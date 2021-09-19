@@ -1,13 +1,13 @@
 import os
 import re
 import sys
-import sysconfig
 import platform
 import subprocess
 
 from distutils.version import LooseVersion
 from setuptools import setup, Extension
 from setuptools.command.build_ext import build_ext
+from shutil import copyfile
 
 class CMakeExtension(Extension):
     def __init__(self, name, moduleName, sourcedir=''):
@@ -36,8 +36,10 @@ class CMakeBuild(build_ext):
     def build_extension(self, ext):
         extdir = os.path.abspath(
             os.path.dirname(self.get_ext_fullpath(ext.name)))
-        cmake_args = ['-DCMAKE_LIBRARY_OUTPUT_DIRECTORY=' + extdir+'/' + ext.moduleName]
-
+        extdir += '/' + ext.moduleName
+        if platform.system() == "Windows":
+            extdir = extdir.replace("/","\\")
+        cmake_args = ['-DCMAKE_LIBRARY_OUTPUT_DIRECTORY=' + extdir]
         cfg = 'Debug' if self.debug else 'Release'        
         build_args = ['--config', cfg]
 
@@ -62,6 +64,10 @@ class CMakeBuild(build_ext):
                               cwd=self.build_temp, env=env)
         subprocess.check_call(['cmake', '--build', '.'] + build_args,
                               cwd=self.build_temp)
+        if platform.system() == "Windows":
+            src = self.build_temp + "\\" + cfg + "\\" + ext.moduleName + ".dll"
+            dst = extdir + "\\" + ext.moduleName + ".dll"
+            copyfile(src, dst)
 
 setup(
     name='numba-rtx',
