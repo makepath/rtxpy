@@ -264,6 +264,7 @@ int traceRTX_internal(State& state, Ray* rays, Hit* hits, int size);
 int initBuffers_internal(State& state, int numRays);
 
 int buildRTX_internal(State& state, uint64_t hash, float3* verts, int64_t numVerts, int3* triangles, int numTriangles) {
+	assert(numVerts<INT_MAX);
     if (!state.valid) {
         fprintf(stderr, "State is invalid!");
         return -2;
@@ -311,7 +312,7 @@ int buildRTX_internal(State& state, uint64_t hash, float3* verts, int64_t numVer
     geometry.type = OPTIX_BUILD_INPUT_TYPE_TRIANGLES;
     geometry.triangleArray.vertexFormat = OPTIX_VERTEX_FORMAT_FLOAT3;
     geometry.triangleArray.vertexStrideInBytes = sizeof(float3);
-    geometry.triangleArray.numVertices = numVerts;
+    geometry.triangleArray.numVertices = int(numVerts);
     geometry.triangleArray.vertexBuffers = &vbuff;
 
     geometry.triangleArray.indexBuffer = d_tris;
@@ -575,8 +576,8 @@ int initBuffers_internal(State& state, int numRays) {
 
 DLL_API int buildRTX(uint64_t hash, void* pverts, int64_t vBytes, void* ptriangles, int tBytes) {
 
-    const int numVerts = vBytes / (sizeof(float) * 3);
-    const int numTriangles = tBytes / (sizeof(int) * 3);
+    const int numVerts = int(vBytes / (sizeof(float) * 3));
+    const int numTriangles = int(tBytes / (sizeof(int) * 3));
     int3* triangles = reinterpret_cast<int3*>(ptriangles);
     float3* verts = reinterpret_cast<float3*>(pverts);
 
