@@ -40,7 +40,7 @@ class CMakeBuild(build_ext):
         if platform.system() == "Windows":
             extdir = extdir.replace("/","\\")
         cmake_args = ['-DCMAKE_LIBRARY_OUTPUT_DIRECTORY=' + extdir]
-        cfg = 'Debug' if self.debug else 'Release'        
+        cfg = 'Debug' if self.debug else 'Release'
         build_args = ['--config', cfg]
 
         if platform.system() == "Windows":
@@ -72,11 +72,18 @@ class CMakeBuild(build_ext):
 setup(
     name='numba-rtx',
     version='0.0.1',
-    packages=['rtx'],
+    packages=['rtx', 'rtx.tests'],
     license='MIT',
     description='',
     author='makepath',
     url='https://github.com/makepath/numba-rtx',
     ext_modules=[CMakeExtension('crtx','rtx')],
     cmdclass=dict(build_ext=CMakeBuild),
+    #install_requires=['cupy'],
+    extras_require = {
+        'tests': [
+            'pytest',
+            'numpy',
+        ],
+    }
 )

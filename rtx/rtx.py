@@ -1,13 +1,11 @@
 import ctypes
 import sys, os
 
-# 3rd-party
 try:
     import cupy
-except ImportError:
-    class cupy(object):
-        ndarray = False
-
+    has_cupy = True
+except ModuleNotFoundError:
+    has_cupy = False
 
 import atexit
 #Handle to the OptiX library.
@@ -31,7 +29,7 @@ class RTX():
             dir_path = dir_path + "\\rtx.dll"
         else:
             dir_path = dir_path + "/librtx.so"
-        
+
         try:
             c_lib = ctypes.CDLL(dir_path)
             c_lib.initRTX.restype = ctypes.c_int
@@ -41,18 +39,18 @@ class RTX():
             c_lib.getHashRTX.restype = ctypes.c_uint64
             if c_lib.initRTX():
                 free_optix_resources()
-                raise Exception("Failed to initialize RTX library")
+                raise RuntimeError("Failed to initialize RTX library")
             else:
                 atexit.register(free_optix_resources)
         except:
-            raise Exception("Failed not load RTX library")
-    
+            raise RuntimeError("Failed not load RTX library")
+
     def build(self, hashValue, vertexBuffer, indexBuffer):
-        if isinstance(vertexBuffer, cupy.ndarray):
+        if has_cupy and isinstance(vertexBuffer, cupy.ndarray):
             vb = ctypes.c_ulonglong(vertexBuffer.data.ptr)
         else:
             vb = vertexBuffer.ctypes.data_as(ctypes.POINTER(ctypes.c_void_p))
-        if isinstance(indexBuffer, cupy.ndarray):
+        if has_cupy and isinstance(indexBuffer, cupy.ndarray):
             ib = ctypes.c_ulonglong(indexBuffer.data.ptr)
         else:
             ib = indexBuffer.ctypes.data_as(ctypes.POINTER(ctypes.c_void_p))
@@ -66,23 +64,24 @@ class RTX():
                 indexBuffer.size*4 #sizeof(int) is 4
             )
         else:
-            raise Exception("Cannot communicate with OptiX")
+            raise RuntimeError("Cannot communicate with OptiX")
 
         return res
+
     def getHash(self):
         if c_lib:
             return c_lib.getHashRTX()
         else:
-            raise Exception("Cannot communicate with OptiX")
+            raise RuntimeError("Cannot communicate with OptiX")
 
     def trace(self, rays, hits, numRays):
         if (rays.size != hits.size*2):
             return -1
-        if isinstance(rays, cupy.ndarray):
+        if has_cupy and isinstance(rays, cupy.ndarray):
             rays = ctypes.c_ulonglong(rays.data.ptr)
         else:
             rays = rays.ctypes.data_as(ctypes.POINTER(ctypes.c_void_p))
-        if isinstance(hits, cupy.ndarray):
+        if has_cupy and isinstance(hits, cupy.ndarray):
             hits = ctypes.c_ulonglong(hits.data.ptr)
         else:
             hits = hits.ctypes.data_as(ctypes.POINTER(ctypes.c_void_p))
