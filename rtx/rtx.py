@@ -27,6 +27,8 @@ class RTX():
         # Load the shared library into c types.
         if sys.platform.startswith("win"):
             dir_path = dir_path + "\\rtx.dll"
+        elif sys.platform == "darwin":
+            dir_path = dir_path + "/librtx.dylib"
         else:
             dir_path = dir_path + "/librtx.so"
 
@@ -43,7 +45,7 @@ class RTX():
             else:
                 atexit.register(free_optix_resources)
         except:
-            raise RuntimeError("Failed not load RTX library")
+            raise RuntimeError("Failed to load RTX library")
 
     def build(self, hashValue, vertexBuffer, indexBuffer):
         if has_cupy and isinstance(vertexBuffer, cupy.ndarray):
