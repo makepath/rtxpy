@@ -1,6 +1,13 @@
 import ctypes
 import sys, os
-import cupy
+
+# 3rd-party
+try:
+    import cupy
+except ImportError:
+    class cupy(object):
+        ndarray = False
+
 
 import atexit
 #Handle to the OptiX library.
@@ -34,11 +41,11 @@ class RTX():
             c_lib.getHashRTX.restype = ctypes.c_uint64
             if c_lib.initRTX():
                 free_optix_resources()
-                raise "Failed to initialize RTX library"
+                raise Exception("Failed to initialize RTX library")
             else:
                 atexit.register(free_optix_resources)
         except:
-            raise "Failed not load RTX library"
+            raise Exception("Failed not load RTX library")
     
     def build(self, hashValue, vertexBuffer, indexBuffer):
         if isinstance(vertexBuffer, cupy.ndarray):
@@ -59,14 +66,14 @@ class RTX():
                 indexBuffer.size*4 #sizeof(int) is 4
             )
         else:
-            raise "Cannot communicate with OptiX"
+            raise Exception("Cannot communicate with OptiX")
 
         return res
     def getHash(self):
         if c_lib:
             return c_lib.getHashRTX()
         else:
-            raise "Cannot communicate with OptiX"
+            raise Exception("Cannot communicate with OptiX")
 
     def trace(self, rays, hits, numRays):
         if (rays.size != hits.size*2):
@@ -87,5 +94,5 @@ class RTX():
                 numRays
             )
         else:
-            raise "Cannot communicate with OptiX"
+            raise Exception("Cannot communicate with OptiX")
         return res
