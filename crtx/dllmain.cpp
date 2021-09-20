@@ -489,6 +489,10 @@ int initRTX_internal(State& state) {
     }
     int deviceIndex = 0;
     int err = cuewInit(CUEW_INIT_CUDA);
+    if (err != CUEW_SUCCESS) {
+        fprintf(stderr, "Error[%d] at %s[%d]: Failed to find CUDA", err, __FUNCTION__, __LINE__);
+        return err;
+    }
     err = cuInit(0);
     CHECK_CUDA_LOG(err, "Failed to initialize CUDA");
 
