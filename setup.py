@@ -71,6 +71,6 @@ class CMakeBuild(build_ext):
 
 setup(
     version='0.0.1',
-    ext_modules=[CMakeExtension('crtx','rtx')],
+    ext_modules=[CMakeExtension('crtx','rtxpy')],
     cmdclass=dict(build_ext=CMakeBuild),
 )

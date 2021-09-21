@@ -25,7 +25,7 @@ which is for CUDA toolkit 10.1
 To run tests
 
     pip install -ve .[tests]
-    pytest -v rtx/tests
+    pytest -v rtxpy/tests
 
 **Requires NVIDIA R456.71 driver or newer for Windows and 455.28 or newer for Linux.**
 **Requires an NVidia Maxwell GPU or newer**

@@ -1,6 +1,6 @@
 import numpy as np
 import pytest
-from rtx import RTX, has_cupy
+from rtxpy import RTX, has_cupy
 
 
 @pytest.mark.parametrize("test_cupy", [False, True])
