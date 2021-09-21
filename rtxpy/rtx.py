@@ -26,11 +26,11 @@ class RTX():
         dir_path = os.path.dirname(os.path.realpath(__file__))
         # Load the shared library into c types.
         if sys.platform.startswith("win"):
-            dir_path = dir_path + "\\rtx.dll"
+            dir_path = dir_path + "\\rtxpy.dll"
         elif sys.platform == "darwin":
-            dir_path = dir_path + "/librtx.dylib"
+            dir_path = dir_path + "/librtxpy.dylib"
         else:
-            dir_path = dir_path + "/librtx.so"
+            dir_path = dir_path + "/librtxpy.so"
 
         try:
             c_lib = ctypes.CDLL(dir_path)
