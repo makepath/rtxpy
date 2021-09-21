@@ -70,20 +70,7 @@ class CMakeBuild(build_ext):
             copyfile(src, dst)
 
 setup(
-    name='numba-rtx',
     version='0.0.1',
-    packages=['rtx', 'rtx.tests'],
-    license='MIT',
-    description='',
-    author='makepath',
-    url='https://github.com/makepath/numba-rtx',
     ext_modules=[CMakeExtension('crtx','rtx')],
     cmdclass=dict(build_ext=CMakeBuild),
-    #install_requires=['cupy'],
-    extras_require = {
-        'tests': [
-            'pytest',
-            'numpy',
-        ],
-    }
 )

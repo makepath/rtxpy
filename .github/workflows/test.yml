@@ -1,13 +1,7 @@
 name: Test
 
 on:
-  #pull_request:
-  #  branches:
-  #    - main
-  push:
-    branches:
-      - packaging
-  #    - main
+  workflow_dispatch:
 
 jobs:
   test:

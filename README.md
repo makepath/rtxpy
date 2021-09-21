@@ -1,4 +1,6 @@
-# Numba RTX
+# RTX
+
+Ray tracing using CUDA accessible from Python
 
 Requires CMake 3.10 or higher, either system CMake or can
 
