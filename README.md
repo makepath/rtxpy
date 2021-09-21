@@ -26,3 +26,6 @@ To run tests
 
     pip install -ve .[tests]
     pytest -v rtx/tests
+
+**Requires NVIDIA R456.71 driver or newer for Windows and 455.28 or newer for Linux.**
+**Requires an NVidia Maxwell GPU or newer**
