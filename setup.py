@@ -66,7 +66,7 @@ class CMakeBuild(build_ext):
                               cwd=self.build_temp)
         if platform.system() == "Windows":
             src = self.build_temp + "\\" + cfg + "\\" + ext.moduleName + ".dll"
-            dst = extdir + ".dll"
+            dst = extdir + "\\" + ext.moduleName + ".dll"
             copyfile(src, dst)
 
 setup(
