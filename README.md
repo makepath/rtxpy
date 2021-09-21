@@ -12,6 +12,14 @@ Optional runtime dependencies
 
     cupy
 
+If you know the version of the CUDA toolkit that you have installed, which can
+be obtained by running `nvcc --version`, you can install the appropriate `cupy`
+wheel using
+
+    pip install cupy-cuda101
+
+which is for CUDA toolkit 10.1
+
 To run tests
 
     pip install -ve .[tests]
