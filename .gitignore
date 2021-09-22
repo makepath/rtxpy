@@ -30,3 +30,9 @@
 *.exe
 *.out
 *.app
+
+# Directories used by build process
+__pycache__
+build/
+dist/
+rtxpy.egg-info/
