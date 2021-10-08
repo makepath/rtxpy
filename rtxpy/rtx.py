@@ -39,13 +39,14 @@ class RTX():
             c_lib.traceRTX.restype = ctypes.c_int
             c_lib.cleanRTX.restype = ctypes.c_int
             c_lib.getHashRTX.restype = ctypes.c_uint64
-            if c_lib.initRTX():
-                free_optix_resources()
-                raise RuntimeError("Failed to initialize RTX library")
-            else:
-                atexit.register(free_optix_resources)
         except:
             raise RuntimeError("Failed to load RTX library")
+
+        if c_lib.initRTX():
+            free_optix_resources()
+            raise RuntimeError("Failed to initialize RTX library")
+        else:
+            atexit.register(free_optix_resources)
 
     def build(self, hashValue, vertexBuffer, indexBuffer):
         if has_cupy and isinstance(vertexBuffer, cupy.ndarray):

@@ -21,7 +21,13 @@ def test_simple(test_cupy):
     rays = backend.float32([0.33,0.33,100,0,0,0,-1,1000])
     hits =backend.float32([0,0,0,0])
 
-    optix = RTX()
+    try:
+        optix = RTX()
+    except RuntimeError as e:
+        # RTX fails to initialize if CUDA not available.
+        if str(e) == "Failed to initialize RTX library":
+            pytest.xfail("CUDA not available")
+        raise
 
     res = optix.build(0, verts, triangles)
     assert res == 0
