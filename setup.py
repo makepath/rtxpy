@@ -42,14 +42,19 @@ class CMakeBuild(build_ext):
         cmake_args = ['-DCMAKE_LIBRARY_OUTPUT_DIRECTORY=' + extdir]
         cfg = 'Debug' if self.debug else 'Release'
         build_args = ['--config', cfg]
+        conda_build = os.environ.get("CONDA_BUILD", 0)
 
         if platform.system() == "Windows":
             cmake_args += ['-DCMAKE_LIBRARY_OUTPUT_DIRECTORY_{}={}'.format(
                 cfg.upper(),
                 extdir)]
-            if sys.maxsize > 2**32:
+            # CMake lets you override the generator, as is done in conda build.
+            # If using NMake for generator, do not use arch specifier as not supported.
+            cmake_generator = os.environ.get("CMAKE_GENERATOR", "")
+            if sys.maxsize > 2**32 and not cmake_generator.startswith("NMake"):
                 cmake_args += ['-A', 'x64']
-            build_args += ['--', '/m']
+            if not conda_build:
+                build_args += ['--', '/m']
         else:
             cmake_args += ['-DCMAKE_BUILD_TYPE=' + cfg]
             build_args += ['--', '-j2']
@@ -64,8 +69,13 @@ class CMakeBuild(build_ext):
                               cwd=self.build_temp, env=env)
         subprocess.check_call(['cmake', '--build', '.'] + build_args,
                               cwd=self.build_temp)
+
         if platform.system() == "Windows":
-            src = self.build_temp + "\\" + cfg + "\\" + ext.moduleName + ".dll"
+            src = self.build_temp
+            if not conda_build:
+                src += "\\" + cfg
+            src += "\\" + ext.moduleName + ".dll"
+
             dst = extdir + "\\" + ext.moduleName + ".dll"
             copyfile(src, dst)
 

@@ -15,9 +15,7 @@ Ray tracing using CUDA, accessible from Python.
 
 ## Installation from source
 
-Requires CMake 3.10 or higher, either system CMake or
-
-    pip install cmake
+Requires CMake 3.10 or higher to build.
 
 To install RTXpy from source use
 
@@ -26,9 +24,9 @@ To install RTXpy from source use
 `cupy` is an optional runtime dependency. If you know the version of the CUDA
 toolkit you have installed, which can be obtained by running `nvcc --version`,
 you can install the appropriate `cupy` wheel. For example, for CUDA toolkit
-10.1 use
+11.2 use
 
-    pip install cupy-cuda101
+    pip install cupy-cuda112
 
 To run tests
 
