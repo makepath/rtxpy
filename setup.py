@@ -49,9 +49,11 @@ class CMakeBuild(build_ext):
                 cfg.upper(),
                 extdir)]
             # CMake lets you override the generator, as is done in conda build.
-            # If using NMake for generator, do not use arch specifier as not supported.
+            # If using NMake for generator or building on conda, do not use
+            # arch specifier as not supported.
             cmake_generator = os.environ.get("CMAKE_GENERATOR", "")
-            if sys.maxsize > 2**32 and not cmake_generator.startswith("NMake"):
+            if sys.maxsize > 2**32 and not (
+                    cmake_generator.startswith("NMake") or conda_build):
                 cmake_args += ['-A', 'x64']
             if not conda_build:
                 build_args += ['--', '/m']
@@ -71,11 +73,7 @@ class CMakeBuild(build_ext):
                               cwd=self.build_temp)
 
         if platform.system() == "Windows":
-            src = self.build_temp
-            if not conda_build:
-                src += "\\" + cfg
-            src += "\\" + ext.moduleName + ".dll"
-
+            src = self.build_temp + "\\" + cfg + "\\" + ext.moduleName + ".dll"
             dst = extdir + "\\" + ext.moduleName + ".dll"
             copyfile(src, dst)
 
