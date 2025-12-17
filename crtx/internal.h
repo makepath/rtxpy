@@ -6,6 +6,9 @@
 #include <string>
 #include <fstream>
 #include <sstream>
+#include <string>
+#include <stdexcept>
+#include <filesystem>
 
 // NOTE: dllmain.cpp must include <cuda.h> and <optix.h> BEFORE including this file.
 #ifdef WIN32
@@ -127,27 +130,42 @@ struct State {
     bool valid = false;
 };
 
-// Read a PTX file into a std::string (throws on failure)
-inline std::string load_ptx_file(const char* path)
+
+
+#include <dlfcn.h>
+
+static std::string read_file_to_string(const std::string& path)
 {
-    std::ifstream f(path, std::ios::in | std::ios::binary);
-    if (!f) {
-        throw std::runtime_error(std::string("Could not open PTX file: ") + path);
-    }
-
-    f.seekg(0, std::ios::end);
-    std::streamoff size = f.tellg();
-    f.seekg(0, std::ios::beg);
-
-    if (size <= 0) {
-        throw std::runtime_error(std::string("PTX file is empty: ") + path);
-    }
-
-    std::string ptx;
-    ptx.resize(static_cast<size_t>(size));
-    f.read(&ptx[0], size);
-    if (!f) {
-        throw std::runtime_error(std::string("Failed to read PTX file: ") + path);
-    }
-    return ptx;
+    std::ifstream f(path.c_str(), std::ios::binary);
+    if (!f) return "";
+    std::ostringstream ss;
+    ss << f.rdbuf();
+    return ss.str();
 }
+
+static std::string shared_lib_dir()
+{
+    Dl_info info{};
+    if (dladdr((void*)&shared_lib_dir, &info) && info.dli_fname) {
+        std::string full(info.dli_fname);
+        auto pos = full.find_last_of('/');
+        return (pos == std::string::npos) ? "." : full.substr(0, pos);
+    }
+    return ".";
+}
+
+std::string load_ptx_file(const std::string& filename)
+{
+    std::string dir = shared_lib_dir();
+
+    std::string p1 = dir + "/" + filename;
+    std::string s = read_file_to_string(p1);
+    if (!s.empty()) return s;
+
+    std::string p2 = dir + "/data/" + filename;
+    s = read_file_to_string(p2);
+    if (!s.empty()) return s;
+
+    return "";
+}
+

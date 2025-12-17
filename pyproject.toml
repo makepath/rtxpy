@@ -5,4 +5,11 @@ requires = [
     "packaging",
     "setuptools>=42",
     "wheel",
+    "pytest",
 ]
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.package-data]
+rtxpy = ["*.ptx", "*.so"]
