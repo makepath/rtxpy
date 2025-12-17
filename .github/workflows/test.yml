@@ -32,7 +32,7 @@ jobs:
       - name: Install CUDA Toolkit
         uses: Jimver/cuda-toolkit@v0.2.29
         with:
-          cuda: "12.4"
+          cuda: "12.3"
 
       - name: Verify CUDA
         shell: bash
