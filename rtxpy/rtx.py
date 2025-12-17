@@ -35,17 +35,25 @@ class RTX():
 
         try:
             c_lib = ctypes.CDLL(dir_path)
+            c_lib = ctypes.CDLL(dir_path, use_errno=True)
+
             c_lib.initRTX.restype = ctypes.c_int
             c_lib.buildRTX.restype = ctypes.c_int
             c_lib.traceRTX.restype = ctypes.c_int
             c_lib.cleanRTX.restype = ctypes.c_int
             c_lib.getHashRTX.restype = ctypes.c_uint64
+            c_lib.getLastErrorRTX.restype = ctypes.c_char_p
         except:
             raise RuntimeError("Failed to load RTX library")
 
-        if c_lib.initRTX():
+        rc = c_lib.initRTX()
+        if rc != 0:
+            msg = c_lib.getLastErrorRTX()
             free_optix_resources()
-            raise RuntimeError("Failed to initialize RTX library")
+            raise RuntimeError(
+                f"Failed to initialize RTX library (rc={rc}): "
+                + (msg.decode("utf-8", "replace") if msg else "no details")
+            )
         else:
             atexit.register(free_optix_resources)
 

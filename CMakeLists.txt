@@ -33,8 +33,8 @@ set(CUDA_LIB_DIR "${CUDA_TOOLKIT_ROOT_DIR}/lib64")
 
 target_include_directories(${PROJECT_NAME} PRIVATE
   ${SOURCE_DIR}
-  ${SOURCE_DIR}/optix_7.1/include
-  ${SOURCE_DIR}/optix_7.1
+  ${SOURCE_DIR}/optix_9.1/include
+  ${SOURCE_DIR}/optix_9.1
   ${SOURCE_DIR}/cuew
   ${CUDA_INCLUDE_DIR}
 )

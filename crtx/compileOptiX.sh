@@ -12,7 +12,7 @@ esac
 
 mkdir -p external/shaders
 
-OPTIX_VERSION=7.1.0
+OPTIX_VERSION=9.1.0
 
 if [ "${machine}" == "Linux" ]
 then
@@ -22,7 +22,7 @@ then
     COMPILER="g++"
 
     INCLUDES=(
-        -I"./optix_7.1"                         # <-- OptiX 7.1 headers vendored in this repo
+        -I"./optix_9.1"                         # <-- OptiX 9.1 headers vendored in this repo
         -I"../include"
         -I"/usr/local/cuda/samples/common/inc"  # For helper_math.h / math_helper.h (CUDA samples)
     )
