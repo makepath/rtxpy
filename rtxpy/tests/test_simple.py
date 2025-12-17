@@ -1,5 +1,6 @@
 import numpy as np
 import pytest
+
 from rtxpy import RTX, has_cupy
 
 

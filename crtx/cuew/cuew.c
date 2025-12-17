@@ -25,7 +25,7 @@
 #  endif
 #endif
 
-#include <cuew.h>
+#include <cuew/cuew.h>
 #include <assert.h>
 #include <stdio.h>
 #include <string.h>

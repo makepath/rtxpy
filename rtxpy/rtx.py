@@ -18,6 +18,7 @@ def free_optix_resources():
     c_lib = None
 
 class RTX():
+
     def __init__(self):
         global c_lib
         if c_lib != None:

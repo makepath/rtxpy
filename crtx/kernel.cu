@@ -1,6 +1,16 @@
 #include <optix.h>
 #include "common.h"
 
+// ---- Compatibility helpers (older sample code used these names) ----
+#ifndef int_as_float
+#define int_as_float __int_as_float
+#endif
+
+#ifndef float_as_int
+#define float_as_int __float_as_int
+#endif
+// -------------------------------------------------------------------
+
 typedef unsigned long long uint64_t;
 
 extern "C" {

@@ -1,5 +1,5 @@
-#include <assert.h>
-#include "cuew.h"
+#define CUDA_NO_PROTOTYPES
+#include "cuew/cuew.h"          // this pulls in cuda.h safely (no prototypes)
 
 #define OPTIX_DONT_INCLUDE_CUDA
 #include <optix.h>
@@ -7,15 +7,17 @@
 #include <optix_stack_size.h>
 #include <optix_stubs.h>
 
+// now your other includes:
+#include <assert.h>
+#include <climits>
 #include <sstream>
-
 #include <vector>
 #include <fstream>
 
 struct float3 { float x,y,z; };
-struct int3   {   int i[3]; };
-#include "common.h"
+struct int3   { int i[3]; };
 
+#include "common.h"
 #include "rtx.h"
 #include "internal.h"
 
@@ -43,55 +45,63 @@ std::string getTextFileContents(const char* fileName) {
     return res;
 }
 
-
 int createModule(State& state)
 {
     char   log[2048];  // For error reporting from OptiX creation functions
-    size_t logSize = sizeof( log );
+    size_t logSize = sizeof(log);
 
     OptixModuleCompileOptions module_compile_options = {};
-    module_compile_options.maxRegisterCount          = OPTIX_COMPILE_DEFAULT_MAX_REGISTER_COUNT;
-
-    module_compile_options.optLevel   = OPTIX_COMPILE_OPTIMIZATION_DEFAULT;
-    module_compile_options.debugLevel = OPTIX_COMPILE_DEBUG_LEVEL_LINEINFO;
+    module_compile_options.maxRegisterCount = OPTIX_COMPILE_DEFAULT_MAX_REGISTER_COUNT;
+    module_compile_options.optLevel         = OPTIX_COMPILE_OPTIMIZATION_DEFAULT;
+    module_compile_options.debugLevel       = OPTIX_COMPILE_DEBUG_LEVEL_LINEINFO;
 
     state.pipeline_compile_options.usesMotionBlur        = false;
     state.pipeline_compile_options.traversableGraphFlags = OPTIX_TRAVERSABLE_GRAPH_FLAG_ALLOW_SINGLE_GAS;
     state.pipeline_compile_options.numPayloadValues      = 4;
     state.pipeline_compile_options.numAttributeValues    = 2;
-    state.pipeline_compile_options.exceptionFlags = OPTIX_EXCEPTION_FLAG_NONE;  // should be OPTIX_EXCEPTION_FLAG_STACK_OVERFLOW;
+    state.pipeline_compile_options.exceptionFlags        = OPTIX_EXCEPTION_FLAG_NONE;
     state.pipeline_compile_options.pipelineLaunchParamsVariableName = "params";
 
-#if 0
-    std::string input2 = getTextFileContents("kernel.ptx");
-    size_t      inputSize2 = input2.length();
-    input2 += "\0\0\0";
-    unsigned* asd = reinterpret_cast<unsigned*>(&input2[0]);
-    for (int i = 0; i < inputSize2/4; i++) {
-        fprintf(stderr, "0x%x, ", asd[i]);
-        if (i % 20 == 0 && i > 0) {
-            fprintf(stderr, "\n");
+    std::string ptx;
+    try {
+        // Path is relative to the *current working directory* when your .so is loaded.
+        // If you run from repo root, this is likely "crtx/kernel.ptx".
+        // If you run from crtx/, this is "kernel.ptx".
+        //
+        // Start simple:
+        //   bash compileOptiX.sh   (from crtx)
+        //   pytest ...             (from repo root)
+        //
+        // So try "crtx/kernel.ptx" first, then fallback to "kernel.ptx".
+        try {
+            ptx = load_ptx_file("crtx/kernel.ptx");
+        } catch (...) {
+            ptx = load_ptx_file("kernel.ptx");
         }
+    } catch (const std::exception& e) {
+        fprintf(stderr, "[RTX] Failed to load PTX: %s\n", e.what());
+        return -1;
     }
-#endif
 
-    std::string input(reinterpret_cast<const char*>(buff));
-    size_t      inputSize = input.length();
+    const char* input     = ptx.c_str();
+    const size_t inputSize = ptx.size();
 
     OPTIX_CHECK_LOG(
         optixModuleCreateFromPTX(
-            state.context, 
-            &module_compile_options, 
+            state.context,
+            &module_compile_options,
             &state.pipeline_compile_options,
-            &input[0], 
-            inputSize, 
-            log, 
+            input,
+            inputSize,
+            log,
             &logSize,
             &state.ptx_module
         )
     );
+
     return 0;
 }
+
 
 int createProgramGroups(State& state)
 {
@@ -376,60 +386,82 @@ int buildRTX_internal(State& state, uint64_t hash, float3* verts, int64_t numVer
 
 int cleanup_internal(State& state)
 {
-    //In case cleanup has already been called, don't call it again
+    // If CUDA context was never created, nothing to do.
     if (state.cuda.context == 0) {
+        state.valid = false;
         return 0;
     }
-    state.valid = false;
-    state.scene.freeMem();
-    
-    OPTIX_CHECK(optixPipelineDestroy(state.pipeline));
-    OPTIX_CHECK(optixProgramGroupDestroy(state.raygen));
-    OPTIX_CHECK(optixProgramGroupDestroy(state.miss));
-    OPTIX_CHECK(optixProgramGroupDestroy(state.hit));
-    state.pipeline = 0;
-    state.raygen = 0;
-    state.miss = 0;
-    state.hit = 0;
-    
-    OPTIX_CHECK(optixModuleDestroy(state.ptx_module));
-    OPTIX_CHECK(optixDeviceContextDestroy(state.context));
-    state.ptx_module = 0;
-    state.context = 0;
 
-    CUresult err = CUDA_SUCCESS;
-    err = cuMemFree(state.sbt.raygenRecord);
-    assert(err == CUDA_SUCCESS);
-    err = cuMemFree(state.sbt.missRecordBase);
-    assert(err == CUDA_SUCCESS);
-    err = cuMemFree(state.sbt.hitgroupRecordBase);
-    assert(err == CUDA_SUCCESS);
+    state.valid = false;
+
+    // Free scene memory safely
+    state.scene.freeMem();
+    state.scene.hash = uint64_t(-1);
+
+    // OptiX objects (ONLY destroy if non-zero)
+    if (state.pipeline) {
+        optixPipelineDestroy(state.pipeline);
+        state.pipeline = 0;
+    }
+    if (state.raygen) {
+        optixProgramGroupDestroy(state.raygen);
+        state.raygen = 0;
+    }
+    if (state.miss) {
+        optixProgramGroupDestroy(state.miss);
+        state.miss = 0;
+    }
+    if (state.hit) {
+        optixProgramGroupDestroy(state.hit);
+        state.hit = 0;
+    }
+    if (state.ptx_module) {
+        optixModuleDestroy(state.ptx_module);
+        state.ptx_module = 0;
+    }
+    if (state.context) {
+        optixDeviceContextDestroy(state.context);
+        state.context = 0;
+    }
+
+    // Free SBT buffers (ONLY if non-zero)
+    if (state.sbt.raygenRecord) {
+        cuMemFree(state.sbt.raygenRecord);
+    }
+    if (state.sbt.missRecordBase) {
+        cuMemFree(state.sbt.missRecordBase);
+    }
+    if (state.sbt.hitgroupRecordBase) {
+        cuMemFree(state.sbt.hitgroupRecordBase);
+    }
     memset(&state.sbt, 0, sizeof(state.sbt));
 
-    err = cuMemFree(state.d_params);
-    assert(err == CUDA_SUCCESS);
-    err = cuMemFree(state.d_rays);
-    assert(err == CUDA_SUCCESS);
-    err = cuMemFree(state.d_hits);
-    assert(err == CUDA_SUCCESS);
+    // Free params/rays/hits (ONLY if non-zero)
+    if (state.d_params) cuMemFree(state.d_params);
+    if (state.d_rays)   cuMemFree(state.d_rays);
+    if (state.d_hits)   cuMemFree(state.d_hits);
+
     state.d_params = 0;
-    state.d_hits = 0;
-    state.d_rays = 0;
-    state.d_hits_size = 0;
+    state.d_rays   = 0;
+    state.d_hits   = 0;
     state.d_rays_size = 0;
+    state.d_hits_size = 0;
 
-    err = cuStreamDestroy(state.cuda.stream);
-    assert(err == CUDA_SUCCESS);
+    // Stream/context teardown
+    if (state.cuda.stream) {
+        cuStreamDestroy(state.cuda.stream);
+        state.cuda.stream = 0;
+    }
 
-    err = cuDevicePrimaryCtxRelease(state.cuda.device);
-    assert(err == CUDA_SUCCESS);
+    if (state.cuda.device) {
+        cuDevicePrimaryCtxRelease(state.cuda.device);
+        state.cuda.device = 0;
+    }
 
-    state.cuda.stream = 0;
-    state.cuda.device = 0;
     state.cuda.context = 0;
-
-    return err;
+    return 0;
 }
+
 
 int traceRTX_internal(State& state, Ray* rays, Hit* hits, int size) {
     if (!state.valid) {
@@ -555,22 +587,35 @@ int initBuffers_internal(State& state, int numRays) {
         fprintf(stderr, "State is invalid!");
         return -2;
     }
-    CUresult err = CUDA_SUCCESS;
-    size_t newRaysSize = sizeof(Ray) * numRays;
-    size_t newHitsSize = sizeof(Hit) * numRays;
-    if (newRaysSize != state.d_rays_size || newHitsSize != state.d_hits_size) {
-        err = cuMemFree(state.d_rays);
-        CHECK_CUDA_LOG(err, "Failed to deallocate old input data buffer");
-        err = cuMemFree(state.d_hits);
-        CHECK_CUDA_LOG(err, "Failed to deallocate old output data buffer");
 
+    CUresult err = CUDA_SUCCESS;
+    size_t newRaysSize = sizeof(Ray) * (size_t)numRays;
+    size_t newHitsSize = sizeof(Hit) * (size_t)numRays;
+
+    if (newRaysSize != state.d_rays_size || newHitsSize != state.d_hits_size) {
+
+        // Only free if we actually have something allocated
+        if (state.d_rays) {
+            err = cuMemFree(state.d_rays);
+            CHECK_CUDA_LOG(err, "Failed to deallocate old input data buffer");
+            state.d_rays = 0;
+        }
+        if (state.d_hits) {
+            err = cuMemFree(state.d_hits);
+            CHECK_CUDA_LOG(err, "Failed to deallocate old output data buffer");
+            state.d_hits = 0;
+        }
+
+        // Allocate new buffers
         state.d_rays_size = newRaysSize;
         err = cuMemAlloc(&state.d_rays, state.d_rays_size);
         CHECK_CUDA_LOG(err, "Failed to allocate input data buffer");
+
         state.d_hits_size = newHitsSize;
         err = cuMemAlloc(&state.d_hits, state.d_hits_size);
         CHECK_CUDA_LOG(err, "Failed to allocate output data buffer");
     }
+
     return err;
 }
 
