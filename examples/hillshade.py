@@ -1,5 +1,5 @@
 import numpy as np
-import numba as nb
+from numba import cuda
 
 import cupy
 import xarray as xr
@@ -9,17 +9,17 @@ from typing import Optional
 
 from scipy.spatial.transform import Rotation as R
 
-from raytrace.cuda_utils import *
-from raytrace import mesh_utils
+from cuda_utils import *
+import mesh_utils
 
-@nb.cuda.jit
+@cuda.jit
 def _generatePrimaryRays(data, x_coords, y_coords, H, W):
     """
     A GPU kernel that given a set of x and y discrete coordinates on a raster terrain
     generates in @data a list of parallel rays that represent camera rays generated from an ortographic camera
     that is looking straight down at the surface from an origin height 10000
     """
-    i, j = nb.cuda.grid(2)
+    i, j = cuda.grid(2)
     if i>=0 and i < H and j>=0 and j < W:
         #data[i,j,0] = j + 1e-6 # x_coords[j] + 1e-6
         #data[i,j,1] = i + 1e-6 # y_coords[i] + 1e-6
@@ -48,7 +48,7 @@ def generatePrimaryRays(rays, x_coords, y_coords, H, W):
     return 0
 
 
-@nb.cuda.jit
+@cuda.jit
 def _generateShadowRays(rays, hits, normals, H, W, sunDir):
     """
     A GPU kernel that given a set rays and their respective intersection points,
@@ -57,7 +57,7 @@ def _generateShadowRays(rays, hits, normals, H, W, sunDir):
     The normals vectors at the point of intersection of the original rays are cached in @normals
     Thus we can later use them to do lambertian shading, after the shadow rays have been traced
     """
-    i, j = nb.cuda.grid(2)
+    i, j = cuda.grid(2)
     if i>=0 and i < H and j>=0 and j < W:
         dist = hits[i,j,0]
         norm = make_float3(hits[i,j], 1)
@@ -88,7 +88,7 @@ def generateShadowRays(rays, hits, normals, H, W, sunDir):
     return 0
 
 
-@nb.cuda.jit
+@cuda.jit
 def _shadeLambert(hits, normals, output, H, W, sunDir, castShadows):
     """
     This kernel does a simple Lambertian shading
@@ -99,7 +99,7 @@ def _shadeLambert(hits, normals, output, H, W, sunDir, castShadows):
     We then use the information for light visibility and normal to apply Lambert's cosine law
     The final result is stored in output which is an RGB array
     """
-    i, j = nb.cuda.grid(2)
+    i, j = cuda.grid(2)
     if i>=0 and i < H and j>=0 and j < W:
         # Normal at the intersection of camera ray (i,j) with the scene
         norm = make_float3(normals[i,j], 0)
@@ -202,10 +202,10 @@ def hillshade_gpu(raster: xr.DataArray,
     # Move the terrain to GPU for testing the GPU path
     if not isinstance(raster.data, cupy.ndarray):
         print("WARNING: raster.data is not a cupy array. Additional overhead will be incurred")
-    H,W = raster.shape
+    H,W = raster.data.squeeze().shape
     optix = RTX()
 
-    datahash = np.uint64(hash(str(raster.data.get())))
+    datahash = np.uint64(hash(str(raster.data.get())) % (1 << 64))
     optixhash = np.uint64(optix.getHash())
     if (optixhash != datahash):
         numTris = (H - 1) * (W - 1) * 2

@@ -1,32 +1,34 @@
 
 import numba as nb
+from numba import cuda
 import numpy as np
 import cupy
-from raytrace.cuda_utils import calc_dims
 
-@nb.cuda.jit
+
+@cuda.jit
 def _triangulateTerrain(verts, triangles, data, H, W, scale, stride):
-    globalId = stride + nb.cuda.grid(1)
+    globalId = stride + cuda.grid(1)
     if globalId < W*H:
         h = globalId // W
         w = globalId % W
         meshMapIndex = h * W + w
 
-        val = data[h,w]
+        val = data[h, w]
 
         offset = 3*meshMapIndex
-        verts[offset]   = w # x_coords[w] # w
-        verts[offset+1] = h # y_coords[h] # h
+        verts[offset] = w  # x_coords[w] # w
+        verts[offset+1] = h  # y_coords[h] # h
         verts[offset+2] = val * scale
 
         if w != W - 1 and h != H - 1:
             offset = 6*(h * (W-1) + w)
-            triangles[offset+0]= np.int32(meshMapIndex + W)
-            triangles[offset+1]= np.int32(meshMapIndex + W + 1)
-            triangles[offset+2]= np.int32(meshMapIndex)
-            triangles[offset+3]= np.int32(meshMapIndex + W + 1)
-            triangles[offset+4]= np.int32(meshMapIndex + 1)
-            triangles[offset+5]= np.int32(meshMapIndex)
+            triangles[offset+0] = np.int32(meshMapIndex + W)
+            triangles[offset+1] = np.int32(meshMapIndex + W + 1)
+            triangles[offset+2] = np.int32(meshMapIndex)
+            triangles[offset+3] = np.int32(meshMapIndex + W + 1)
+            triangles[offset+4] = np.int32(meshMapIndex + 1)
+            triangles[offset+5] = np.int32(meshMapIndex)
+
 
 @nb.njit(parallel=True)
 def triangulateCPU(verts, triangles, data, H, W, scale):
@@ -34,25 +36,25 @@ def triangulateCPU(verts, triangles, data, H, W, scale):
         for w in range(W):
             meshMapIndex = h * W + w
 
-            val = data[h,w]
+            val = data[h, w]
 
             offset = 3*meshMapIndex
-            verts[offset]   = w # x_coords[w] # w
-            verts[offset+1] = h # y_coords[h] # h
+            verts[offset] = w  # x_coords[w] # w
+            verts[offset+1] = h  # y_coords[h] # h
             verts[offset+2] = val * scale
 
             if w != W - 1 and h != H - 1:
                 offset = 6*(h * (W-1) + w)
-                triangles[offset+0]= np.int32(meshMapIndex + W)
-                triangles[offset+1]= np.int32(meshMapIndex + W + 1)
-                triangles[offset+2]= np.int32(meshMapIndex)
-                triangles[offset+3]= np.int32(meshMapIndex + W+1)
-                triangles[offset+4]= np.int32(meshMapIndex + 1)
-                triangles[offset+5]= np.int32(meshMapIndex)
+                triangles[offset+0] = np.int32(meshMapIndex + W)
+                triangles[offset+1] = np.int32(meshMapIndex + W + 1)
+                triangles[offset+2] = np.int32(meshMapIndex)
+                triangles[offset+3] = np.int32(meshMapIndex + W+1)
+                triangles[offset+4] = np.int32(meshMapIndex + 1)
+                triangles[offset+5] = np.int32(meshMapIndex)
 
 
 def triangulateTerrain(verts, triangles, terrain, scale=1):
-    H,W = terrain.shape
+    H, W = terrain.shape
     if isinstance(terrain.data, np.ndarray):
         triangulateCPU(verts, triangles, terrain.data, H, W, scale)
     if isinstance(terrain.data, cupy.ndarray):
@@ -61,9 +63,11 @@ def triangulateTerrain(verts, triangles, terrain, scale=1):
         griddim = (jobSize + blockdim - 1) // 1024
         d = 100
         offset = 0
-        while(jobSize>0):
+        while (jobSize > 0):
             batch = min(d, griddim)
-            _triangulateTerrain[batch, blockdim](verts, triangles, terrain.data, H, W, scale, offset)
+            _triangulateTerrain[batch, blockdim](verts, triangles,
+                                                 terrain.data, H, W,
+                                                 scale, offset)
             offset += batch*blockdim
             jobSize -= batch*blockdim
     return 0
@@ -95,6 +99,7 @@ def fillContents(content, verts, triangles, numTris):
         content[offset:offset+48] = v.view(np.uint8)
         content[offset+48:offset+50] = pad
 
+
 def write(name, verts, triangles):
     """
     Save a triangulated raster to a standard STL file.
@@ -116,7 +121,7 @@ def write(name, verts, triangles):
     nf = np.empty(1, np.uint32)
     numTris = triangles.shape[0] // 3
     nf[0] = numTris
-    f=open(name,'wb')
+    f = open(name, 'wb')
     f.write(header)
     f.write(nf)
 

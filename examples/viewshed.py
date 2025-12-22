@@ -1,3 +1,4 @@
+from numba import cuda
 import numpy as np
 import numba as nb
 
@@ -10,8 +11,8 @@ from typing import Union
 
 from scipy.spatial.transform import Rotation as R
 
-from raytrace.cuda_utils import *
-from raytrace import mesh_utils
+from cuda_utils import *
+import mesh_utils
 
 # view options default values
 OBS_ELEV = 0
@@ -20,9 +21,9 @@ TARGET_ELEV = 0
 # if a cell is invisible, its value is set to -1
 INVISIBLE = -1
 
-@nb.cuda.jit
+@cuda.jit
 def _generatePrimaryRays(data, x_coords, y_coords, H, W):
-    i, j = nb.cuda.grid(2)
+    i, j = cuda.grid(2)
     if i>=0 and i < H and j>=0 and j < W:
 #        if (j == W-1):
 #            data[i,j,0] = y_coords[j] - 1e-6
@@ -58,9 +59,9 @@ def generatePrimaryRays(rays, x_coords, y_coords, H, W):
     _generatePrimaryRays[griddim, blockdim](rays, d_x_coords, d_y_coords, H, W)
     return 0
 
-@nb.cuda.jit
+@cuda.jit
 def _generateViewshedRays(camRays, hits, vsrays, visibility_grid, H, W, vp):
-    i, j = nb.cuda.grid(2)
+    i, j = cuda.grid(2)
     if i>=0 and i < H and j>=0 and j < W:
         elevationOffset = vp[2]
         targetElevation = vp[3]
@@ -111,9 +112,9 @@ def generateViewshedRays(rays, hits, vsrays, visibility_grid, H, W, vp):
     _generateViewshedRays[griddim, blockdim](rays, hits, vsrays, visibility_grid, H, W, vp)
     return 0
 
-@nb.cuda.jit
+@cuda.jit
 def _calcViewshed(hits, visibility_grid, H, W):
-    i, j = nb.cuda.grid(2)
+    i, j = cuda.grid(2)
     if i>=0 and i < H and j>=0 and j < W:
         dist = hits[i,j,0]
         # We traced the viewshed rays and now hits contains the intersection data
@@ -198,7 +199,7 @@ def viewshed_gpu(raster: xr.DataArray,
     H,W = raster.shape
     optix = RTX()
 
-    datahash = np.uint64(hash(str(raster.data.get())))
+    datahash = np.uint64(hash(str(raster.data.get())) % (1 << 64))
     optixhash = np.uint64(optix.getHash())
     if (optixhash != datahash):
         numTris = (H - 1) * (W - 1) * 2
