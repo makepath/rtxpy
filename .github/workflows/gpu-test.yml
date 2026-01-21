@@ -64,6 +64,11 @@ jobs:
             echo "Checking if otk-pyoptix wheel is available..."
           fi
 
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake
+
       - name: Install otk-pyoptix from source
         run: |
           # Clone and install otk-pyoptix
