@@ -46,6 +46,8 @@ jobs:
         with:
           cuda: '12.6.3'
           method: 'network'
+          # Only install toolkit components, not drivers (runner already has drivers)
+          sub-packages: '["nvcc", "cudart-dev", "nvrtc-dev", "thrust"]'
 
       - name: Verify CUDA installation
         run: |
