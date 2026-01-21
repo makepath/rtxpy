@@ -1,4 +1,5 @@
 #!/bin/bash
+set -euo pipefail
 
 unameOut="$(uname -s)"
 case "${unameOut}" in
@@ -6,48 +7,58 @@ case "${unameOut}" in
     Darwin*)    machine=Mac;;
     CYGWIN*)    machine=Cygwin;;
     MINGW*)     machine=MinGw;;
-    *)          machine="UNKNOWN:${unameOut}"
+    *)          machine="UNKNOWN:${unameOut}";;
 esac
 
-if [ ! -d "external/shaders" ]
-then
-	mkdir external/shaders
-fi
+mkdir -p external/shaders
+
+OPTIX_VERSION=9.1.0
 
 if [ "${machine}" == "Linux" ]
 then
-	echo "Setting up variables for Linux"
-	export OPTIX_VERSION=7.1.0
-	export INCLUDES="-I'/<PATH_TO>/NVIDIA-OptiX-SDK-${OPTIX_VERSION}-linux64-x86_64/include'"
-	export INCLUDES="$INCLUDES -I'../include'"
-	export INCLUDES="$INCLUDES -I'/usr/local/cuda/samples/common/inc'" #For math_helper.h
-	export NVCC="/usr/local/cuda/bin/nvcc"
-	export COMPILER="g++"
-else 
-	if [ "${machine}" == "MinGw" ]
-	then
-		echo "Setting up variables for Windows (Git Bash)"
+    echo "Setting up variables for Linux"
 
-		export OPTIX_VERSION=7.1.0
-		export CUDA_VERSION=11.4
-		export INCLUDES=(-I"/c/ProgramData/NVIDIA Corporation/OptiX SDK $OPTIX_VERSION/include" -I"../include" -I"/c/ProgramData/NVIDIA Corporation/CUDA Samples/v${CUDA_VERSION}/common/inc")
-		export NVCC="/c/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v${CUDA_VERSION}/bin/nvcc"
-		# You may need to update the path to a valid compiler. This points to MSVS 2019 compiler
-		export COMPILER="/c/Program Files (x86)/Microsoft Visual Studio/2019/BuildTools/VC/Tools/MSVC/14.29.30037/bin/Hostx64/x64"
-	else
-		echo "Unsupported OS : ${machine}"
-	fi
-fi
+    NVCC="/usr/local/cuda/bin/nvcc"
+    COMPILER="g++"
 
-echo "Compiling for OptiX $OPTIX_VERSION"
-echo "NVCC compiler currently set: $NVCC"
-echo "C++ compiler currently set: $COMPILER"
+    INCLUDES=(
+        -I"./optix_9.1"                         # <-- OptiX 9.1 headers vendored in this repo
+        -I"../include"
+        -I"/usr/local/cuda/samples/common/inc"  # For helper_math.h / math_helper.h (CUDA samples)
+    )
 
-export NVCC_FLAGS="-m64 --std c++11 --use_fast_math -cudart static -arch sm_50 -Xptxas -v"
-
-if [ -f "kernel.ptx" ]
+elif [ "${machine}" == "MinGw" ]
 then
-	rm kernel.ptx
+    echo "Setting up variables for Windows (Git Bash)"
+
+    CUDA_VERSION=11.4
+    INCLUDES=(
+        -I"./optix_7.1"  # <-- also use vendored headers on Windows
+        -I"../include"
+        -I"/c/ProgramData/NVIDIA Corporation/CUDA Samples/v${CUDA_VERSION}/common/inc"
+    )
+
+    NVCC="/c/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v${CUDA_VERSION}/bin/nvcc"
+    COMPILER="/c/Program Files (x86)/Microsoft Visual Studio/2019/BuildTools/VC/Tools/MSVC/14.29.30037/bin/Hostx64/x64"
+else
+    echo "Unsupported OS : ${machine}"
+    exit 1
 fi
 
-exec "$NVCC" $NVCC_FLAGS -ccbin "$COMPILER" "${INCLUDES[@]}" -ptx -o kernel.ptx  kernel.cu >> cudaoutput.txt | tee
+echo "Compiling for OptiX ${OPTIX_VERSION}"
+echo "NVCC compiler currently set: ${NVCC}"
+echo "C++ compiler currently set: ${COMPILER}"
+
+NVCC_FLAGS=(
+    -m64
+    --std=c++11
+    --use_fast_math
+    -cudart=static
+    -arch=sm_86
+    -Xptxas -v
+)
+
+rm -f kernel.ptx
+
+exec "${NVCC}" "${NVCC_FLAGS[@]}" -ccbin "${COMPILER}" "${INCLUDES[@]}" -ptx -o kernel.ptx kernel.cu \
+    >> cudaoutput.txt | tee

@@ -2,11 +2,9 @@ name: Test
 
 on:
   pull_request:
-    branches:
-      - master
+    branches: [master]
   push:
-    branches:
-      - master
+    branches: [master]
 
 jobs:
   test:
@@ -17,7 +15,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest]
-        python-version: ["3.7", "3.8", "3.9", "3.10"]
+        python-version: ["3.11", "3.12", "3.13", "3.14"]
 
     steps:
       - name: Checkout source
@@ -26,15 +24,29 @@ jobs:
           fetch-depth: 0
 
       - name: Install Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v2
+        uses: actions/setup-python@v6
         with:
           python-version: ${{ matrix.python-version }}
 
+      # Install CUDA toolkit (nvcc + CUDA_PATH)
+      - name: Install CUDA Toolkit
+        uses: Jimver/cuda-toolkit@v0.2.29
+        with:
+          cuda: "12.3.0"
+
+      - name: Verify CUDA
+        shell: bash
+        run: |
+          echo "CUDA_PATH=$CUDA_PATH"
+          nvcc --version
+
       - name: Install rtxpy
         run: |
+          python -m pip install -U pip
           python -m pip install -ve .[tests]
           python -m pip list
 
       - name: Run tests
         run: |
           python -m pytest -v rtxpy/tests
+

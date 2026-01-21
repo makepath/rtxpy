@@ -1,23 +1,55 @@
-#include <assert.h>
-#include "cuew.h"
+#include "cuew/cuew.h"          // this pulls in cuda.h safely (no prototypes)
 
-#define OPTIX_DONT_INCLUDE_CUDA
 #include <optix.h>
 #include <optix_function_table_definition.h>
 #include <optix_stack_size.h>
 #include <optix_stubs.h>
 
+// now your other includes:
+#include <assert.h>
+#include <climits>
 #include <sstream>
-
 #include <vector>
 #include <fstream>
+#include <string>
 
 struct float3 { float x,y,z; };
-struct int3   {   int i[3]; };
-#include "common.h"
+struct int3   { int i[3]; };
 
+#include "common.h"
 #include "rtx.h"
 #include "internal.h"
+
+
+// Optional: returns CUDA driver version as int like 12040 == 12.4
+static int getCudaDriverVersion()
+{
+    int v = 0;
+    cuDriverGetVersion(&v);
+    return v;
+}
+
+#define OPTIX_CHECK_RTX(call)                                                     \
+    do {                                                                          \
+        OptixResult _res = (call);                                                \
+        if (_res != OPTIX_SUCCESS) {                                              \
+            std::ostringstream _oss;                                              \
+            _oss << "OptiX call failed: " << #call                                \
+                 << " at " << __FILE__ << ":" << __LINE__                         \
+                 << " (" << __FUNCTION__ << ")\n"                                 \
+                 << "  OptixResult: " << optixResultToString(_res)                \
+                 << " (" << static_cast<int>(_res) << ")\n"                       \
+                 << "  CUDA driver version: " << getCudaDriverVersion() << "\n"  \
+                 << "  OPTIX_ABI_VERSION (compiled): " << OPTIX_ABI_VERSION       \
+                 << "\n";                                                         \
+            if (_res == OPTIX_ERROR_UNSUPPORTED_ABI_VERSION) {                    \
+                _oss << "  Hint: driver/runtime ABI mismatch. Your NVIDIA "       \
+                        "driver is likely too old for this OptiX SDK.\n";         \
+            }                                                                     \
+            setLastErrorRTX(_oss.str().c_str());                                  \
+            return static_cast<int>(_res);                                        \
+        }                                                                         \
+    } while (0)
 
 State global_state;
 
@@ -44,54 +76,80 @@ std::string getTextFileContents(const char* fileName) {
 }
 
 
+static thread_local std::string g_last_error;
+
+extern "C" void setLastErrorRTX(const char* msg)
+{
+    g_last_error = (msg ? msg : "");
+}
+
+extern "C" const char* getLastErrorRTX()
+{
+    return g_last_error.empty() ? nullptr : g_last_error.c_str();
+}
+
+
+static const char* optixResultToString(OptixResult r)
+{
+    switch (r)
+    {
+        case OPTIX_SUCCESS: return "OPTIX_SUCCESS";
+        case OPTIX_ERROR_INVALID_VALUE: return "OPTIX_ERROR_INVALID_VALUE";
+        case OPTIX_ERROR_HOST_OUT_OF_MEMORY: return "OPTIX_ERROR_HOST_OUT_OF_MEMORY";
+        case OPTIX_ERROR_INVALID_OPERATION: return "OPTIX_ERROR_INVALID_OPERATION";
+        case OPTIX_ERROR_FILE_IO_ERROR: return "OPTIX_ERROR_FILE_IO_ERROR";
+        case OPTIX_ERROR_INVALID_FILE_FORMAT: return "OPTIX_ERROR_INVALID_FILE_FORMAT";
+        case OPTIX_ERROR_DISK_CACHE_INVALID_PATH: return "OPTIX_ERROR_DISK_CACHE_INVALID_PATH";
+        case OPTIX_ERROR_UNSUPPORTED_ABI_VERSION: return "OPTIX_ERROR_UNSUPPORTED_ABI_VERSION";
+        case OPTIX_ERROR_FUNCTION_TABLE_SIZE_MISMATCH: return "OPTIX_ERROR_FUNCTION_TABLE_SIZE_MISMATCH";
+        case OPTIX_ERROR_INVALID_DEVICE_CONTEXT: return "OPTIX_ERROR_INVALID_DEVICE_CONTEXT";
+        default: return "OPTIX_ERROR_UNKNOWN";
+    }
+}
+
 int createModule(State& state)
 {
-    char   log[2048];  // For error reporting from OptiX creation functions
-    size_t logSize = sizeof( log );
+    char   log[16384];
+    size_t logSize = sizeof(log);
 
     OptixModuleCompileOptions module_compile_options = {};
-    module_compile_options.maxRegisterCount          = OPTIX_COMPILE_DEFAULT_MAX_REGISTER_COUNT;
-
-    module_compile_options.optLevel   = OPTIX_COMPILE_OPTIMIZATION_DEFAULT;
-    module_compile_options.debugLevel = OPTIX_COMPILE_DEBUG_LEVEL_LINEINFO;
+    module_compile_options.maxRegisterCount = OPTIX_COMPILE_DEFAULT_MAX_REGISTER_COUNT;
+    module_compile_options.optLevel         = OPTIX_COMPILE_OPTIMIZATION_DEFAULT;
+    module_compile_options.debugLevel       = OPTIX_COMPILE_DEBUG_LEVEL_MINIMAL;
 
     state.pipeline_compile_options.usesMotionBlur        = false;
     state.pipeline_compile_options.traversableGraphFlags = OPTIX_TRAVERSABLE_GRAPH_FLAG_ALLOW_SINGLE_GAS;
     state.pipeline_compile_options.numPayloadValues      = 4;
     state.pipeline_compile_options.numAttributeValues    = 2;
-    state.pipeline_compile_options.exceptionFlags = OPTIX_EXCEPTION_FLAG_NONE;  // should be OPTIX_EXCEPTION_FLAG_STACK_OVERFLOW;
+    state.pipeline_compile_options.exceptionFlags        = OPTIX_EXCEPTION_FLAG_NONE;
     state.pipeline_compile_options.pipelineLaunchParamsVariableName = "params";
 
-#if 0
-    std::string input2 = getTextFileContents("kernel.ptx");
-    size_t      inputSize2 = input2.length();
-    input2 += "\0\0\0";
-    unsigned* asd = reinterpret_cast<unsigned*>(&input2[0]);
-    for (int i = 0; i < inputSize2/4; i++) {
-        fprintf(stderr, "0x%x, ", asd[i]);
-        if (i % 20 == 0 && i > 0) {
-            fprintf(stderr, "\n");
-        }
+    std::string ptx = load_ptx_file("kernel.ptx");
+    if (ptx.empty()) {
+        fprintf(stderr, "Failed to load kernel.ptx\n");
+        return -1;
     }
-#endif
 
-    std::string input(reinterpret_cast<const char*>(buff));
-    size_t      inputSize = input.length();
+    const char*  input     = ptx.data();
+    const size_t inputSize = ptx.size();
 
     OPTIX_CHECK_LOG(
-        optixModuleCreateFromPTX(
-            state.context, 
-            &module_compile_options, 
+        optixModuleCreate(
+            state.context,
+            &module_compile_options,
             &state.pipeline_compile_options,
-            &input[0], 
-            inputSize, 
-            log, 
+            input,
+            inputSize,
+            log,
             &logSize,
             &state.ptx_module
         )
     );
+
     return 0;
 }
+
+
 
 int createProgramGroups(State& state)
 {
@@ -155,59 +213,63 @@ int createPipelines(State& state)
 {
     OptixResult res = OPTIX_SUCCESS;
     char   log[2048];
-    size_t sizeof_log = sizeof( log );
+    size_t sizeof_log = sizeof(log);
 
     const uint32_t    max_trace_depth   = 1;
-    OptixProgramGroup program_groups[3] = {state.raygen, state.miss, state.hit};
+    OptixProgramGroup program_groups[3] = { state.raygen, state.miss, state.hit };
 
     OptixPipelineLinkOptions pipeline_link_options = {};
-    pipeline_link_options.maxTraceDepth            = max_trace_depth;
-    pipeline_link_options.debugLevel               = OPTIX_COMPILE_DEBUG_LEVEL_FULL;
+    pipeline_link_options.maxTraceDepth = max_trace_depth;
 
     res = optixPipelineCreate(
-        state.context, 
-        &state.pipeline_compile_options, 
+        state.context,
+        &state.pipeline_compile_options,
         &pipeline_link_options,
-        program_groups, 
-        sizeof(program_groups) / sizeof(program_groups[0]), 
+        program_groups,
+        sizeof(program_groups) / sizeof(program_groups[0]),
         log,
-        &sizeof_log, 
+        &sizeof_log,
         &state.pipeline
     );
     if (res != OPTIX_SUCCESS) {
-        fprintf(stderr, "Failed to create OptiX Pipeline.");
+        fprintf(stderr, "Failed to create OptiX Pipeline.\nLog:\n%s\n", log);
         return -1;
     }
+
     OptixStackSizes stack_sizes = {};
-    for(auto& prog_group : program_groups) {
-        OPTIX_CHECK(optixUtilAccumulateStackSizes(prog_group, &stack_sizes));
+    for (auto& prog_group : program_groups) {
+        OPTIX_CHECK(optixUtilAccumulateStackSizes(prog_group, &stack_sizes, state.pipeline));
     }
 
-    uint32_t direct_callable_stack_size_from_traversal;
-    uint32_t direct_callable_stack_size_from_state;
-    uint32_t continuation_stack_size;
+    uint32_t direct_callable_stack_size_from_traversal = 0;
+    uint32_t direct_callable_stack_size_from_state     = 0;
+    uint32_t continuation_stack_size                   = 0;
+
     OPTIX_CHECK(
         optixUtilComputeStackSizes(
-            &stack_sizes, 
+            &stack_sizes,
             max_trace_depth,
-            0,  // maxCCDepth
-            0,  // maxDCDEpth
+            0, // maxCCDepth
+            0, // maxDCDepth
             &direct_callable_stack_size_from_traversal,
-            &direct_callable_stack_size_from_state, 
+            &direct_callable_stack_size_from_state,
             &continuation_stack_size
         )
     );
+
     OPTIX_CHECK(
         optixPipelineSetStackSize(
             state.pipeline,
             direct_callable_stack_size_from_traversal,
             direct_callable_stack_size_from_state,
             continuation_stack_size,
-            1  // maxTraversableDepth
+            1 // maxTraversableDepth
         )
     );
+
     return 0;
 }
+
 
 int createSBT(State& state)
 {
@@ -376,60 +438,82 @@ int buildRTX_internal(State& state, uint64_t hash, float3* verts, int64_t numVer
 
 int cleanup_internal(State& state)
 {
-    //In case cleanup has already been called, don't call it again
+    // If CUDA context was never created, nothing to do.
     if (state.cuda.context == 0) {
+        state.valid = false;
         return 0;
     }
-    state.valid = false;
-    state.scene.freeMem();
-    
-    OPTIX_CHECK(optixPipelineDestroy(state.pipeline));
-    OPTIX_CHECK(optixProgramGroupDestroy(state.raygen));
-    OPTIX_CHECK(optixProgramGroupDestroy(state.miss));
-    OPTIX_CHECK(optixProgramGroupDestroy(state.hit));
-    state.pipeline = 0;
-    state.raygen = 0;
-    state.miss = 0;
-    state.hit = 0;
-    
-    OPTIX_CHECK(optixModuleDestroy(state.ptx_module));
-    OPTIX_CHECK(optixDeviceContextDestroy(state.context));
-    state.ptx_module = 0;
-    state.context = 0;
 
-    CUresult err = CUDA_SUCCESS;
-    err = cuMemFree(state.sbt.raygenRecord);
-    assert(err == CUDA_SUCCESS);
-    err = cuMemFree(state.sbt.missRecordBase);
-    assert(err == CUDA_SUCCESS);
-    err = cuMemFree(state.sbt.hitgroupRecordBase);
-    assert(err == CUDA_SUCCESS);
+    state.valid = false;
+
+    // Free scene memory safely
+    state.scene.freeMem();
+    state.scene.hash = uint64_t(-1);
+
+    // OptiX objects (ONLY destroy if non-zero)
+    if (state.pipeline) {
+        optixPipelineDestroy(state.pipeline);
+        state.pipeline = 0;
+    }
+    if (state.raygen) {
+        optixProgramGroupDestroy(state.raygen);
+        state.raygen = 0;
+    }
+    if (state.miss) {
+        optixProgramGroupDestroy(state.miss);
+        state.miss = 0;
+    }
+    if (state.hit) {
+        optixProgramGroupDestroy(state.hit);
+        state.hit = 0;
+    }
+    if (state.ptx_module) {
+        optixModuleDestroy(state.ptx_module);
+        state.ptx_module = 0;
+    }
+    if (state.context) {
+        optixDeviceContextDestroy(state.context);
+        state.context = 0;
+    }
+
+    // Free SBT buffers (ONLY if non-zero)
+    if (state.sbt.raygenRecord) {
+        cuMemFree(state.sbt.raygenRecord);
+    }
+    if (state.sbt.missRecordBase) {
+        cuMemFree(state.sbt.missRecordBase);
+    }
+    if (state.sbt.hitgroupRecordBase) {
+        cuMemFree(state.sbt.hitgroupRecordBase);
+    }
     memset(&state.sbt, 0, sizeof(state.sbt));
 
-    err = cuMemFree(state.d_params);
-    assert(err == CUDA_SUCCESS);
-    err = cuMemFree(state.d_rays);
-    assert(err == CUDA_SUCCESS);
-    err = cuMemFree(state.d_hits);
-    assert(err == CUDA_SUCCESS);
+    // Free params/rays/hits (ONLY if non-zero)
+    if (state.d_params) cuMemFree(state.d_params);
+    if (state.d_rays)   cuMemFree(state.d_rays);
+    if (state.d_hits)   cuMemFree(state.d_hits);
+
     state.d_params = 0;
-    state.d_hits = 0;
-    state.d_rays = 0;
-    state.d_hits_size = 0;
+    state.d_rays   = 0;
+    state.d_hits   = 0;
     state.d_rays_size = 0;
+    state.d_hits_size = 0;
 
-    err = cuStreamDestroy(state.cuda.stream);
-    assert(err == CUDA_SUCCESS);
+    // Stream/context teardown
+    if (state.cuda.stream) {
+        cuStreamDestroy(state.cuda.stream);
+        state.cuda.stream = 0;
+    }
 
-    err = cuDevicePrimaryCtxRelease(state.cuda.device);
-    assert(err == CUDA_SUCCESS);
+    if (state.cuda.device) {
+        cuDevicePrimaryCtxRelease(state.cuda.device);
+        state.cuda.device = 0;
+    }
 
-    state.cuda.stream = 0;
-    state.cuda.device = 0;
     state.cuda.context = 0;
-
-    return err;
+    return 0;
 }
+
 
 int traceRTX_internal(State& state, Ray* rays, Hit* hits, int size) {
     if (!state.valid) {
@@ -518,36 +602,36 @@ int initRTX_internal(State& state) {
     err = cuMemAlloc(&state.d_params, sizeof(Params));
     CHECK_CUDA_LOG(err, "Failed to allocate internal state buffer");
 
-    OPTIX_CHECK(optixInit());
+  // Make the optixInit failure readable in Python:
+    OPTIX_CHECK_RTX(optixInit());
 
-	OptixDeviceContextOptions options;
-	options.logCallbackLevel = 0; //MAX verbosity 4
-	options.logCallbackFunction = contextLogCallback;
-	options.logCallbackData = nullptr;
+    // Always zero-init options:
+    OptixDeviceContextOptions options = {};
+    options.logCallbackFunction = contextLogCallback;
+    options.logCallbackData     = nullptr;
+    options.logCallbackLevel    = 4; // max verbosity
+
 #if OPTIX_VERSION >= 70300
 #if DEBUG_PRINTS
-	options.validationMode = OPTIX_DEVICE_CONTEXT_VALIDATION_MODE_ALL;
-#endif //DEBUG_PRINTS
-#endif //OPTIX_VERSION >= 70300
-    OPTIX_CHECK(optixDeviceContextCreate(state.cuda.context, &options, &state.context));
+    options.validationMode = OPTIX_DEVICE_CONTEXT_VALIDATION_MODE_ALL;
+#endif
+#endif
+
+    OPTIX_CHECK_RTX(optixDeviceContextCreate(state.cuda.context, &options, &state.context));
+
     if (!state.context) {
-        return -1;
-    }
-    if (createModule(state)) {
-        return -1;
-    }
-    if (createProgramGroups(state)) {
-        return -1;
-    }
-    if (createPipelines(state)) {
-        return -1;
-    }
-    if (createSBT(state)) {
+        setLastErrorRTX("optixDeviceContextCreate returned success but state.context is null");
         return -1;
     }
 
+    // For your other helpers, also setLastErrorRTX before returning -1
+    if (createModule(state))         { /* setLastErrorRTX inside createModule */ return -1; }
+    if (createProgramGroups(state))  { /* ... */ return -1; }
+    if (createPipelines(state))      { /* ... */ return -1; }
+    if (createSBT(state))            { /* ... */ return -1; }
+
     state.valid = true;
-    return err;
+    return 0;
 }
 
 int initBuffers_internal(State& state, int numRays) {
@@ -555,22 +639,35 @@ int initBuffers_internal(State& state, int numRays) {
         fprintf(stderr, "State is invalid!");
         return -2;
     }
-    CUresult err = CUDA_SUCCESS;
-    size_t newRaysSize = sizeof(Ray) * numRays;
-    size_t newHitsSize = sizeof(Hit) * numRays;
-    if (newRaysSize != state.d_rays_size || newHitsSize != state.d_hits_size) {
-        err = cuMemFree(state.d_rays);
-        CHECK_CUDA_LOG(err, "Failed to deallocate old input data buffer");
-        err = cuMemFree(state.d_hits);
-        CHECK_CUDA_LOG(err, "Failed to deallocate old output data buffer");
 
+    CUresult err = CUDA_SUCCESS;
+    size_t newRaysSize = sizeof(Ray) * (size_t)numRays;
+    size_t newHitsSize = sizeof(Hit) * (size_t)numRays;
+
+    if (newRaysSize != state.d_rays_size || newHitsSize != state.d_hits_size) {
+
+        // Only free if we actually have something allocated
+        if (state.d_rays) {
+            err = cuMemFree(state.d_rays);
+            CHECK_CUDA_LOG(err, "Failed to deallocate old input data buffer");
+            state.d_rays = 0;
+        }
+        if (state.d_hits) {
+            err = cuMemFree(state.d_hits);
+            CHECK_CUDA_LOG(err, "Failed to deallocate old output data buffer");
+            state.d_hits = 0;
+        }
+
+        // Allocate new buffers
         state.d_rays_size = newRaysSize;
         err = cuMemAlloc(&state.d_rays, state.d_rays_size);
         CHECK_CUDA_LOG(err, "Failed to allocate input data buffer");
+
         state.d_hits_size = newHitsSize;
         err = cuMemAlloc(&state.d_hits, state.d_hits_size);
         CHECK_CUDA_LOG(err, "Failed to allocate output data buffer");
     }
+
     return err;
 }
 
