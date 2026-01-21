@@ -43,25 +43,26 @@ jobs:
           echo "=== CUDA Version ==="
           nvcc --version || echo "nvcc not in PATH, checking CUDA_PATH..."
           echo "CUDA_PATH=${CUDA_PATH:-not set}"
-          echo ""
-          echo "=== Looking for OptiX SDK ==="
-          # Common locations for OptiX SDK
-          for dir in /opt/nvidia/OptiX* /usr/local/OptiX* "$HOME/OptiX*" /opt/optix*; do
-            if [ -d "$dir" ]; then
-              echo "Found OptiX at: $dir"
-              export OptiX_INSTALL_DIR="$dir"
-            fi
-          done
-          echo "OptiX_INSTALL_DIR=${OptiX_INSTALL_DIR:-not found}"
 
-      - name: Install OptiX SDK
+      - name: Install OptiX SDK headers
         run: |
-          # Download and install OptiX SDK if not present
-          # Note: OptiX SDK requires NVIDIA developer account for direct download
-          # The NVIDIA GPU-Optimized image may have it pre-installed
-          if [ -z "$OptiX_INSTALL_DIR" ]; then
-            echo "OptiX SDK not found in common locations"
-            echo "Checking if otk-pyoptix wheel is available..."
+          # Clone NVIDIA's public OptiX headers repository
+          # This contains the minimal headers needed to build OptiX applications
+          # See: https://github.com/NVIDIA/optix-dev
+          OPTIX_DIR="/opt/optix"
+          sudo mkdir -p ${OPTIX_DIR}
+
+          echo "=== Cloning OptiX SDK headers from NVIDIA/optix-dev ==="
+          sudo git clone --depth 1 https://github.com/NVIDIA/optix-dev.git ${OPTIX_DIR}
+
+          # Verify the headers are present
+          if [ -f "${OPTIX_DIR}/include/optix.h" ]; then
+            echo "OptiX headers installed successfully at: ${OPTIX_DIR}"
+            ls -la ${OPTIX_DIR}/include/
+            echo "OptiX_INSTALL_DIR=${OPTIX_DIR}" >> $GITHUB_ENV
+          else
+            echo "ERROR: OptiX headers not found after clone"
+            exit 1
           fi
 
       - name: Install build dependencies
@@ -71,15 +72,13 @@ jobs:
 
       - name: Install otk-pyoptix from source
         run: |
+          echo "Using OptiX from: ${OptiX_INSTALL_DIR}"
+
           # Clone and install otk-pyoptix
           git clone --depth 1 https://github.com/NVIDIA/otk-pyoptix.git /tmp/otk-pyoptix
           cd /tmp/otk-pyoptix/optix
 
-          # Set OptiX path if found
-          if [ -n "$OptiX_INSTALL_DIR" ]; then
-            export OptiX_INSTALL_DIR
-          fi
-
+          # Install with OptiX path set
           pip install .
 
       - name: Install rtxpy with CUDA dependencies
