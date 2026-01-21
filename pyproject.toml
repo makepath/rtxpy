@@ -4,15 +4,19 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "rtxpy"
-version = "0.0.0"
+version = "0.0.4"
 description = "Ray tracing using CUDA accessible from Python"
 readme = { file = "README.md", content-type = "text/markdown" }
 requires-python = ">=3.10"
 license = { text = "MIT" }
 authors = [{ name = "makepath" }]
-dependencies = ["numpy>=1.16"]
+dependencies = [
+    "numpy>=1.16",
+]
 
 [project.optional-dependencies]
+cuda12 = ["cupy-cuda12x"]
+cuda11 = ["cupy-cuda11x"]
 tests = ["pytest"]
 
 [tool.setuptools]
