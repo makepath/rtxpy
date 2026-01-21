@@ -35,14 +35,29 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
-      - name: Verify GPU and CUDA
+      - name: Verify GPU
         run: |
           echo "=== NVIDIA GPU Info ==="
           nvidia-smi
-          echo ""
+
+      - name: Install CUDA Toolkit
+        uses: Jimver/cuda-toolkit@v0.2.21
+        id: cuda-toolkit
+        with:
+          cuda: '12.6.3'
+          method: 'network'
+
+      - name: Verify CUDA installation
+        run: |
           echo "=== CUDA Version ==="
-          nvcc --version || echo "nvcc not in PATH, checking CUDA_PATH..."
+          nvcc --version
           echo "CUDA_PATH=${CUDA_PATH:-not set}"
+          echo "CUDA installed to: ${{ steps.cuda-toolkit.outputs.CUDA_PATH }}"
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake
 
       - name: Install OptiX SDK headers
         run: |
@@ -51,24 +66,27 @@ jobs:
           # See: https://github.com/NVIDIA/optix-dev
           OPTIX_DIR="/opt/optix"
           sudo mkdir -p ${OPTIX_DIR}
+          sudo chown -R $(whoami) ${OPTIX_DIR}
 
           echo "=== Cloning OptiX SDK headers from NVIDIA/optix-dev ==="
-          sudo git clone --depth 1 https://github.com/NVIDIA/optix-dev.git ${OPTIX_DIR}
+          git clone --depth 1 --verbose https://github.com/NVIDIA/optix-dev.git ${OPTIX_DIR}
+
+          # Debug: show what was cloned
+          echo "=== Contents of ${OPTIX_DIR} ==="
+          ls -la ${OPTIX_DIR}
+          echo "=== Contents of ${OPTIX_DIR}/include (if exists) ==="
+          ls -la ${OPTIX_DIR}/include/ 2>/dev/null || echo "include directory not found"
 
           # Verify the headers are present
           if [ -f "${OPTIX_DIR}/include/optix.h" ]; then
             echo "OptiX headers installed successfully at: ${OPTIX_DIR}"
-            ls -la ${OPTIX_DIR}/include/
             echo "OptiX_INSTALL_DIR=${OPTIX_DIR}" >> $GITHUB_ENV
           else
             echo "ERROR: OptiX headers not found after clone"
+            echo "Attempting alternative: checking if files are in subdirectory..."
+            find ${OPTIX_DIR} -name "optix.h" 2>/dev/null || echo "optix.h not found anywhere"
             exit 1
           fi
-
-      - name: Install build dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y cmake
 
       - name: Install otk-pyoptix from source
         run: |
