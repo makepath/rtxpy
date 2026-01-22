@@ -1,0 +1,19 @@
+# CUDA versions to build against
+cuda_compiler_version:
+  - "12.6"
+
+# Python versions to support
+python:
+  - "3.10"
+  - "3.11"
+  - "3.12"
+  - "3.13"
+  - "3.14"
+
+# Pin numpy for ABI compatibility
+numpy:
+  - "1.26"
+
+# Zip keys to create version combinations
+zip_keys:
+  - - python
