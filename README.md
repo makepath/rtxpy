@@ -45,14 +45,21 @@ pytest -v rtxpy/tests
 
 ## Building kernel.ptx from source
 
-If you need to rebuild the PTX kernel (e.g., for a different OptiX version):
+If you need to rebuild the PTX kernel (e.g., for a different GPU architecture or OptiX version):
 
 ```bash
-# Assuming kernel.cu is available
-nvcc -ptx -o rtxpy/kernel.ptx kernel.cu \
+# Detect your GPU's compute capability (e.g., 75 for Turing, 86 for Ampere)
+GPU_ARCH=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | tr -d '.')
+
+# Compile for your GPU architecture
+nvcc -ptx -o rtxpy/kernel.ptx cuda/kernel.cu \
+    -arch=sm_${GPU_ARCH} \
     -I/path/to/OptiX-SDK/include \
+    -I cuda \
     --use_fast_math
 ```
+
+The CUDA source files are in the `cuda/` directory.
 
 ## WSL2 Support
 

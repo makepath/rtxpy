@@ -97,6 +97,25 @@ jobs:
             exit 1
           fi
 
+      - name: Compile PTX for target GPU
+        run: |
+          # Detect GPU compute capability
+          GPU_ARCH=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | head -1 | tr -d '.')
+          echo "Detected GPU compute capability: sm_${GPU_ARCH}"
+
+          # Compile kernel.cu to PTX for the target architecture
+          echo "=== Compiling kernel.cu to PTX ==="
+          nvcc -ptx \
+            -arch=sm_${GPU_ARCH} \
+            -I${OptiX_INSTALL_DIR}/include \
+            -I cuda \
+            --use_fast_math \
+            -o rtxpy/kernel.ptx \
+            cuda/kernel.cu
+
+          echo "=== PTX compiled successfully ==="
+          head -15 rtxpy/kernel.ptx
+
       - name: Install otk-pyoptix from source
         run: |
           echo "Using OptiX from: ${OptiX_INSTALL_DIR}"
