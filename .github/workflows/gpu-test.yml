@@ -39,6 +39,11 @@ jobs:
         run: |
           echo "=== NVIDIA GPU Info ==="
           nvidia-smi
+          echo ""
+          echo "=== Driver version check ==="
+          echo "OptiX 7.7 requires driver 530.41+"
+          echo "OptiX 8.0 requires driver 535+"
+          echo "OptiX 9.1 requires driver 590+"
 
       - name: Install CUDA Toolkit
         uses: Jimver/cuda-toolkit@v0.2.21
@@ -71,7 +76,9 @@ jobs:
           sudo chown -R $(whoami) ${OPTIX_DIR}
 
           echo "=== Cloning OptiX SDK headers from NVIDIA/optix-dev ==="
-          git clone --depth 1 --verbose https://github.com/NVIDIA/optix-dev.git ${OPTIX_DIR}
+          # Use OptiX 7.7 for broader driver compatibility (requires driver 530.41+)
+          # OptiX 9.x requires R590+ drivers which may not be available on all runners
+          git clone --depth 1 --branch v7.7.0 --verbose https://github.com/NVIDIA/optix-dev.git ${OPTIX_DIR}
 
           # Debug: show what was cloned
           echo "=== Contents of ${OPTIX_DIR} ==="
