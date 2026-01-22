@@ -1,4 +1,3 @@
-# Extra files required in sdist
-include CMakeLists.txt
-recursive-include crtx *.h *.c *cpp *.cu *.sh *.ptx
-recursive-include rtxpy *.ptx *.so
+include README.md
+include LICENSE
+recursive-include rtxpy *.ptx

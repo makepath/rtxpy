@@ -1,0 +1,67 @@
+{% set name = "rtxpy" %}
+{% set version = "0.0.4" %}
+
+package:
+  name: {{ name|lower }}
+  version: {{ version }}
+
+source:
+  path: ..
+
+build:
+  number: 0
+  skip: true  # [not linux]
+  skip: true  # [py<310]
+  script_env:
+    - OPTIX_VERSION=7.7.0
+    # GPU_ARCH can be set by user, otherwise detected at build time
+    - GPU_ARCH
+
+requirements:
+  build:
+    - {{ compiler('c') }}
+    - {{ compiler('cxx') }}
+    - cmake
+    - git
+    - cuda-nvcc
+    - cuda-cudart-dev
+    - cuda-nvrtc-dev
+
+  host:
+    - python
+    - pip
+    - setuptools >=68
+    - wheel
+    - cuda-version >=12
+    - cuda-cudart-dev
+    - cuda-nvrtc-dev
+
+  run:
+    - python >=3.10
+    - numpy >=1.21
+    - cupy >=12.0
+    - cuda-version >=12
+    - __cuda
+
+test:
+  imports:
+    - rtxpy
+  requires:
+    - pytest
+  commands:
+    - python -c "from rtxpy import RTX; print('rtxpy imported successfully')"
+
+about:
+  home: https://github.com/makepath/rtxpy
+  license: MIT
+  license_family: MIT
+  license_file: LICENSE
+  summary: Ray tracing using CUDA accessible from Python
+  description: |
+    RTXpy provides GPU-accelerated ray-triangle intersection using
+    NVIDIA's OptiX ray tracing engine via the otk-pyoptix Python bindings.
+  dev_url: https://github.com/makepath/rtxpy
+
+extra:
+  recipe-maintainers:
+    - makepath

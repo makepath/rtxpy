@@ -1,0 +1,162 @@
+name: GPU Test
+
+# GPU tests are triggered by adding the "GPU CI" label to a PR
+# This prevents expensive GPU runners from running on every commit
+on:
+  pull_request:
+    types: [labeled]
+
+jobs:
+  gpu-test:
+    name: GPU Test ${{ matrix.python-version }}
+    # Only run when the "GPU CI" label is added
+    if: github.event.label.name == 'GPU CI'
+
+    # Use the GPU runner group - you need to create this in your org settings
+    # Go to: Organization Settings > Actions > Runner groups > Create new runner group
+    # Select "NVIDIA GPU-Optimized Image for Linux" when creating the runner
+    runs-on:
+      group: gpu-runners
+      labels: linux-gpu
+
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12", "3.13"]
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Verify GPU
+        run: |
+          echo "=== NVIDIA GPU Info ==="
+          nvidia-smi
+          echo ""
+          echo "=== Driver version check ==="
+          echo "OptiX 7.7 requires driver 530.41+"
+          echo "OptiX 8.0 requires driver 535+"
+          echo "OptiX 9.1 requires driver 590+"
+
+      - name: Install CUDA Toolkit
+        uses: Jimver/cuda-toolkit@v0.2.21
+        id: cuda-toolkit
+        with:
+          cuda: '12.6.3'
+          method: 'network'
+          # Only install toolkit components, not drivers (runner already has drivers)
+          sub-packages: '["nvcc", "cudart-dev", "nvrtc-dev", "thrust"]'
+
+      - name: Verify CUDA installation
+        run: |
+          echo "=== CUDA Version ==="
+          nvcc --version
+          echo "CUDA_PATH=${CUDA_PATH:-not set}"
+          echo "CUDA installed to: ${{ steps.cuda-toolkit.outputs.CUDA_PATH }}"
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake
+
+      - name: Install OptiX SDK headers
+        run: |
+          # Clone NVIDIA's public OptiX headers repository
+          # This contains the minimal headers needed to build OptiX applications
+          # See: https://github.com/NVIDIA/optix-dev
+          OPTIX_DIR="/opt/optix"
+          sudo mkdir -p ${OPTIX_DIR}
+          sudo chown -R $(whoami) ${OPTIX_DIR}
+
+          echo "=== Cloning OptiX SDK headers from NVIDIA/optix-dev ==="
+          # Use OptiX 7.7 for broader driver compatibility (requires driver 530.41+)
+          # OptiX 9.x requires R590+ drivers which may not be available on all runners
+          git clone --depth 1 --branch v7.7.0 --verbose https://github.com/NVIDIA/optix-dev.git ${OPTIX_DIR}
+
+          # Debug: show what was cloned
+          echo "=== Contents of ${OPTIX_DIR} ==="
+          ls -la ${OPTIX_DIR}
+          echo "=== Contents of ${OPTIX_DIR}/include (if exists) ==="
+          ls -la ${OPTIX_DIR}/include/ 2>/dev/null || echo "include directory not found"
+
+          # Verify the headers are present
+          if [ -f "${OPTIX_DIR}/include/optix.h" ]; then
+            echo "OptiX headers installed successfully at: ${OPTIX_DIR}"
+            echo "OptiX_INSTALL_DIR=${OPTIX_DIR}" >> $GITHUB_ENV
+          else
+            echo "ERROR: OptiX headers not found after clone"
+            echo "Attempting alternative: checking if files are in subdirectory..."
+            find ${OPTIX_DIR} -name "optix.h" 2>/dev/null || echo "optix.h not found anywhere"
+            exit 1
+          fi
+
+      - name: Compile PTX for target GPU
+        run: |
+          # Detect GPU compute capability
+          GPU_ARCH=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | head -1 | tr -d '.')
+          echo "Detected GPU compute capability: sm_${GPU_ARCH}"
+
+          # Compile kernel.cu to PTX for the target architecture
+          echo "=== Compiling kernel.cu to PTX ==="
+          nvcc -ptx \
+            -arch=sm_${GPU_ARCH} \
+            -I${OptiX_INSTALL_DIR}/include \
+            -I cuda \
+            --use_fast_math \
+            -o rtxpy/kernel.ptx \
+            cuda/kernel.cu
+
+          echo "=== PTX compiled successfully ==="
+          head -15 rtxpy/kernel.ptx
+
+      - name: Install otk-pyoptix from source
+        run: |
+          echo "Using OptiX from: ${OptiX_INSTALL_DIR}"
+
+          # Clone and install otk-pyoptix
+          git clone --depth 1 https://github.com/NVIDIA/otk-pyoptix.git /tmp/otk-pyoptix
+          cd /tmp/otk-pyoptix/optix
+
+          # Install with OptiX path set
+          pip install .
+
+      - name: Install rtxpy with CUDA dependencies
+        run: |
+          python -m pip install -U pip
+          python -m pip install -ve .[tests,cuda12]
+          python -m pip list
+
+      - name: Run GPU tests
+        run: |
+          python -m pytest -v rtxpy/tests
+
+      - name: Test basic ray tracing
+        run: |
+          python -c "
+          from rtxpy import RTX
+          import numpy as np
+
+          # Simple triangle mesh test
+          verts = np.float32([0,0,0, 1,0,0, 0,1,0, 1,1,0])
+          triangles = np.int32([0,1,2, 2,1,3])
+          rays = np.float32([0.33,0.33,100, 0,0,0, -1,1000])
+          hits = np.float32([0,0,0,0])
+
+          optix = RTX()
+          res = optix.build(0, verts, triangles)
+          assert res == 0, f'Build failed with {res}'
+
+          res = optix.trace(rays, hits, 1)
+          assert res == 0, f'Trace failed with {res}'
+
+          print(f'Hit result: t={hits[0]}, normal=({hits[1]}, {hits[2]}, {hits[3]})')
+          assert hits[0] > 0, 'Expected a hit'
+          print('GPU ray tracing test PASSED!')
+          "
