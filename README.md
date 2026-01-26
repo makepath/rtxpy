@@ -61,6 +61,39 @@ nvcc -ptx -o rtxpy/kernel.ptx cuda/kernel.cu \
 
 The CUDA source files are in the `cuda/` directory.
 
+## Building with Conda
+
+The easiest way to build rtxpy with all dependencies is using the included conda recipe:
+
+```bash
+# Install conda-build if not already installed
+conda install conda-build
+
+# Build the package (auto-detects GPU architecture)
+conda build conda-recipe
+
+# Or specify GPU architecture explicitly
+GPU_ARCH=86 conda build conda-recipe  # For RTX 30xx/A100
+
+# Install the built package
+conda install --use-local rtxpy
+```
+
+The conda build automatically:
+1. Clones OptiX SDK headers from NVIDIA/optix-dev
+2. Detects your GPU architecture (or uses `GPU_ARCH` env var)
+3. Compiles the PTX kernel for your GPU
+4. Builds and installs otk-pyoptix
+5. Installs rtxpy
+
+You can also specify the OptiX version:
+```bash
+OPTIX_VERSION=7.7.0 conda build conda-recipe  # Requires driver 530.41+
+OPTIX_VERSION=8.0.0 conda build conda-recipe  # Requires driver 535+
+```
+
+See `conda-recipe/README.md` for detailed documentation, GPU architecture reference, and troubleshooting.
+
 ## WSL2 Support
 
 To get OptiX working on WSL2, follow the instructions from the NVIDIA forums:
