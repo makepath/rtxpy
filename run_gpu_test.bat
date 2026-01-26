@@ -214,6 +214,20 @@ if errorlevel 1 (
         echo ERROR: Failed to clone otk-pyoptix
         exit /b 1
     )
+
+    :: Pre-clone pybind11 without submodules to avoid FetchContent submodule update failures
+    echo Pre-cloning pybind11 to avoid submodule issues...
+    set "PYBIND11_DIR=%TEMP%\pybind11-src"
+    if exist "!PYBIND11_DIR!" rmdir /s /q "!PYBIND11_DIR!"
+    git clone --depth 1 --branch v2.13.6 https://github.com/pybind/pybind11.git "!PYBIND11_DIR!"
+    if errorlevel 1 (
+        echo WARNING: Failed to pre-clone pybind11, will try without
+    ) else (
+        :: Tell CMake to use our pre-cloned pybind11 instead of fetching
+        set "FETCHCONTENT_SOURCE_DIR_PYBIND11=!PYBIND11_DIR!"
+        echo Using pre-cloned pybind11 at !PYBIND11_DIR!
+    )
+
     pushd "%TEMP%\otk-pyoptix\optix"
 
     :: Set OptiX path for cmake/pip build process
