@@ -238,12 +238,15 @@ if errorlevel 1 (
     set "PYBIND11_DIR_CMAKE=!PYBIND11_DIR:\=/!"
 
     :: Prepend the FETCHCONTENT_SOURCE_DIR_PYBIND11 setting to CMakeLists.txt
-    echo set(FETCHCONTENT_SOURCE_DIR_PYBIND11 "!PYBIND11_DIR_CMAKE!" CACHE PATH "pybind11 source" FORCE)> "%TEMP%\cmake_prepend.txt"
-    copy /b "%TEMP%\cmake_prepend.txt" + CMakeLists.txt "%TEMP%\CMakeLists_new.txt" >nul
+    :: Use parentheses with echo to create file with newline, then use type to append
+    (
+        echo set^(FETCHCONTENT_SOURCE_DIR_PYBIND11 "!PYBIND11_DIR_CMAKE!" CACHE PATH "pybind11 source" FORCE^)
+        type CMakeLists.txt
+    ) > "%TEMP%\CMakeLists_new.txt"
     move /y "%TEMP%\CMakeLists_new.txt" CMakeLists.txt >nul
 
-    echo Patched CMakeLists.txt - first line:
-    powershell -Command "Get-Content CMakeLists.txt -Head 1"
+    echo Patched CMakeLists.txt - first 2 lines:
+    powershell -Command "Get-Content CMakeLists.txt -Head 2"
 
     :: Set OptiX path for cmake/pip build process
     set "OptiX_INSTALL_DIR=%OptiX_INSTALL_DIR%"
