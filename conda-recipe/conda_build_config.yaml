@@ -1,3 +1,7 @@
+# Channels to use for build dependencies
+channel_sources:
+  - conda-forge,nvidia
+
 # CUDA versions to build against
 cuda_compiler_version:
   - "12.6"
