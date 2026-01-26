@@ -82,7 +82,10 @@ echo.
 :: Step 5: Detect GPU architecture
 echo [5/9] Detecting GPU architecture...
 echo ----------------------------------------
-for /f "tokens=*" %%i in ('nvidia-smi --query-gpu=compute_cap --format=csv,noheader') do set COMPUTE_CAP=%%i
+:: Use skip=1 to skip the CSV header line since noheader may not be supported
+for /f "skip=1 tokens=*" %%i in ('nvidia-smi --query-gpu=compute_cap --format=csv') do (
+    if not defined COMPUTE_CAP set "COMPUTE_CAP=%%i"
+)
 :: Remove the dot from compute capability (e.g., 8.6 -> 86)
 set GPU_ARCH=%COMPUTE_CAP:.=%
 echo Detected GPU compute capability: sm_%GPU_ARCH%
