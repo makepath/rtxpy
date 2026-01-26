@@ -2,17 +2,35 @@
 
 This conda recipe builds rtxpy with all required dependencies including OptiX and CUDA support.
 
+## Supported Platforms
+
+- **Linux** (x86_64)
+- **Windows** (x86_64)
+
 ## Prerequisites
 
-- NVIDIA GPU with compute capability 5.2+ (Maxwell or newer)
+- NVIDIA GPU with compute capability 7.5+ (Turing or newer, for CUDA 12+)
 - NVIDIA driver 530.41+ (for OptiX 7.7 compatibility)
 - conda-build installed
 
+## Python and NumPy Compatibility
+
+| Python Version | NumPy Version |
+|----------------|---------------|
+| 3.10, 3.11, 3.12 | >=1.21, <3 |
+| 3.13+ | >=2.0, <3 |
+
 ## Building the Package
 
-### Basic build (auto-detect GPU architecture):
+### Linux - Basic build (auto-detect GPU architecture):
 
 ```bash
+conda build conda-recipe
+```
+
+### Windows - Basic build:
+
+```cmd
 conda build conda-recipe
 ```
 
@@ -58,10 +76,10 @@ conda install --use-local rtxpy
 
 ## GPU Architecture Reference
 
+**Note:** CUDA 12+ requires compute capability 7.5+ (Turing or newer).
+
 | GPU Series | Architecture | Compute Capability |
 |------------|--------------|-------------------|
-| GTX 900, Tesla M | Maxwell | sm_52 |
-| GTX 1000, Tesla P | Pascal | sm_60, sm_61 |
 | RTX 2000, Tesla T4 | Turing | sm_75 |
 | RTX 3000, A100 | Ampere | sm_80, sm_86 |
 | RTX 4000, L40 | Ada Lovelace | sm_89 |
@@ -87,7 +105,21 @@ Your driver is too old for the OptiX version. Either:
 
 ### "Invalid target architecture" error
 The PTX was compiled for a different GPU. Rebuild with your GPU's architecture:
+
+**Linux:**
 ```bash
 GPU_ARCH=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | tr -d '.')
 conda build conda-recipe
 ```
+
+**Windows:**
+```cmd
+for /f "tokens=*" %a in ('nvidia-smi --query-gpu^=compute_cap --format^=csv^,noheader') do set GPU_ARCH=%a
+set GPU_ARCH=%GPU_ARCH:.=%
+conda build conda-recipe
+```
+
+### NumPy version conflicts
+If you see errors about numpy version incompatibility:
+- Python 3.13+ requires numpy 2.0 or later
+- The recipe handles this automatically with conditional dependencies

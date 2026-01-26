@@ -10,7 +10,6 @@ source:
 
 build:
   number: 0
-  skip: true  # [not linux]
   skip: true  # [py<310]
   script_env:
     - OPTIX_VERSION=7.7.0
@@ -38,10 +37,11 @@ requirements:
 
   run:
     - python >=3.10
-    - numpy >=1.21
+    - numpy >=1.21,<3  # [py<313]
+    - numpy >=2.0,<3  # [py>=313]
     - cupy >=12.0
     - cuda-version >=12
-    - __cuda
+    - __cuda  # [linux]
 
 test:
   imports:
