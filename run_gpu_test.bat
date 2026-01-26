@@ -89,57 +89,77 @@ if not errorlevel 1 (
     goto :vs_done
 )
 
-:: Try to find and run vcvars64.bat for various VS versions
-set "VCVARS_FOUND="
+:: Use vswhere to find Visual Studio installation (most reliable method)
+set "VSWHERE=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe"
+set "VCVARS_PATH="
 
-:: VS 2022 paths
-for %%e in (Enterprise Professional Community BuildTools) do (
-    if not defined VCVARS_FOUND (
-        if exist "C:\Program Files\Microsoft Visual Studio\2022\%%e\VC\Auxiliary\Build\vcvars64.bat" (
-            echo Found VS 2022 %%e
-            call "C:\Program Files\Microsoft Visual Studio\2022\%%e\VC\Auxiliary\Build\vcvars64.bat" >nul 2>&1
-            set "VCVARS_FOUND=1"
+if exist "%VSWHERE%" (
+    echo Using vswhere to locate Visual Studio...
+    for /f "usebackq tokens=*" %%i in (`"%VSWHERE%" -latest -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do (
+        set "VS_PATH=%%i"
+    )
+    if defined VS_PATH (
+        set "VCVARS_PATH=!VS_PATH!\VC\Auxiliary\Build\vcvars64.bat"
+    )
+)
+
+:: Fallback: try common paths if vswhere didn't work
+if not defined VCVARS_PATH (
+    echo vswhere not found or no VS with C++ tools, trying common paths...
+    for %%p in (
+        "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat"
+        "C:\Program Files\Microsoft Visual Studio\2022\Professional\VC\Auxiliary\Build\vcvars64.bat"
+        "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
+        "C:\Program Files\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat"
+        "C:\Program Files (x86)\Microsoft Visual Studio\2019\Community\VC\Auxiliary\Build\vcvars64.bat"
+        "C:\Program Files (x86)\Microsoft Visual Studio\2019\Professional\VC\Auxiliary\Build\vcvars64.bat"
+        "C:\Program Files (x86)\Microsoft Visual Studio\2019\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
+        "C:\Program Files (x86)\Microsoft Visual Studio\2019\BuildTools\VC\Auxiliary\Build\vcvars64.bat"
+    ) do (
+        if not defined VCVARS_PATH (
+            if exist %%p (
+                set "VCVARS_PATH=%%~p"
+            )
         )
     )
 )
 
-:: VS 2019 paths
-for %%e in (Enterprise Professional Community BuildTools) do (
-    if not defined VCVARS_FOUND (
-        if exist "C:\Program Files (x86)\Microsoft Visual Studio\2019\%%e\VC\Auxiliary\Build\vcvars64.bat" (
-            echo Found VS 2019 %%e
-            call "C:\Program Files (x86)\Microsoft Visual Studio\2019\%%e\VC\Auxiliary\Build\vcvars64.bat" >nul 2>&1
-            set "VCVARS_FOUND=1"
-        )
-    )
+if not defined VCVARS_PATH (
+    echo ERROR: Could not find Visual Studio with C++ tools.
+    echo.
+    echo Please install Visual Studio with C++ build tools:
+    echo   winget install Microsoft.VisualStudio.2022.Community --silent --override "--wait --quiet --add Microsoft.VisualStudio.Workload.NativeDesktop --add Microsoft.VisualStudio.Component.VC.Tools.x86.x64 --includeRecommended"
+    echo.
+    echo Or run this script from "x64 Native Tools Command Prompt for VS 2022"
+    exit /b 1
 )
 
-:: VS 2017 paths
-for %%e in (Enterprise Professional Community BuildTools) do (
-    if not defined VCVARS_FOUND (
-        if exist "C:\Program Files (x86)\Microsoft Visual Studio\2017\%%e\VC\Auxiliary\Build\vcvars64.bat" (
-            echo Found VS 2017 %%e
-            call "C:\Program Files (x86)\Microsoft Visual Studio\2017\%%e\VC\Auxiliary\Build\vcvars64.bat" >nul 2>&1
-            set "VCVARS_FOUND=1"
-        )
-    )
-)
-
-if not defined VCVARS_FOUND (
-    echo ERROR: Could not find Visual Studio installation.
-    echo Please install Visual Studio with C++ build tools, or run this script
-    echo from a "Developer Command Prompt for Visual Studio" or "x64 Native Tools Command Prompt".
+echo Found: %VCVARS_PATH%
+echo Initializing Visual Studio environment...
+call "%VCVARS_PATH%"
+if errorlevel 1 (
+    echo ERROR: Failed to initialize Visual Studio environment
     exit /b 1
 )
 
 :: Verify cl.exe is now available
 where cl.exe >nul 2>&1
 if errorlevel 1 (
-    echo ERROR: cl.exe still not found after setting up VS environment.
-    echo Please run this script from a "Developer Command Prompt for Visual Studio".
+    echo.
+    echo ERROR: cl.exe still not found after running vcvars64.bat
+    echo The C++ compiler may not be installed. Please ensure you have installed
+    echo the "Desktop development with C++" workload in Visual Studio.
+    echo.
+    echo You can add it by running:
+    echo   "%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vs_installer.exe" modify --installPath "!VS_PATH!" --add Microsoft.VisualStudio.Component.VC.Tools.x86.x64
+    echo.
+    echo Or run this script from "x64 Native Tools Command Prompt for VS 2022"
     exit /b 1
 )
+echo.
 echo Visual Studio environment configured successfully
+echo Compiler:
+where cl.exe
 :vs_done
 echo.
 
