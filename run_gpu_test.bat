@@ -18,7 +18,7 @@ set SCRIPT_DIR=%~dp0
 cd /d "%SCRIPT_DIR%"
 
 :: Step 1: Verify GPU
-echo [1/9] Verifying NVIDIA GPU...
+echo [1/10] Verifying NVIDIA GPU...
 echo ----------------------------------------
 nvidia-smi >nul 2>&1
 if errorlevel 1 (
@@ -33,7 +33,7 @@ echo OptiX 9.1 requires driver 590+
 echo.
 
 :: Step 2: Verify CUDA Toolkit
-echo [2/9] Verifying CUDA Toolkit...
+echo [2/10] Verifying CUDA Toolkit...
 echo ----------------------------------------
 nvcc --version >nul 2>&1
 if errorlevel 1 (
@@ -45,7 +45,7 @@ nvcc --version
 echo.
 
 :: Step 3: Verify CMake
-echo [3/9] Verifying CMake...
+echo [3/10] Verifying CMake...
 echo ----------------------------------------
 cmake --version >nul 2>&1
 if errorlevel 1 (
@@ -58,7 +58,7 @@ cmake --version
 echo.
 
 :: Step 4: Install OptiX SDK headers
-echo [4/9] Setting up OptiX SDK headers...
+echo [4/10] Setting up OptiX SDK headers...
 echo ----------------------------------------
 if exist "%OPTIX_DIR%\include\optix.h" (
     echo OptiX headers already installed at %OPTIX_DIR%
@@ -79,8 +79,72 @@ if exist "%OPTIX_DIR%\include\optix.h" (
 set OptiX_INSTALL_DIR=%OPTIX_DIR%
 echo.
 
-:: Step 5: Detect GPU architecture
-echo [5/9] Detecting GPU architecture...
+:: Step 5: Set up Visual Studio environment for nvcc
+echo [5/10] Setting up Visual Studio environment...
+echo ----------------------------------------
+:: Check if cl.exe is already available
+where cl.exe >nul 2>&1
+if not errorlevel 1 (
+    echo Visual Studio environment already configured
+    goto :vs_done
+)
+
+:: Try to find and run vcvars64.bat for various VS versions
+set "VCVARS_FOUND="
+
+:: VS 2022 paths
+for %%e in (Enterprise Professional Community BuildTools) do (
+    if not defined VCVARS_FOUND (
+        if exist "C:\Program Files\Microsoft Visual Studio\2022\%%e\VC\Auxiliary\Build\vcvars64.bat" (
+            echo Found VS 2022 %%e
+            call "C:\Program Files\Microsoft Visual Studio\2022\%%e\VC\Auxiliary\Build\vcvars64.bat" >nul 2>&1
+            set "VCVARS_FOUND=1"
+        )
+    )
+)
+
+:: VS 2019 paths
+for %%e in (Enterprise Professional Community BuildTools) do (
+    if not defined VCVARS_FOUND (
+        if exist "C:\Program Files (x86)\Microsoft Visual Studio\2019\%%e\VC\Auxiliary\Build\vcvars64.bat" (
+            echo Found VS 2019 %%e
+            call "C:\Program Files (x86)\Microsoft Visual Studio\2019\%%e\VC\Auxiliary\Build\vcvars64.bat" >nul 2>&1
+            set "VCVARS_FOUND=1"
+        )
+    )
+)
+
+:: VS 2017 paths
+for %%e in (Enterprise Professional Community BuildTools) do (
+    if not defined VCVARS_FOUND (
+        if exist "C:\Program Files (x86)\Microsoft Visual Studio\2017\%%e\VC\Auxiliary\Build\vcvars64.bat" (
+            echo Found VS 2017 %%e
+            call "C:\Program Files (x86)\Microsoft Visual Studio\2017\%%e\VC\Auxiliary\Build\vcvars64.bat" >nul 2>&1
+            set "VCVARS_FOUND=1"
+        )
+    )
+)
+
+if not defined VCVARS_FOUND (
+    echo ERROR: Could not find Visual Studio installation.
+    echo Please install Visual Studio with C++ build tools, or run this script
+    echo from a "Developer Command Prompt for Visual Studio" or "x64 Native Tools Command Prompt".
+    exit /b 1
+)
+
+:: Verify cl.exe is now available
+where cl.exe >nul 2>&1
+if errorlevel 1 (
+    echo ERROR: cl.exe still not found after setting up VS environment.
+    echo Please run this script from a "Developer Command Prompt for Visual Studio".
+    exit /b 1
+)
+echo Visual Studio environment configured successfully
+:vs_done
+echo.
+
+:: Step 6: Detect GPU architecture
+echo [6/10] Detecting GPU architecture...
 echo ----------------------------------------
 :: Use skip=1 to skip the CSV header line since noheader may not be supported
 for /f "skip=1 tokens=*" %%i in ('nvidia-smi --query-gpu=compute_cap --format=csv') do (
@@ -91,8 +155,8 @@ set GPU_ARCH=%COMPUTE_CAP:.=%
 echo Detected GPU compute capability: sm_%GPU_ARCH%
 echo.
 
-:: Step 6: Compile PTX
-echo [6/9] Compiling kernel.cu to PTX...
+:: Step 7: Compile PTX
+echo [7/10] Compiling kernel.cu to PTX...
 echo ----------------------------------------
 if not exist "cuda\kernel.cu" (
     echo ERROR: cuda\kernel.cu not found. Are you in the rtxpy directory?
@@ -106,8 +170,8 @@ if errorlevel 1 (
 echo PTX compiled successfully to rtxpy\kernel.ptx
 echo.
 
-:: Step 7: Install otk-pyoptix
-echo [7/9] Installing otk-pyoptix...
+:: Step 8: Install otk-pyoptix
+echo [8/10] Installing otk-pyoptix...
 echo ----------------------------------------
 python -c "import optix" >nul 2>&1
 if errorlevel 1 (
@@ -132,8 +196,8 @@ if errorlevel 1 (
 )
 echo.
 
-:: Step 8: Install rtxpy
-echo [8/9] Installing rtxpy with test dependencies...
+:: Step 9: Install rtxpy
+echo [9/10] Installing rtxpy with test dependencies...
 echo ----------------------------------------
 pip install -U pip
 pip install -ve .[tests,cuda12]
@@ -143,8 +207,8 @@ if errorlevel 1 (
 )
 echo.
 
-:: Step 9: Run tests
-echo [9/9] Running GPU tests...
+:: Step 10: Run tests
+echo [10/10] Running GPU tests...
 echo ----------------------------------------
 echo.
 echo === Running pytest ===
