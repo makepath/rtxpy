@@ -234,21 +234,16 @@ if errorlevel 1 (
     :: Patch CMakeLists.txt to use our pre-cloned pybind11 and skip submodule updates
     echo Patching CMakeLists.txt to use local pybind11...
 
-    :: Convert backslashes to forward slashes for CMake and escape for PowerShell
+    :: Convert backslashes to forward slashes for CMake
     set "PYBIND11_DIR_CMAKE=!PYBIND11_DIR:\=/!"
 
-    :: Add set(FETCHCONTENT_SOURCE_DIR_PYBIND11 ...) at the beginning of CMakeLists.txt
-    :: and also add GIT_SUBMODULES "" to the FetchContent_Declare as backup
-    powershell -Command ^
-        "$pybindDir = '%PYBIND11_DIR_CMAKE%';" ^
-        "$content = Get-Content CMakeLists.txt -Raw;" ^
-        "$injection = \"set(FETCHCONTENT_SOURCE_DIR_PYBIND11 `\"$pybindDir`\" CACHE PATH `\"pybind11 source`\" FORCE)`n\";" ^
-        "$content = $injection + $content;" ^
-        "$content = $content -replace '(GIT_TAG\s+v[\d\.]+)(\s*\))', '$1 GIT_SUBMODULES \"\"$2';" ^
-        "Set-Content CMakeLists.txt -Value $content -NoNewline"
+    :: Prepend the FETCHCONTENT_SOURCE_DIR_PYBIND11 setting to CMakeLists.txt
+    echo set(FETCHCONTENT_SOURCE_DIR_PYBIND11 "!PYBIND11_DIR_CMAKE!" CACHE PATH "pybind11 source" FORCE)> "%TEMP%\cmake_prepend.txt"
+    copy /b "%TEMP%\cmake_prepend.txt" + CMakeLists.txt "%TEMP%\CMakeLists_new.txt" >nul
+    move /y "%TEMP%\CMakeLists_new.txt" CMakeLists.txt >nul
 
-    echo Patched CMakeLists.txt - first few lines:
-    powershell -Command "Get-Content CMakeLists.txt -Head 5"
+    echo Patched CMakeLists.txt - first line:
+    powershell -Command "Get-Content CMakeLists.txt -Head 1"
 
     :: Set OptiX path for cmake/pip build process
     set "OptiX_INSTALL_DIR=%OptiX_INSTALL_DIR%"
