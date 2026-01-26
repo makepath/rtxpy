@@ -193,6 +193,18 @@ echo.
 :: Step 8: Install otk-pyoptix
 echo [8/10] Installing otk-pyoptix...
 echo ----------------------------------------
+
+:: Verify OptiX_INSTALL_DIR is set and valid
+if not defined OptiX_INSTALL_DIR (
+    set "OptiX_INSTALL_DIR=%OPTIX_DIR%"
+)
+if not exist "%OptiX_INSTALL_DIR%\include\optix.h" (
+    echo ERROR: OptiX headers not found at %OptiX_INSTALL_DIR%\include
+    echo Please ensure step 4 completed successfully.
+    exit /b 1
+)
+echo Using OptiX_INSTALL_DIR=%OptiX_INSTALL_DIR%
+
 python -c "import optix" >nul 2>&1
 if errorlevel 1 (
     echo otk-pyoptix not found, installing from source...
@@ -203,9 +215,22 @@ if errorlevel 1 (
         exit /b 1
     )
     pushd "%TEMP%\otk-pyoptix\optix"
-    pip install .
+
+    :: Set OptiX path for cmake/pip build process
+    set "OptiX_INSTALL_DIR=%OptiX_INSTALL_DIR%"
+    set "OPTIX_PATH=%OptiX_INSTALL_DIR%"
+    set "CMAKE_PREFIX_PATH=%OptiX_INSTALL_DIR%;%CMAKE_PREFIX_PATH%"
+
+    echo Building with OptiX_INSTALL_DIR=%OptiX_INSTALL_DIR%
+    pip install . -v
     if errorlevel 1 (
+        echo.
         echo ERROR: Failed to install otk-pyoptix
+        echo.
+        echo If the error mentions OptiX not found, try setting manually:
+        echo   set OptiX_INSTALL_DIR=%OptiX_INSTALL_DIR%
+        echo   set OPTIX_PATH=%OptiX_INSTALL_DIR%
+        echo.
         popd
         exit /b 1
     )
