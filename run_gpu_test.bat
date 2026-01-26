@@ -221,22 +221,38 @@ if errorlevel 1 (
     if exist "!PYBIND11_DIR!" rmdir /s /q "!PYBIND11_DIR!"
     git clone --depth 1 --branch v2.13.6 https://github.com/pybind/pybind11.git "!PYBIND11_DIR!"
     if errorlevel 1 (
-        echo WARNING: Failed to pre-clone pybind11, will try without
-    ) else (
-        :: Tell CMake to use our pre-cloned pybind11 instead of fetching
-        set "FETCHCONTENT_SOURCE_DIR_PYBIND11=!PYBIND11_DIR!"
-        echo Using pre-cloned pybind11 at !PYBIND11_DIR!
+        echo ERROR: Failed to clone pybind11
+        exit /b 1
     )
 
+    :: Tell CMake to use our pre-cloned pybind11 instead of fetching
+    set "FETCHCONTENT_SOURCE_DIR_PYBIND11=!PYBIND11_DIR!"
+    echo Using pre-cloned pybind11 at !PYBIND11_DIR!
+
     pushd "%TEMP%\otk-pyoptix\optix"
+
+    :: Patch CMakeLists.txt to add GIT_SUBMODULES "" to pybind11 FetchContent
+    :: This prevents the submodule update that fails on Windows
+    echo Patching CMakeLists.txt to disable pybind11 submodule updates...
+    powershell -Command "$content = Get-Content CMakeLists.txt -Raw; $content = $content -replace '(GIT_TAG\s+v[\d\.]+)(\s*\))', '$1 GIT_SUBMODULES \"\"$2'; Set-Content CMakeLists.txt -Value $content -NoNewline"
 
     :: Set OptiX path for cmake/pip build process
     set "OptiX_INSTALL_DIR=%OptiX_INSTALL_DIR%"
     set "OPTIX_PATH=%OptiX_INSTALL_DIR%"
     set "CMAKE_PREFIX_PATH=%OptiX_INSTALL_DIR%;%CMAKE_PREFIX_PATH%"
 
+    :: Pre-install build dependencies so we can use --no-build-isolation
+    echo Installing build dependencies...
+    pip install setuptools wheel
+
     echo Building with OptiX_INSTALL_DIR=%OptiX_INSTALL_DIR%
-    pip install . -v
+    echo FETCHCONTENT_SOURCE_DIR_PYBIND11=!FETCHCONTENT_SOURCE_DIR_PYBIND11!
+
+    :: Pass pybind11 source dir to CMake via CMAKE_ARGS (used by scikit-build and setuptools)
+    set "CMAKE_ARGS=-DFETCHCONTENT_SOURCE_DIR_PYBIND11=!PYBIND11_DIR!"
+
+    :: Use --no-build-isolation so environment variables are visible to CMake
+    pip install . -v --no-build-isolation
     if errorlevel 1 (
         echo.
         echo ERROR: Failed to install otk-pyoptix
