@@ -271,11 +271,15 @@ def run_playground():
 
         # Convert hillshade to grayscale image
         hs_data = hs.data.get() if hasattr(hs.data, 'get') else hs.data
-        hs_data = np.nan_to_num(hs_data, nan=0.5)
+        vs_data = vs.data.get() if hasattr(vs.data, 'get') else vs.data
+
+        # Track NaN pixels - these will be shown as black
+        nan_mask = np.isnan(hs_data) | np.isnan(vs_data)
+
+        hs_data = np.nan_to_num(hs_data, nan=0.0)
         gray = np.uint8(np.clip(hs_data * 200, 0, 255))
 
         # Create visibility mask
-        vs_data = vs.data.get() if hasattr(vs.data, 'get') else vs.data
         visible_mask = vs_data > 0
 
         # Compose the final image:
@@ -293,6 +297,9 @@ def run_playground():
         colors[~visible_mask, 2] = np.minimum(255, colors[~visible_mask, 2] + 40)
         colors[~visible_mask, 0] = colors[~visible_mask, 0] // 2
         colors[~visible_mask, 1] = colors[~visible_mask, 1] // 2
+
+        # Make NaN pixels black (no data)
+        colors[nan_mask] = [0, 0, 0]
 
         # Draw observer marker
         px, py = coords_to_pixel(vsw, vsh, x_coords, y_coords)
