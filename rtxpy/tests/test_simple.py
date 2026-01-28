@@ -414,3 +414,516 @@ def test_nan_in_elevation_data_sparse(test_cupy, dtype):
         # Near NaN - should not crash
         t_nan_area = float(hits_nan_area[0])
         assert np.isfinite(t_nan_area) or np.isnan(t_nan_area) or t_nan_area == -1.0
+
+
+# =============================================================================
+# Multi-GAS Tests
+# =============================================================================
+
+@pytest.mark.parametrize("test_cupy", [False, True])
+def test_multi_gas_two_meshes(test_cupy):
+    """Test tracing against two meshes at different Z heights."""
+    if test_cupy:
+        if not has_cupy:
+            pytest.skip("cupy not available")
+        import cupy
+        backend = cupy
+    else:
+        backend = np
+
+    rtx = RTX()
+    rtx.clear_scene()  # Clear any state from previous tests
+
+    # Two triangles: one at z=0, one at z=5
+    verts = backend.float32([0, 0, 0, 1, 0, 0, 0.5, 1, 0])
+    tris = backend.int32([0, 1, 2])
+
+    # Add ground mesh at z=0
+    res = rtx.add_geometry("ground", verts, tris)
+    assert res == 0
+
+    # Add elevated mesh at z=5 using transform
+    # Transform: identity rotation, translation (0, 0, 5)
+    transform = [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 5]
+    res = rtx.add_geometry("elevated", verts, tris, transform=transform)
+    assert res == 0
+
+    # Ray pointing down from z=10 at the triangle center
+    rays = backend.float32([0.5, 0.33, 10, 0, 0, 0, -1, 1000])
+    hits = backend.float32([0, 0, 0, 0])
+
+    res = rtx.trace(rays, hits, 1)
+    assert res == 0
+
+    # Should hit the elevated mesh first at z=5 (distance ~5)
+    t_value = float(hits[0])
+    np.testing.assert_almost_equal(t_value, 5.0, decimal=1)
+
+
+@pytest.mark.parametrize("test_cupy", [False, True])
+def test_multi_gas_with_transform(test_cupy):
+    """Test geometry with translation transform."""
+    if test_cupy:
+        if not has_cupy:
+            pytest.skip("cupy not available")
+        import cupy
+        backend = cupy
+    else:
+        backend = np
+
+    rtx = RTX()
+    rtx.clear_scene()  # Clear any state from previous tests
+
+    # Triangle at origin
+    verts = backend.float32([0, 0, 0, 1, 0, 0, 0.5, 1, 0])
+    tris = backend.int32([0, 1, 2])
+
+    # Translate by (10, 0, 0)
+    transform = [1, 0, 0, 10, 0, 1, 0, 0, 0, 0, 1, 0]
+    res = rtx.add_geometry("translated", verts, tris, transform=transform)
+    assert res == 0
+
+    # Ray pointing down at (10.5, 0.33, 10) - should hit translated mesh
+    rays = backend.float32([10.5, 0.33, 10, 0, 0, 0, -1, 1000])
+    hits = backend.float32([0, 0, 0, 0])
+
+    res = rtx.trace(rays, hits, 1)
+    assert res == 0
+
+    t_value = float(hits[0])
+    np.testing.assert_almost_equal(t_value, 10.0, decimal=1)
+
+    # Ray at original position should miss
+    rays_miss = backend.float32([0.5, 0.33, 10, 0, 0, 0, -1, 1000])
+    hits_miss = backend.float32([0, 0, 0, 0])
+
+    res = rtx.trace(rays_miss, hits_miss, 1)
+    assert res == 0
+    assert float(hits_miss[0]) == -1.0  # Miss
+
+
+@pytest.mark.parametrize("test_cupy", [False, True])
+def test_multi_gas_many_geometries(test_cupy):
+    """Stress test with many geometries."""
+    if test_cupy:
+        if not has_cupy:
+            pytest.skip("cupy not available")
+        import cupy
+        backend = cupy
+    else:
+        backend = np
+
+    rtx = RTX()
+    rtx.clear_scene()  # Clear any state from previous tests
+
+    # Small triangle
+    verts = backend.float32([0, 0, 0, 0.5, 0, 0, 0.25, 0.5, 0])
+    tris = backend.int32([0, 1, 2])
+
+    # Add 100 geometries in a 10x10 grid
+    num_geoms = 100
+    for i in range(num_geoms):
+        x = (i % 10) * 2
+        y = (i // 10) * 2
+        transform = [1, 0, 0, x, 0, 1, 0, y, 0, 0, 1, 0]
+        res = rtx.add_geometry(f"mesh_{i}", verts, tris, transform=transform)
+        assert res == 0
+
+    assert rtx.get_geometry_count() == num_geoms
+
+    # Trace a ray at one of the geometries
+    rays = backend.float32([4.25, 4.25, 10, 0, 0, 0, -1, 1000])  # Should hit mesh_22
+    hits = backend.float32([0, 0, 0, 0])
+
+    res = rtx.trace(rays, hits, 1)
+    assert res == 0
+
+    t_value = float(hits[0])
+    np.testing.assert_almost_equal(t_value, 10.0, decimal=1)
+
+
+@pytest.mark.parametrize("test_cupy", [False, True])
+def test_remove_geometry(test_cupy):
+    """Test adding and removing geometry."""
+    if test_cupy:
+        if not has_cupy:
+            pytest.skip("cupy not available")
+        import cupy
+        backend = cupy
+    else:
+        backend = np
+
+    rtx = RTX()
+    rtx.clear_scene()  # Clear any state from previous tests
+
+    verts = backend.float32([0, 0, 0, 1, 0, 0, 0.5, 1, 0])
+    tris = backend.int32([0, 1, 2])
+
+    # Add two geometries
+    rtx.add_geometry("mesh1", verts, tris)
+    rtx.add_geometry("mesh2", verts, tris, transform=[1, 0, 0, 5, 0, 1, 0, 0, 0, 0, 1, 0])
+
+    assert rtx.get_geometry_count() == 2
+    assert "mesh1" in rtx.list_geometries()
+    assert "mesh2" in rtx.list_geometries()
+
+    # Remove one
+    res = rtx.remove_geometry("mesh1")
+    assert res == 0
+
+    assert rtx.get_geometry_count() == 1
+    assert "mesh1" not in rtx.list_geometries()
+    assert "mesh2" in rtx.list_geometries()
+
+    # Remove non-existent should fail
+    res = rtx.remove_geometry("nonexistent")
+    assert res == -1
+
+
+@pytest.mark.parametrize("test_cupy", [False, True])
+def test_replace_geometry(test_cupy):
+    """Test adding geometry with the same ID replaces it."""
+    if test_cupy:
+        if not has_cupy:
+            pytest.skip("cupy not available")
+        import cupy
+        backend = cupy
+    else:
+        backend = np
+
+    rtx = RTX()
+    rtx.clear_scene()  # Clear any state from previous tests
+
+    verts1 = backend.float32([0, 0, 0, 1, 0, 0, 0.5, 1, 0])
+    verts2 = backend.float32([0, 0, 5, 1, 0, 5, 0.5, 1, 5])  # At z=5
+    tris = backend.int32([0, 1, 2])
+
+    # Add initial geometry at z=0
+    rtx.add_geometry("mesh", verts1, tris)
+
+    # Ray should hit at z=0 (distance 10)
+    rays = backend.float32([0.5, 0.33, 10, 0, 0, 0, -1, 1000])
+    hits = backend.float32([0, 0, 0, 0])
+    rtx.trace(rays, hits, 1)
+    np.testing.assert_almost_equal(float(hits[0]), 10.0, decimal=1)
+
+    # Replace with geometry at z=5
+    rtx.add_geometry("mesh", verts2, tris)
+    assert rtx.get_geometry_count() == 1  # Still only one geometry
+
+    # Now should hit at z=5 (distance 5)
+    hits = backend.float32([0, 0, 0, 0])
+    rtx.trace(rays, hits, 1)
+    np.testing.assert_almost_equal(float(hits[0]), 5.0, decimal=1)
+
+
+@pytest.mark.parametrize("test_cupy", [False, True])
+def test_update_transform(test_cupy):
+    """Test updating transform of existing geometry."""
+    if test_cupy:
+        if not has_cupy:
+            pytest.skip("cupy not available")
+        import cupy
+        backend = cupy
+    else:
+        backend = np
+
+    rtx = RTX()
+    rtx.clear_scene()  # Clear any state from previous tests
+
+    verts = backend.float32([0, 0, 0, 1, 0, 0, 0.5, 1, 0])
+    tris = backend.int32([0, 1, 2])
+
+    # Add geometry at origin
+    rtx.add_geometry("mesh", verts, tris)
+
+    # Ray at origin hits
+    rays_origin = backend.float32([0.5, 0.33, 10, 0, 0, 0, -1, 1000])
+    hits = backend.float32([0, 0, 0, 0])
+    rtx.trace(rays_origin, hits, 1)
+    np.testing.assert_almost_equal(float(hits[0]), 10.0, decimal=1)
+
+    # Update transform to translate by (10, 0, 0)
+    res = rtx.update_transform("mesh", [1, 0, 0, 10, 0, 1, 0, 0, 0, 0, 1, 0])
+    assert res == 0
+
+    # Now ray at origin should miss
+    hits = backend.float32([0, 0, 0, 0])
+    rtx.trace(rays_origin, hits, 1)
+    assert float(hits[0]) == -1.0
+
+    # Ray at new position should hit
+    rays_new = backend.float32([10.5, 0.33, 10, 0, 0, 0, -1, 1000])
+    hits = backend.float32([0, 0, 0, 0])
+    rtx.trace(rays_new, hits, 1)
+    np.testing.assert_almost_equal(float(hits[0]), 10.0, decimal=1)
+
+    # Update non-existent should fail
+    res = rtx.update_transform("nonexistent", [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0])
+    assert res == -1
+
+    # Invalid transform length should fail
+    res = rtx.update_transform("mesh", [1, 0, 0])
+    assert res == -1
+
+
+@pytest.mark.parametrize("test_cupy", [False, True])
+def test_list_geometries(test_cupy):
+    """Test list_geometries and get_geometry_count methods."""
+    if test_cupy:
+        if not has_cupy:
+            pytest.skip("cupy not available")
+        import cupy
+        backend = cupy
+    else:
+        backend = np
+
+    rtx = RTX()
+    rtx.clear_scene()  # Clear any state from previous tests
+
+    verts = backend.float32([0, 0, 0, 1, 0, 0, 0.5, 1, 0])
+    tris = backend.int32([0, 1, 2])
+
+    # Initially empty
+    assert rtx.get_geometry_count() == 0
+    assert rtx.list_geometries() == []
+
+    # Add geometries
+    rtx.add_geometry("a", verts, tris)
+    rtx.add_geometry("b", verts, tris)
+    rtx.add_geometry("c", verts, tris)
+
+    assert rtx.get_geometry_count() == 3
+    geoms = rtx.list_geometries()
+    assert "a" in geoms
+    assert "b" in geoms
+    assert "c" in geoms
+
+
+@pytest.mark.parametrize("test_cupy", [False, True])
+def test_clear_scene(test_cupy):
+    """Test clear_scene removes all geometry and resets state."""
+    if test_cupy:
+        if not has_cupy:
+            pytest.skip("cupy not available")
+        import cupy
+        backend = cupy
+    else:
+        backend = np
+
+    rtx = RTX()
+    rtx.clear_scene()  # Clear any state from previous tests
+
+    verts = backend.float32([0, 0, 0, 1, 0, 0, 0.5, 1, 0])
+    tris = backend.int32([0, 1, 2])
+
+    # Add geometries
+    rtx.add_geometry("mesh1", verts, tris)
+    rtx.add_geometry("mesh2", verts, tris)
+    assert rtx.get_geometry_count() == 2
+
+    # Clear scene
+    rtx.clear_scene()
+    assert rtx.get_geometry_count() == 0
+    assert rtx.list_geometries() == []
+
+    # Can use build() after clear
+    res = rtx.build(123, verts, tris)
+    assert res == 0
+    assert rtx.getHash() == 123
+
+
+@pytest.mark.parametrize("test_cupy", [False, True])
+def test_backward_compat_single_gas(test_cupy):
+    """Test that existing single-GAS build() API still works."""
+    if test_cupy:
+        if not has_cupy:
+            pytest.skip("cupy not available")
+        import cupy
+        backend = cupy
+    else:
+        backend = np
+
+    rtx = RTX()
+    rtx.clear_scene()  # Clear any state from previous tests
+
+    verts = backend.float32([0, 0, 0, 1, 0, 0, 0.5, 1, 0])
+    tris = backend.int32([0, 1, 2])
+
+    # Use original API
+    res = rtx.build(12345, verts, tris)
+    assert res == 0
+    assert rtx.getHash() == 12345
+
+    # Trace should work
+    rays = backend.float32([0.5, 0.33, 10, 0, 0, 0, -1, 1000])
+    hits = backend.float32([0, 0, 0, 0])
+    res = rtx.trace(rays, hits, 1)
+    assert res == 0
+    np.testing.assert_almost_equal(float(hits[0]), 10.0, decimal=1)
+
+
+@pytest.mark.parametrize("test_cupy", [False, True])
+def test_switch_multi_to_single(test_cupy):
+    """Test that build() clears multi-GAS state."""
+    if test_cupy:
+        if not has_cupy:
+            pytest.skip("cupy not available")
+        import cupy
+        backend = cupy
+    else:
+        backend = np
+
+    rtx = RTX()
+    rtx.clear_scene()  # Clear any state from previous tests
+
+    verts = backend.float32([0, 0, 0, 1, 0, 0, 0.5, 1, 0])
+    tris = backend.int32([0, 1, 2])
+
+    # Start with multi-GAS
+    rtx.add_geometry("mesh1", verts, tris)
+    rtx.add_geometry("mesh2", verts, tris, transform=[1, 0, 0, 5, 0, 1, 0, 0, 0, 0, 1, 0])
+    assert rtx.get_geometry_count() == 2
+
+    # Switch to single-GAS with build()
+    res = rtx.build(999, verts, tris)
+    assert res == 0
+
+    # Multi-GAS state should be cleared
+    assert rtx.get_geometry_count() == 0
+
+    # Trace should use single-GAS
+    rays = backend.float32([0.5, 0.33, 10, 0, 0, 0, -1, 1000])
+    hits = backend.float32([0, 0, 0, 0])
+    res = rtx.trace(rays, hits, 1)
+    assert res == 0
+    np.testing.assert_almost_equal(float(hits[0]), 10.0, decimal=1)
+
+
+@pytest.mark.parametrize("test_cupy", [False, True])
+def test_switch_single_to_multi(test_cupy):
+    """Test that add_geometry() clears single-GAS state."""
+    if test_cupy:
+        if not has_cupy:
+            pytest.skip("cupy not available")
+        import cupy
+        backend = cupy
+    else:
+        backend = np
+
+    rtx = RTX()
+    rtx.clear_scene()  # Clear any state from previous tests
+
+    verts = backend.float32([0, 0, 0, 1, 0, 0, 0.5, 1, 0])
+    tris = backend.int32([0, 1, 2])
+
+    # Start with single-GAS
+    rtx.build(888, verts, tris)
+    assert rtx.getHash() == 888
+
+    # Switch to multi-GAS
+    rtx.add_geometry("mesh", verts, tris)
+
+    # Single-GAS hash should be cleared
+    assert rtx.getHash() == 0xFFFFFFFFFFFFFFFF
+
+    # Trace should use multi-GAS (IAS)
+    rays = backend.float32([0.5, 0.33, 10, 0, 0, 0, -1, 1000])
+    hits = backend.float32([0, 0, 0, 0])
+    res = rtx.trace(rays, hits, 1)
+    assert res == 0
+    np.testing.assert_almost_equal(float(hits[0]), 10.0, decimal=1)
+
+
+@pytest.mark.parametrize("test_cupy", [False, True])
+def test_empty_scene(test_cupy):
+    """Test behavior when tracing after removing all geometry."""
+    if test_cupy:
+        if not has_cupy:
+            pytest.skip("cupy not available")
+        import cupy
+        backend = cupy
+    else:
+        backend = np
+
+    rtx = RTX()
+    rtx.clear_scene()  # Clear any state from previous tests
+
+    verts = backend.float32([0, 0, 0, 1, 0, 0, 0.5, 1, 0])
+    tris = backend.int32([0, 1, 2])
+
+    # Add and then remove all geometry
+    rtx.add_geometry("mesh", verts, tris)
+    rtx.remove_geometry("mesh")
+    assert rtx.get_geometry_count() == 0
+
+    # Trace should fail gracefully (return error)
+    rays = backend.float32([0.5, 0.33, 10, 0, 0, 0, -1, 1000])
+    hits = backend.float32([0, 0, 0, 0])
+    res = rtx.trace(rays, hits, 1)
+    assert res == -1  # No geometry to trace against
+
+
+@pytest.mark.parametrize("test_cupy", [False, True])
+def test_trace_miss_multi_gas(test_cupy):
+    """Test ray that misses all geometries in multi-GAS mode."""
+    if test_cupy:
+        if not has_cupy:
+            pytest.skip("cupy not available")
+        import cupy
+        backend = cupy
+    else:
+        backend = np
+
+    rtx = RTX()
+    rtx.clear_scene()  # Clear any state from previous tests
+
+    verts = backend.float32([0, 0, 0, 1, 0, 0, 0.5, 1, 0])
+    tris = backend.int32([0, 1, 2])
+
+    rtx.add_geometry("mesh", verts, tris)
+
+    # Ray that misses the geometry
+    rays = backend.float32([100, 100, 10, 0, 0, 0, -1, 1000])
+    hits = backend.float32([0, 0, 0, 0])
+
+    res = rtx.trace(rays, hits, 1)
+    assert res == 0
+    assert float(hits[0]) == -1.0  # Miss
+
+
+@pytest.mark.parametrize("test_cupy", [False, True])
+def test_cupy_buffers_multi_gas(test_cupy):
+    """Test multi-GAS mode works with cupy buffers for rays/hits."""
+    if test_cupy:
+        if not has_cupy:
+            pytest.skip("cupy not available")
+        import cupy
+
+    rtx = RTX()
+    rtx.clear_scene()  # Clear any state from previous tests
+
+    # Use numpy arrays for vertex/triangle data (works with both backends)
+    verts = np.float32([0, 0, 0, 1, 0, 0, 0.5, 1, 0])
+    tris = np.int32([0, 1, 2])
+
+    rtx.add_geometry("mesh", verts, tris)
+
+    # Create ray/hit buffers on the appropriate backend
+    if test_cupy:
+        rays = cupy.array([0.5, 0.33, 10, 0, 0, 0, -1, 1000], dtype=cupy.float32)
+        hits = cupy.zeros(4, dtype=cupy.float32)
+    else:
+        rays = np.float32([0.5, 0.33, 10, 0, 0, 0, -1, 1000])
+        hits = np.float32([0, 0, 0, 0])
+
+    res = rtx.trace(rays, hits, 1)
+    assert res == 0
+
+    # Convert to numpy for comparison
+    if test_cupy:
+        hits_np = hits.get()
+    else:
+        hits_np = hits
+
+    np.testing.assert_almost_equal(hits_np[0], 10.0, decimal=1)
