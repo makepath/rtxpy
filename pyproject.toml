@@ -35,7 +35,7 @@ dependencies = [
 # Install cupy via: conda install -c conda-forge cupy
 # Note: otk-pyoptix must be installed separately from NVIDIA
 # See: https://github.com/NVIDIA/otk-pyoptix
-tests = ["pytest"]
+tests = ["pytest", "cupy"]
 
 [project.urls]
 Homepage = "https://github.com/makepath/rtxpy"

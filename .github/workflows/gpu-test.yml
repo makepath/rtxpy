@@ -130,7 +130,7 @@ jobs:
       - name: Install rtxpy with CUDA dependencies
         run: |
           python -m pip install -U pip
-          python -m pip install -ve .[tests,cuda12]
+          python -m pip install -ve .[tests]
           python -m pip list
 
       - name: Run GPU tests
