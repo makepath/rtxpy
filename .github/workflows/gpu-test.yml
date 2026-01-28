@@ -41,7 +41,7 @@ jobs:
       - name: Install CuPy
         shell: bash -el {0}
         run: |
-          conda install -y -c conda-forge cupy
+          conda install -y -c conda-forge cupy xarray
 
       - name: Verify GPU
         run: |
