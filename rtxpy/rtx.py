@@ -49,6 +49,7 @@ class _OptixState:
     """
 
     def __init__(self):
+        self.device_id = None  # CUDA device ID used for this context
         self.context = None
         self.module = None
         self.pipeline = None
@@ -83,6 +84,9 @@ class _OptixState:
 
     def cleanup(self):
         """Release all OptiX and CUDA resources."""
+        # Reset device tracking
+        self.device_id = None
+
         # Free device buffers
         self.d_params = None
         self.d_rays = None
@@ -114,6 +118,10 @@ class _OptixState:
 
         self.initialized = False
 
+    def reset_device(self):
+        """Reset device tracking (called during cleanup)."""
+        self.device_id = None
+
 
 _state = _OptixState()
 
@@ -123,6 +131,106 @@ def _cleanup_at_exit():
     global _state
     if _state:
         _state.cleanup()
+
+
+# -----------------------------------------------------------------------------
+# Device utilities
+# -----------------------------------------------------------------------------
+
+def get_device_count() -> int:
+    """
+    Get the number of available CUDA devices.
+
+    Returns:
+        Number of CUDA-capable GPUs available.
+
+    Example:
+        >>> import rtxpy
+        >>> rtxpy.get_device_count()
+        2
+    """
+    return cupy.cuda.runtime.getDeviceCount()
+
+
+def get_device_properties(device: int = 0) -> dict:
+    """
+    Get properties of a CUDA device.
+
+    Args:
+        device: Device ID (0, 1, 2, ...). Defaults to device 0.
+
+    Returns:
+        Dictionary containing device properties including:
+        - name: Device name (e.g., "NVIDIA GeForce RTX 3090")
+        - compute_capability: Tuple of (major, minor) compute capability
+        - total_memory: Total device memory in bytes
+        - multiprocessor_count: Number of streaming multiprocessors
+
+    Raises:
+        ValueError: If device ID is invalid.
+
+    Example:
+        >>> import rtxpy
+        >>> props = rtxpy.get_device_properties(0)
+        >>> print(props['name'])
+        NVIDIA GeForce RTX 3090
+    """
+    device_count = cupy.cuda.runtime.getDeviceCount()
+    if device < 0 or device >= device_count:
+        raise ValueError(
+            f"Invalid device ID {device}. "
+            f"Available devices: 0-{device_count - 1}"
+        )
+
+    with cupy.cuda.Device(device):
+        props = cupy.cuda.runtime.getDeviceProperties(device)
+
+    return {
+        'name': props['name'].decode('utf-8') if isinstance(props['name'], bytes) else props['name'],
+        'compute_capability': (props['major'], props['minor']),
+        'total_memory': props['totalGlobalMem'],
+        'multiprocessor_count': props['multiProcessorCount'],
+    }
+
+
+def list_devices() -> list:
+    """
+    List all available CUDA devices with their properties.
+
+    Returns:
+        List of dictionaries, each containing device properties.
+        Each dict includes 'id' (device index) plus all properties
+        from get_device_properties().
+
+    Example:
+        >>> import rtxpy
+        >>> for dev in rtxpy.list_devices():
+        ...     print(f"GPU {dev['id']}: {dev['name']}")
+        GPU 0: NVIDIA GeForce RTX 3090
+        GPU 1: NVIDIA GeForce RTX 2080
+    """
+    devices = []
+    for i in range(get_device_count()):
+        props = get_device_properties(i)
+        props['id'] = i
+        devices.append(props)
+    return devices
+
+
+def get_current_device() -> Optional[int]:
+    """
+    Get the CUDA device ID that RTX is currently using.
+
+    Returns:
+        Device ID if RTX has been initialized, None otherwise.
+
+    Example:
+        >>> import rtxpy
+        >>> rtx = rtxpy.RTX(device=1)
+        >>> rtxpy.get_current_device()
+        1
+    """
+    return _state.device_id if _state.initialized else None
 
 
 # -----------------------------------------------------------------------------
@@ -157,12 +265,42 @@ def _log_callback(level, tag, message):
     print(f"[OPTIX][{level}][{tag}]: {message}")
 
 
-def _init_optix():
-    """Initialize OptiX context, module, pipeline, and SBT."""
+def _init_optix(device: Optional[int] = None):
+    """
+    Initialize OptiX context, module, pipeline, and SBT.
+
+    Args:
+        device: CUDA device ID to use. If None, uses the current CuPy device.
+                If already initialized, this parameter is ignored (a warning
+                would be appropriate if it differs from the active device).
+    """
     global _state
 
     if _state.initialized:
+        # Already initialized - check if user requested a different device
+        if device is not None and _state.device_id != device:
+            import warnings
+            warnings.warn(
+                f"RTX already initialized on device {_state.device_id}. "
+                f"Ignoring request for device {device}. "
+                "Create a new Python process to use a different device.",
+                RuntimeWarning
+            )
         return
+
+    # Select the CUDA device if specified
+    if device is not None:
+        device_count = cupy.cuda.runtime.getDeviceCount()
+        if device < 0 or device >= device_count:
+            raise ValueError(
+                f"Invalid device ID {device}. "
+                f"Available devices: 0-{device_count - 1}"
+            )
+        cupy.cuda.Device(device).use()
+        _state.device_id = device
+    else:
+        # Use current device
+        _state.device_id = cupy.cuda.Device().id
 
     # Create OptiX device context (uses cupy's CUDA context)
     _state.context = optix.deviceContextCreate(
@@ -736,11 +874,34 @@ class RTX:
 
     This class provides GPU-accelerated ray-triangle intersection using
     NVIDIA's OptiX ray tracing engine.
+
+    Args:
+        device: CUDA device ID to use (0, 1, 2, ...). If None (default),
+                uses the currently active CuPy device. Use get_device_count()
+                to see available devices.
+
+    Example:
+        # Use default device (device 0 or current CuPy device)
+        rtx = RTX()
+
+        # Use specific GPU
+        rtx = RTX(device=1)
+
+    Note:
+        The RTX context is a singleton - all RTX instances share the same
+        underlying OptiX context. The device can only be set on first
+        initialization. Subsequent RTX() calls with a different device
+        will emit a warning.
     """
 
-    def __init__(self):
-        """Initialize the RTX context."""
-        _init_optix()
+    def __init__(self, device: Optional[int] = None):
+        """
+        Initialize the RTX context.
+
+        Args:
+            device: CUDA device ID to use. If None, uses the current device.
+        """
+        _init_optix(device)
 
     def build(self, hashValue: int, vertexBuffer, indexBuffer) -> int:
         """
@@ -755,6 +916,16 @@ class RTX:
             0 on success, non-zero on error
         """
         return _build_accel(hashValue, vertexBuffer, indexBuffer)
+
+    @property
+    def device(self) -> Optional[int]:
+        """
+        The CUDA device ID this RTX instance is using.
+
+        Returns:
+            Device ID (0, 1, 2, ...) or None if not initialized.
+        """
+        return _state.device_id
 
     def getHash(self) -> int:
         """
