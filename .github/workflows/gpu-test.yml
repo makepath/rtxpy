@@ -30,10 +30,18 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Install Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v5
+      - name: Setup Miniconda
+        uses: conda-incubator/setup-miniconda@v3
         with:
           python-version: ${{ matrix.python-version }}
+          activate-environment: test
+          auto-activate-base: false
+          miniconda-version: "latest"
+
+      - name: Install CuPy
+        shell: bash -el {0}
+        run: |
+          conda install -y -c conda-forge cupy xarray
 
       - name: Verify GPU
         run: |
@@ -117,6 +125,7 @@ jobs:
           head -15 rtxpy/kernel.ptx
 
       - name: Install otk-pyoptix from source
+        shell: bash -el {0}
         run: |
           echo "Using OptiX from: ${OptiX_INSTALL_DIR}"
 
@@ -128,16 +137,19 @@ jobs:
           pip install .
 
       - name: Install rtxpy with CUDA dependencies
+        shell: bash -el {0}
         run: |
           python -m pip install -U pip
-          python -m pip install -ve .[tests,cuda12]
+          python -m pip install -ve .[tests]
           python -m pip list
 
       - name: Run GPU tests
+        shell: bash -el {0}
         run: |
           python -m pytest -v rtxpy/tests
 
       - name: Test basic ray tracing
+        shell: bash -el {0}
         run: |
           python -c "
           from rtxpy import RTX
