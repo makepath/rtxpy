@@ -64,16 +64,21 @@ def generate_primary_rays(rays, x_coords, y_coords, H, W):
         0 on success.
     """
     griddim, blockdim = calc_dims((H, W))
-    # Ensure coordinate arrays are contiguous for numba transfer
-    # (even though they're unused in the kernel, numba still transfers them)
+    # Ensure coordinate arrays are contiguous and writable for numba transfer
+    # (even though they're unused in the kernel, numba still transfers them
+    # and requires writable buffers for the copy-back mechanism)
     if hasattr(x_coords, 'get'):
         x_coords = cupy.ascontiguousarray(x_coords)
     else:
         x_coords = np.ascontiguousarray(x_coords)
+        if not x_coords.flags.writeable:
+            x_coords = x_coords.copy()
     if hasattr(y_coords, 'get'):
         y_coords = cupy.ascontiguousarray(y_coords)
     else:
         y_coords = np.ascontiguousarray(y_coords)
+        if not y_coords.flags.writeable:
+            y_coords = y_coords.copy()
     _generate_primary_rays_kernel[griddim, blockdim](rays, x_coords, y_coords, H, W)
     return 0
 
