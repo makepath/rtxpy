@@ -2,6 +2,10 @@
 
 Ray tracing using CUDA, accessible from Python.
 
+![Crater Lake Viewshed Demo](examples/images/playground_demo.gif)
+
+*Real-time viewshed analysis with GPU-accelerated ray tracing. Green areas are visible from the observer position (white dot). Run `python examples/playground.py` to try it interactively.*
+
 ## Prerequisites
 
 - NVIDIA GPU with RTX support (Maxwell architecture or newer)

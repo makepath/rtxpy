@@ -6,6 +6,7 @@ from .rtx import (
     list_devices,
     get_current_device,
 )
+from .mesh import triangulate_terrain, write_stl
+from .analysis import viewshed, hillshade
 
-
-__version__ = "0.0.4"
+__version__ = "0.0.5"
