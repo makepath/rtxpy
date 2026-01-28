@@ -362,9 +362,9 @@ def _build_gas_for_geometry(vertices, indices):
     )
     build_input.numVertices = num_vertices
 
-    # Acceleration structure options
+    # Acceleration structure options - enable compaction for memory savings
     accel_options = optix.AccelBuildOptions(
-        buildFlags=optix.BUILD_FLAG_ALLOW_RANDOM_VERTEX_ACCESS,
+        buildFlags=optix.BUILD_FLAG_ALLOW_RANDOM_VERTEX_ACCESS | optix.BUILD_FLAG_ALLOW_COMPACTION,
         operation=optix.BUILD_OPERATION_BUILD,
     )
 
@@ -378,7 +378,10 @@ def _build_gas_for_geometry(vertices, indices):
     d_temp = cupy.zeros(buffer_sizes.tempSizeInBytes, dtype=cupy.uint8)
     gas_buffer = cupy.zeros(buffer_sizes.outputSizeInBytes, dtype=cupy.uint8)
 
-    # Build acceleration structure
+    # Allocate buffer to receive compacted size
+    compacted_size_buffer = cupy.zeros(1, dtype=cupy.uint64)
+
+    # Build acceleration structure with compacted size emission
     gas_handle = _state.context.accelBuild(
         0,  # stream
         [accel_options],
@@ -387,8 +390,23 @@ def _build_gas_for_geometry(vertices, indices):
         buffer_sizes.tempSizeInBytes,
         gas_buffer.data.ptr,
         buffer_sizes.outputSizeInBytes,
-        [],  # emitted properties
+        [optix.AccelEmitDesc(compacted_size_buffer.data.ptr, optix.PROPERTY_TYPE_COMPACTED_SIZE)],
     )
+
+    # Synchronize to ensure compacted size is available
+    cupy.cuda.Stream.null.synchronize()
+
+    # Compact if it saves memory
+    compacted_size = int(compacted_size_buffer[0])
+    if compacted_size < gas_buffer.nbytes:
+        compacted_buffer = cupy.zeros(compacted_size, dtype=cupy.uint8)
+        gas_handle = _state.context.accelCompact(
+            0,  # stream
+            gas_handle,
+            compacted_buffer.data.ptr,
+            compacted_size,
+        )
+        gas_buffer = compacted_buffer
 
     return gas_handle, gas_buffer
 
@@ -559,9 +577,9 @@ def _build_accel(hash_value: int, vertices, indices) -> int:
     )
     build_input.numVertices = num_vertices
 
-    # Acceleration structure options
+    # Acceleration structure options - enable compaction for memory savings
     accel_options = optix.AccelBuildOptions(
-        buildFlags=optix.BUILD_FLAG_ALLOW_RANDOM_VERTEX_ACCESS,
+        buildFlags=optix.BUILD_FLAG_ALLOW_RANDOM_VERTEX_ACCESS | optix.BUILD_FLAG_ALLOW_COMPACTION,
         operation=optix.BUILD_OPERATION_BUILD,
     )
 
@@ -573,19 +591,39 @@ def _build_accel(hash_value: int, vertices, indices) -> int:
 
     # Allocate buffers
     d_temp = cupy.zeros(buffer_sizes.tempSizeInBytes, dtype=cupy.uint8)
-    _state.gas_buffer = cupy.zeros(buffer_sizes.outputSizeInBytes, dtype=cupy.uint8)
+    gas_buffer = cupy.zeros(buffer_sizes.outputSizeInBytes, dtype=cupy.uint8)
 
-    # Build acceleration structure
+    # Allocate buffer to receive compacted size
+    compacted_size_buffer = cupy.zeros(1, dtype=cupy.uint64)
+
+    # Build acceleration structure with compacted size emission
     _state.gas_handle = _state.context.accelBuild(
         0,  # stream
         [accel_options],
         [build_input],
         d_temp.data.ptr,
         buffer_sizes.tempSizeInBytes,
-        _state.gas_buffer.data.ptr,
+        gas_buffer.data.ptr,
         buffer_sizes.outputSizeInBytes,
-        [],  # emitted properties
+        [optix.AccelEmitDesc(compacted_size_buffer.data.ptr, optix.PROPERTY_TYPE_COMPACTED_SIZE)],
     )
+
+    # Synchronize to ensure compacted size is available
+    cupy.cuda.Stream.null.synchronize()
+
+    # Compact if it saves memory
+    compacted_size = int(compacted_size_buffer[0])
+    if compacted_size < gas_buffer.nbytes:
+        compacted_buffer = cupy.zeros(compacted_size, dtype=cupy.uint8)
+        _state.gas_handle = _state.context.accelCompact(
+            0,  # stream
+            _state.gas_handle,
+            compacted_buffer.data.ptr,
+            compacted_size,
+        )
+        _state.gas_buffer = compacted_buffer
+    else:
+        _state.gas_buffer = gas_buffer
 
     _state.current_hash = hash_value
     return 0
