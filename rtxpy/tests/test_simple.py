@@ -4,6 +4,24 @@ import xarray as xr
 
 from rtxpy import RTX, has_cupy
 
+# All numpy numeric dtypes to test for elevation input
+NUMPY_NUMERIC_DTYPES = [
+    # Floating point types
+    np.float16,
+    np.float32,
+    np.float64,
+    # Signed integer types
+    np.int8,
+    np.int16,
+    np.int32,
+    np.int64,
+    # Unsigned integer types
+    np.uint8,
+    np.uint16,
+    np.uint32,
+    np.uint64,
+]
+
 
 def triangulate_elevation(elevation_data, backend):
     """
@@ -153,7 +171,8 @@ def test_nan_in_vertex_input(test_cupy):
 
 
 @pytest.mark.parametrize("test_cupy", [False, True])
-def test_nan_in_elevation_data_single_cell(test_cupy):
+@pytest.mark.parametrize("dtype", NUMPY_NUMERIC_DTYPES)
+def test_nan_in_elevation_data_single_cell(test_cupy, dtype):
     """Test behavior when elevation xarray.DataArray contains a single NaN value."""
     if test_cupy:
         if not has_cupy:
@@ -166,11 +185,16 @@ def test_nan_in_elevation_data_single_cell(test_cupy):
         backend = numpy
 
     # Create a 3x3 elevation grid with one NaN value in the center
-    elevation = np.array([
+    # For integer dtypes, NaN must be converted to a value (0) before casting
+    elevation_float = np.array([
         [1.0, 1.0, 1.0],
         [1.0, np.nan, 1.0],
         [1.0, 1.0, 1.0]
-    ], dtype=np.float32)
+    ], dtype=np.float64)
+    if np.issubdtype(dtype, np.integer):
+        elevation = np.nan_to_num(elevation_float, nan=0).astype(dtype)
+    else:
+        elevation = elevation_float.astype(dtype)
 
     da = xr.DataArray(
         elevation,
@@ -212,7 +236,8 @@ def test_nan_in_elevation_data_single_cell(test_cupy):
 
 
 @pytest.mark.parametrize("test_cupy", [False, True])
-def test_nan_in_elevation_data_edge(test_cupy):
+@pytest.mark.parametrize("dtype", NUMPY_NUMERIC_DTYPES)
+def test_nan_in_elevation_data_edge(test_cupy, dtype):
     """Test behavior when elevation xarray.DataArray has NaN on the edge."""
     if test_cupy:
         if not has_cupy:
@@ -225,12 +250,17 @@ def test_nan_in_elevation_data_edge(test_cupy):
         backend = numpy
 
     # Create a 4x4 elevation grid with NaN on one edge
-    elevation = np.array([
+    # For integer dtypes, NaN must be converted to a value (0) before casting
+    elevation_float = np.array([
         [np.nan, 1.0, 1.0, 1.0],
         [1.0, 2.0, 2.0, 1.0],
         [1.0, 2.0, 2.0, 1.0],
         [1.0, 1.0, 1.0, 1.0]
-    ], dtype=np.float32)
+    ], dtype=np.float64)
+    if np.issubdtype(dtype, np.integer):
+        elevation = np.nan_to_num(elevation_float, nan=0).astype(dtype)
+    else:
+        elevation = elevation_float.astype(dtype)
 
     da = xr.DataArray(
         elevation,
@@ -270,7 +300,8 @@ def test_nan_in_elevation_data_edge(test_cupy):
 
 
 @pytest.mark.parametrize("test_cupy", [False, True])
-def test_nan_in_elevation_data_all_nan(test_cupy):
+@pytest.mark.parametrize("dtype", NUMPY_NUMERIC_DTYPES)
+def test_nan_in_elevation_data_all_nan(test_cupy, dtype):
     """Test behavior when elevation xarray.DataArray is entirely NaN."""
     if test_cupy:
         if not has_cupy:
@@ -283,7 +314,12 @@ def test_nan_in_elevation_data_all_nan(test_cupy):
         backend = numpy
 
     # Create a 3x3 elevation grid with all NaN values
-    elevation = np.full((3, 3), np.nan, dtype=np.float32)
+    # For integer dtypes, NaN must be converted to a value (0) before casting
+    elevation_float = np.full((3, 3), np.nan, dtype=np.float64)
+    if np.issubdtype(dtype, np.integer):
+        elevation = np.nan_to_num(elevation_float, nan=0).astype(dtype)
+    else:
+        elevation = elevation_float.astype(dtype)
 
     da = xr.DataArray(
         elevation,
@@ -304,14 +340,21 @@ def test_nan_in_elevation_data_all_nan(test_cupy):
         res = optix.trace(rays, hits, 1)
         assert res == 0
 
-        # With all NaN vertices, should miss or return NaN but not crash
+        # With all NaN vertices (for float dtypes), should miss or return NaN but not crash
+        # For integer dtypes, NaN gets converted to a valid integer, so we may get a hit
         t_value = float(hits[0])
-        assert np.isnan(t_value) or t_value == -1.0, \
-            f"Expected miss or NaN for all-NaN mesh, got t={t_value}"
+        is_float_dtype = np.issubdtype(dtype, np.floating)
+        if is_float_dtype:
+            assert np.isnan(t_value) or t_value == -1.0, \
+                f"Expected miss or NaN for all-NaN mesh, got t={t_value}"
+        else:
+            # Integer dtypes: NaN converted to int, mesh is valid, may hit or miss
+            assert np.isfinite(t_value) or np.isnan(t_value) or t_value == -1.0
 
 
 @pytest.mark.parametrize("test_cupy", [False, True])
-def test_nan_in_elevation_data_sparse(test_cupy):
+@pytest.mark.parametrize("dtype", NUMPY_NUMERIC_DTYPES)
+def test_nan_in_elevation_data_sparse(test_cupy, dtype):
     """Test behavior with sparse NaN pattern in elevation data."""
     if test_cupy:
         if not has_cupy:
@@ -324,13 +367,18 @@ def test_nan_in_elevation_data_sparse(test_cupy):
         backend = numpy
 
     # Create a 5x5 elevation grid with sparse NaN values (checkerboard-like pattern)
-    elevation = np.array([
+    # For integer dtypes, NaN must be converted to a value (0) before casting
+    elevation_float = np.array([
         [1.0, 2.0, np.nan, 2.0, 1.0],
         [2.0, 3.0, 4.0, 3.0, 2.0],
         [np.nan, 4.0, 5.0, 4.0, np.nan],
         [2.0, 3.0, 4.0, 3.0, 2.0],
         [1.0, 2.0, np.nan, 2.0, 1.0]
-    ], dtype=np.float32)
+    ], dtype=np.float64)
+    if np.issubdtype(dtype, np.integer):
+        elevation = np.nan_to_num(elevation_float, nan=0).astype(dtype)
+    else:
+        elevation = elevation_float.astype(dtype)
 
     da = xr.DataArray(
         elevation,
