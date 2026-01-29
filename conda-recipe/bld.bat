@@ -101,60 +101,58 @@ where cmake
 
 :: Set up Visual Studio environment if not already set
 :: This finds and activates the Visual Studio Build Tools
-if not defined VSINSTALLDIR (
-    echo Setting up Visual Studio environment...
-    set "VCVARS_FOUND="
+if defined VSINSTALLDIR goto :vs_done
+echo Setting up Visual Studio environment...
 
-    if exist "C:\Program Files\Microsoft Visual Studio\18\Community\VC\Auxiliary\Build\vcvars64.bat" (
-        echo Found VS 18 Community
-        call "C:\Program Files\Microsoft Visual Studio\18\Community\VC\Auxiliary\Build\vcvars64.bat"
-        set "VCVARS_FOUND=1"
-    )
-    if not defined VCVARS_FOUND if exist "C:\Program Files\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat" (
-        echo Found VS 2022 BuildTools
-        call "C:\Program Files\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat"
-        set "VCVARS_FOUND=1"
-    )
-    if not defined VCVARS_FOUND if exist "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat" (
-        echo Found VS 2022 Community
-        call "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat"
-        set "VCVARS_FOUND=1"
-    )
-    if not defined VCVARS_FOUND if exist "C:\Program Files\Microsoft Visual Studio\2022\Professional\VC\Auxiliary\Build\vcvars64.bat" (
-        echo Found VS 2022 Professional
-        call "C:\Program Files\Microsoft Visual Studio\2022\Professional\VC\Auxiliary\Build\vcvars64.bat"
-        set "VCVARS_FOUND=1"
-    )
-    if not defined VCVARS_FOUND if exist "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat" (
-        echo Found VS 2022 Enterprise
-        call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
-        set "VCVARS_FOUND=1"
-    )
-    if not defined VCVARS_FOUND if exist "C:\Program Files (x86)\Microsoft Visual Studio\2019\BuildTools\VC\Auxiliary\Build\vcvars64.bat" (
-        echo Found VS 2019 BuildTools
-        call "C:\Program Files (x86)\Microsoft Visual Studio\2019\BuildTools\VC\Auxiliary\Build\vcvars64.bat"
-        set "VCVARS_FOUND=1"
-    )
-    if not defined VCVARS_FOUND if exist "C:\Program Files (x86)\Microsoft Visual Studio\2019\Community\VC\Auxiliary\Build\vcvars64.bat" (
-        echo Found VS 2019 Community
-        call "C:\Program Files (x86)\Microsoft Visual Studio\2019\Community\VC\Auxiliary\Build\vcvars64.bat"
-        set "VCVARS_FOUND=1"
-    )
-    if not defined VCVARS_FOUND if exist "C:\Program Files (x86)\Microsoft Visual Studio\2019\Professional\VC\Auxiliary\Build\vcvars64.bat" (
-        echo Found VS 2019 Professional
-        call "C:\Program Files (x86)\Microsoft Visual Studio\2019\Professional\VC\Auxiliary\Build\vcvars64.bat"
-        set "VCVARS_FOUND=1"
-    )
-    if not defined VCVARS_FOUND if exist "C:\Program Files (x86)\Microsoft Visual Studio\2019\Enterprise\VC\Auxiliary\Build\vcvars64.bat" (
-        echo Found VS 2019 Enterprise
-        call "C:\Program Files (x86)\Microsoft Visual Studio\2019\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
-        set "VCVARS_FOUND=1"
-    )
-    if not defined VCVARS_FOUND (
-        echo WARNING: Could not find Visual Studio. Build may fail.
-        echo Please ensure Visual Studio 2019/2022 Build Tools are installed.
-    )
+if exist "C:\Program Files\Microsoft Visual Studio\18\Community\VC\Auxiliary\Build\vcvars64.bat" (
+    echo Found VS 18 Community
+    call "C:\Program Files\Microsoft Visual Studio\18\Community\VC\Auxiliary\Build\vcvars64.bat"
+    goto :vs_done
 )
+if exist "C:\Program Files\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat" (
+    echo Found VS 2022 BuildTools
+    call "C:\Program Files\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat"
+    goto :vs_done
+)
+if exist "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat" (
+    echo Found VS 2022 Community
+    call "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat"
+    goto :vs_done
+)
+if exist "C:\Program Files\Microsoft Visual Studio\2022\Professional\VC\Auxiliary\Build\vcvars64.bat" (
+    echo Found VS 2022 Professional
+    call "C:\Program Files\Microsoft Visual Studio\2022\Professional\VC\Auxiliary\Build\vcvars64.bat"
+    goto :vs_done
+)
+if exist "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat" (
+    echo Found VS 2022 Enterprise
+    call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
+    goto :vs_done
+)
+if exist "C:\Program Files (x86)\Microsoft Visual Studio\2019\BuildTools\VC\Auxiliary\Build\vcvars64.bat" (
+    echo Found VS 2019 BuildTools
+    call "C:\Program Files (x86)\Microsoft Visual Studio\2019\BuildTools\VC\Auxiliary\Build\vcvars64.bat"
+    goto :vs_done
+)
+if exist "C:\Program Files (x86)\Microsoft Visual Studio\2019\Community\VC\Auxiliary\Build\vcvars64.bat" (
+    echo Found VS 2019 Community
+    call "C:\Program Files (x86)\Microsoft Visual Studio\2019\Community\VC\Auxiliary\Build\vcvars64.bat"
+    goto :vs_done
+)
+if exist "C:\Program Files (x86)\Microsoft Visual Studio\2019\Professional\VC\Auxiliary\Build\vcvars64.bat" (
+    echo Found VS 2019 Professional
+    call "C:\Program Files (x86)\Microsoft Visual Studio\2019\Professional\VC\Auxiliary\Build\vcvars64.bat"
+    goto :vs_done
+)
+if exist "C:\Program Files (x86)\Microsoft Visual Studio\2019\Enterprise\VC\Auxiliary\Build\vcvars64.bat" (
+    echo Found VS 2019 Enterprise
+    call "C:\Program Files (x86)\Microsoft Visual Studio\2019\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
+    goto :vs_done
+)
+echo WARNING: Could not find Visual Studio. Build may fail.
+echo Please ensure Visual Studio 2019/2022 Build Tools are installed.
+
+:vs_done
 
 :: Verify C++ compiler is available
 where cl >nul 2>&1
