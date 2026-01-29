@@ -117,18 +117,39 @@ echo Found C++ compiler at:
 where cl
 
 cd /d "%OTK_PYOPTIX_DIR%\optix"
-echo Building and installing otk-pyoptix...
+echo Building otk-pyoptix with CMake...
 
-:: Use Ninja generator to avoid VS version detection issues
-set CMAKE_GENERATOR=Ninja
-set "CMAKE_GENERATOR_PLATFORM="
-set "CMAKE_GENERATOR_TOOLSET="
-set "CMAKE_ARGS=-G Ninja"
+:: Create build directory
+mkdir build 2>nul
+cd build
 
-"%PYTHON%" -m pip install . --no-deps --no-build-isolation -vv --config-settings=cmake.args=-GNinja
+:: Configure with Ninja generator
+cmake -G Ninja ^
+    -DCMAKE_BUILD_TYPE=Release ^
+    -DPython_EXECUTABLE="%PYTHON%" ^
+    -DOptiX_INSTALL_DIR="%OptiX_INSTALL_DIR%" ^
+    ..
 if errorlevel 1 (
-    echo ERROR: Failed to install otk-pyoptix
+    echo ERROR: CMake configure failed
     exit /b 1
+)
+
+:: Build
+ninja
+if errorlevel 1 (
+    echo ERROR: Build failed
+    exit /b 1
+)
+
+:: Install the built module to site-packages
+echo Installing optix module...
+for /f "delims=" %%i in ('"%PYTHON%" -c "import site; print(site.getsitepackages()[0])"') do set SITE_PACKAGES=%%i
+copy /Y optix*.pyd "%SITE_PACKAGES%\" 2>nul
+copy /Y optix.py "%SITE_PACKAGES%\" 2>nul
+copy /Y *.pyd "%SITE_PACKAGES%\" 2>nul
+if exist "..\optix\__init__.py" (
+    mkdir "%SITE_PACKAGES%\optix" 2>nul
+    xcopy /E /Y "..\optix\*" "%SITE_PACKAGES%\optix\"
 )
 
 echo otk-pyoptix installed successfully
