@@ -927,3 +927,252 @@ def test_cupy_buffers_multi_gas(test_cupy):
         hits_np = hits
 
     np.testing.assert_almost_equal(hits_np[0], 10.0, decimal=1)
+
+
+# =============================================================================
+# Primitive ID and Instance ID Tests
+# =============================================================================
+
+@pytest.mark.parametrize("test_cupy", [False, True])
+def test_primitive_ids_single_gas(test_cupy):
+    """Test primitive_ids returns correct triangle indices in single-GAS mode."""
+    if test_cupy:
+        if not has_cupy:
+            pytest.skip("cupy not available")
+        import cupy
+        backend = cupy
+    else:
+        backend = np
+
+    rtx = RTX()
+    rtx.clear_scene()
+
+    # Create a mesh with 2 triangles (a quad)
+    # Triangle 0: vertices 0,1,2 (bottom-left triangle)
+    # Triangle 1: vertices 2,1,3 (top-right triangle)
+    verts = backend.float32([0, 0, 0, 1, 0, 0, 0, 1, 0, 1, 1, 0])
+    triangles = backend.int32([0, 1, 2, 2, 1, 3])
+
+    res = rtx.build(0, verts, triangles)
+    assert res == 0
+
+    # Ray hitting triangle 0 (bottom-left area)
+    rays = backend.float32([0.25, 0.25, 10, 0, 0, 0, -1, 1000])
+    hits = backend.float32([0, 0, 0, 0])
+    prim_ids = backend.int32([0])
+
+    res = rtx.trace(rays, hits, 1, primitive_ids=prim_ids)
+    assert res == 0
+    assert float(hits[0]) > 0  # Should hit
+    assert int(prim_ids[0]) == 0  # Should hit triangle 0
+
+    # Ray hitting triangle 1 (top-right area)
+    rays2 = backend.float32([0.75, 0.75, 10, 0, 0, 0, -1, 1000])
+    hits2 = backend.float32([0, 0, 0, 0])
+    prim_ids2 = backend.int32([0])
+
+    res = rtx.trace(rays2, hits2, 1, primitive_ids=prim_ids2)
+    assert res == 0
+    assert float(hits2[0]) > 0  # Should hit
+    assert int(prim_ids2[0]) == 1  # Should hit triangle 1
+
+
+@pytest.mark.parametrize("test_cupy", [False, True])
+def test_primitive_ids_miss(test_cupy):
+    """Test primitive_ids returns -1 for misses."""
+    if test_cupy:
+        if not has_cupy:
+            pytest.skip("cupy not available")
+        import cupy
+        backend = cupy
+    else:
+        backend = np
+
+    rtx = RTX()
+    rtx.clear_scene()
+
+    verts = backend.float32([0, 0, 0, 1, 0, 0, 0.5, 1, 0])
+    triangles = backend.int32([0, 1, 2])
+
+    res = rtx.build(0, verts, triangles)
+    assert res == 0
+
+    # Ray that misses
+    rays = backend.float32([100, 100, 10, 0, 0, 0, -1, 1000])
+    hits = backend.float32([0, 0, 0, 0])
+    prim_ids = backend.int32([999])  # Initialize with non-zero to verify it's set
+
+    res = rtx.trace(rays, hits, 1, primitive_ids=prim_ids)
+    assert res == 0
+    assert float(hits[0]) == -1.0  # Miss
+    assert int(prim_ids[0]) == -1  # primitive_id should be -1 for miss
+
+
+@pytest.mark.parametrize("test_cupy", [False, True])
+def test_instance_ids_multi_gas(test_cupy):
+    """Test instance_ids returns correct geometry indices in multi-GAS mode."""
+    if test_cupy:
+        if not has_cupy:
+            pytest.skip("cupy not available")
+        import cupy
+        backend = cupy
+    else:
+        backend = np
+
+    rtx = RTX()
+    rtx.clear_scene()
+
+    # Small triangle
+    verts = backend.float32([0, 0, 0, 1, 0, 0, 0.5, 1, 0])
+    tris = backend.int32([0, 1, 2])
+
+    # Add 3 geometries at different X positions
+    rtx.add_geometry("mesh0", verts, tris, transform=[1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0])
+    rtx.add_geometry("mesh1", verts, tris, transform=[1, 0, 0, 5, 0, 1, 0, 0, 0, 0, 1, 0])
+    rtx.add_geometry("mesh2", verts, tris, transform=[1, 0, 0, 10, 0, 1, 0, 0, 0, 0, 1, 0])
+
+    # Ray hitting mesh0 (at x=0.5)
+    rays0 = backend.float32([0.5, 0.33, 10, 0, 0, 0, -1, 1000])
+    hits0 = backend.float32([0, 0, 0, 0])
+    prim_ids0 = backend.int32([0])
+    inst_ids0 = backend.int32([0])
+
+    res = rtx.trace(rays0, hits0, 1, primitive_ids=prim_ids0, instance_ids=inst_ids0)
+    assert res == 0
+    assert float(hits0[0]) > 0
+    assert int(inst_ids0[0]) == 0  # Should hit mesh0
+
+    # Ray hitting mesh1 (at x=5.5)
+    rays1 = backend.float32([5.5, 0.33, 10, 0, 0, 0, -1, 1000])
+    hits1 = backend.float32([0, 0, 0, 0])
+    prim_ids1 = backend.int32([0])
+    inst_ids1 = backend.int32([0])
+
+    res = rtx.trace(rays1, hits1, 1, primitive_ids=prim_ids1, instance_ids=inst_ids1)
+    assert res == 0
+    assert float(hits1[0]) > 0
+    assert int(inst_ids1[0]) == 1  # Should hit mesh1
+
+    # Ray hitting mesh2 (at x=10.5)
+    rays2 = backend.float32([10.5, 0.33, 10, 0, 0, 0, -1, 1000])
+    hits2 = backend.float32([0, 0, 0, 0])
+    prim_ids2 = backend.int32([0])
+    inst_ids2 = backend.int32([0])
+
+    res = rtx.trace(rays2, hits2, 1, primitive_ids=prim_ids2, instance_ids=inst_ids2)
+    assert res == 0
+    assert float(hits2[0]) > 0
+    assert int(inst_ids2[0]) == 2  # Should hit mesh2
+
+
+@pytest.mark.parametrize("test_cupy", [False, True])
+def test_instance_ids_miss(test_cupy):
+    """Test instance_ids returns -1 for misses in multi-GAS mode."""
+    if test_cupy:
+        if not has_cupy:
+            pytest.skip("cupy not available")
+        import cupy
+        backend = cupy
+    else:
+        backend = np
+
+    rtx = RTX()
+    rtx.clear_scene()
+
+    verts = backend.float32([0, 0, 0, 1, 0, 0, 0.5, 1, 0])
+    tris = backend.int32([0, 1, 2])
+
+    rtx.add_geometry("mesh", verts, tris)
+
+    # Ray that misses
+    rays = backend.float32([100, 100, 10, 0, 0, 0, -1, 1000])
+    hits = backend.float32([0, 0, 0, 0])
+    prim_ids = backend.int32([999])
+    inst_ids = backend.int32([999])
+
+    res = rtx.trace(rays, hits, 1, primitive_ids=prim_ids, instance_ids=inst_ids)
+    assert res == 0
+    assert float(hits[0]) == -1.0  # Miss
+    assert int(prim_ids[0]) == -1
+    assert int(inst_ids[0]) == -1
+
+
+@pytest.mark.parametrize("test_cupy", [False, True])
+def test_primitive_ids_multiple_rays(test_cupy):
+    """Test primitive_ids with multiple rays hitting different triangles."""
+    if test_cupy:
+        if not has_cupy:
+            pytest.skip("cupy not available")
+        import cupy
+        backend = cupy
+    else:
+        backend = np
+
+    rtx = RTX()
+    rtx.clear_scene()
+
+    # Create a mesh with 2 triangles
+    verts = backend.float32([0, 0, 0, 1, 0, 0, 0, 1, 0, 1, 1, 0])
+    triangles = backend.int32([0, 1, 2, 2, 1, 3])
+
+    res = rtx.build(0, verts, triangles)
+    assert res == 0
+
+    # 3 rays: one hitting triangle 0, one hitting triangle 1, one missing
+    rays = backend.float32([
+        0.25, 0.25, 10, 0, 0, 0, -1, 1000,  # hits triangle 0
+        0.75, 0.75, 10, 0, 0, 0, -1, 1000,  # hits triangle 1
+        100, 100, 10, 0, 0, 0, -1, 1000,    # misses
+    ])
+    hits = backend.float32([0] * 12)  # 3 rays * 4 floats
+    prim_ids = backend.int32([0, 0, 0])
+
+    res = rtx.trace(rays, hits, 3, primitive_ids=prim_ids)
+    assert res == 0
+
+    # Check results
+    assert int(prim_ids[0]) == 0   # First ray hits triangle 0
+    assert int(prim_ids[1]) == 1   # Second ray hits triangle 1
+    assert int(prim_ids[2]) == -1  # Third ray misses
+
+
+@pytest.mark.parametrize("test_cupy", [False, True])
+def test_primitive_and_instance_ids_optional(test_cupy):
+    """Test that primitive_ids and instance_ids are truly optional."""
+    if test_cupy:
+        if not has_cupy:
+            pytest.skip("cupy not available")
+        import cupy
+        backend = cupy
+    else:
+        backend = np
+
+    rtx = RTX()
+    rtx.clear_scene()
+
+    verts = backend.float32([0, 0, 0, 1, 0, 0, 0.5, 1, 0])
+    triangles = backend.int32([0, 1, 2])
+
+    res = rtx.build(0, verts, triangles)
+    assert res == 0
+
+    rays = backend.float32([0.5, 0.33, 10, 0, 0, 0, -1, 1000])
+    hits = backend.float32([0, 0, 0, 0])
+
+    # Should work without any optional params
+    res = rtx.trace(rays, hits, 1)
+    assert res == 0
+    np.testing.assert_almost_equal(float(hits[0]), 10.0, decimal=1)
+
+    # Should work with only primitive_ids
+    hits = backend.float32([0, 0, 0, 0])
+    prim_ids = backend.int32([0])
+    res = rtx.trace(rays, hits, 1, primitive_ids=prim_ids)
+    assert res == 0
+    assert int(prim_ids[0]) == 0
+
+    # Should work with only instance_ids
+    hits = backend.float32([0, 0, 0, 0])
+    inst_ids = backend.int32([0])
+    res = rtx.trace(rays, hits, 1, instance_ids=inst_ids)
+    assert res == 0
