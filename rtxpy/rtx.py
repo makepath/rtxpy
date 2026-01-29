@@ -1142,6 +1142,18 @@ class RTX:
         """
         return len(_state.gas_entries)
 
+    def has_geometry(self, geometry_id: str) -> bool:
+        """
+        Check if a geometry with the given ID exists.
+
+        Args:
+            geometry_id: The ID of the geometry to check.
+
+        Returns:
+            True if the geometry exists, False otherwise.
+        """
+        return geometry_id in _state.gas_entries
+
     def clear_scene(self) -> None:
         """
         Remove all geometries and reset to single-GAS mode.

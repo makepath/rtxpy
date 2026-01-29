@@ -1,5 +1,5 @@
 {% set name = "rtxpy" %}
-{% set version = "0.0.4" %}
+{% set version = "0.0.5" %}
 
 package:
   name: {{ name|lower }}
@@ -20,8 +20,8 @@ requirements:
   build:
     - {{ compiler('c') }}
     - {{ compiler('cxx') }}
-    - cmake
-    - git
+    - conda-forge::cmake
+    - conda-forge::git
     - cuda-nvcc
     - cuda-cudart-dev
     - cuda-nvrtc-dev
@@ -39,6 +39,7 @@ requirements:
     - python >=3.10
     - numpy >=1.21,<3  # [py<313]
     - numpy >=2.0,<3  # [py>=313]
+    - numba >=0.56
     - cupy >=12.0
     - cuda-version >=12
     - __cuda  # [linux]

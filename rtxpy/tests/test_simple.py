@@ -929,6 +929,36 @@ def test_cupy_buffers_multi_gas(test_cupy):
     np.testing.assert_almost_equal(hits_np[0], 10.0, decimal=1)
 
 
+@pytest.mark.parametrize("test_cupy", [False, True])
+def test_has_geometry(test_cupy):
+    """Test has_geometry() query method."""
+    if test_cupy:
+        if not has_cupy:
+            pytest.skip("cupy not available")
+        import cupy
+        backend = cupy
+    else:
+        backend = np
+
+    rtx = RTX()
+    rtx.clear_scene()
+
+    # Should not exist initially
+    assert rtx.has_geometry("test_geo") == False
+
+    # Add geometry
+    verts = backend.float32([0, 0, 0, 1, 0, 0, 0.5, 1, 0])
+    tris = backend.int32([0, 1, 2])
+    rtx.add_geometry("test_geo", verts, tris)
+
+    # Should exist now
+    assert rtx.has_geometry("test_geo") == True
+
+    # Remove and check again
+    rtx.remove_geometry("test_geo")
+    assert rtx.has_geometry("test_geo") == False
+
+
 # =============================================================================
 # Primitive ID and Instance ID Tests
 # =============================================================================
@@ -946,7 +976,6 @@ def test_primitive_ids_single_gas(test_cupy):
 
     rtx = RTX()
     rtx.clear_scene()
-
     # Create a mesh with 2 triangles (a quad)
     # Triangle 0: vertices 0,1,2 (bottom-left triangle)
     # Triangle 1: vertices 2,1,3 (top-right triangle)
