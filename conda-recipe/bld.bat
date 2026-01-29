@@ -90,6 +90,57 @@ if errorlevel 1 (
     exit /b 1
 )
 
+:: Verify cmake is available (installed via conda)
+where cmake >nul 2>&1
+if errorlevel 1 (
+    echo ERROR: cmake not found. Ensure cmake is in build requirements.
+    exit /b 1
+)
+echo Found cmake at:
+where cmake
+
+:: Set up Visual Studio environment if not already set
+:: This finds and activates the Visual Studio Build Tools
+if not defined VSINSTALLDIR (
+    echo Setting up Visual Studio environment...
+
+    :: Try VS 18 (user-specific path)
+    if exist "C:\Program Files\Microsoft Visual Studio\18\Community\VC\Auxiliary\Build\vcvars64.bat" (
+        call "C:\Program Files\Microsoft Visual Studio\18\Community\VC\Auxiliary\Build\vcvars64.bat"
+    :: Try VS 2022 Build Tools
+    ) else if exist "C:\Program Files\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat" (
+        call "C:\Program Files\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat"
+    ) else if exist "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat" (
+        call "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat"
+    ) else if exist "C:\Program Files\Microsoft Visual Studio\2022\Professional\VC\Auxiliary\Build\vcvars64.bat" (
+        call "C:\Program Files\Microsoft Visual Studio\2022\Professional\VC\Auxiliary\Build\vcvars64.bat"
+    ) else if exist "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat" (
+        call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
+    :: Try VS 2019
+    ) else if exist "C:\Program Files (x86)\Microsoft Visual Studio\2019\BuildTools\VC\Auxiliary\Build\vcvars64.bat" (
+        call "C:\Program Files (x86)\Microsoft Visual Studio\2019\BuildTools\VC\Auxiliary\Build\vcvars64.bat"
+    ) else if exist "C:\Program Files (x86)\Microsoft Visual Studio\2019\Community\VC\Auxiliary\Build\vcvars64.bat" (
+        call "C:\Program Files (x86)\Microsoft Visual Studio\2019\Community\VC\Auxiliary\Build\vcvars64.bat"
+    ) else if exist "C:\Program Files (x86)\Microsoft Visual Studio\2019\Professional\VC\Auxiliary\Build\vcvars64.bat" (
+        call "C:\Program Files (x86)\Microsoft Visual Studio\2019\Professional\VC\Auxiliary\Build\vcvars64.bat"
+    ) else if exist "C:\Program Files (x86)\Microsoft Visual Studio\2019\Enterprise\VC\Auxiliary\Build\vcvars64.bat" (
+        call "C:\Program Files (x86)\Microsoft Visual Studio\2019\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
+    ) else (
+        echo WARNING: Could not find Visual Studio. Build may fail.
+        echo Please ensure Visual Studio 2019/2022 Build Tools are installed.
+    )
+)
+
+:: Verify C++ compiler is available
+where cl >nul 2>&1
+if errorlevel 1 (
+    echo ERROR: C++ compiler (cl.exe) not found.
+    echo Please install Visual Studio Build Tools with C++ workload.
+    exit /b 1
+)
+echo Found C++ compiler at:
+where cl
+
 cd /d "%OTK_PYOPTIX_DIR%\optix"
 echo Building and installing otk-pyoptix...
 "%PYTHON%" -m pip install . --no-deps --no-build-isolation -vv
