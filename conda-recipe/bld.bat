@@ -121,6 +121,7 @@ echo Building and installing otk-pyoptix...
 
 :: Use Ninja generator to avoid VS version detection issues
 set CMAKE_GENERATOR=Ninja
+set CMAKE_GENERATOR_PLATFORM=
 
 "%PYTHON%" -m pip install . --no-deps --no-build-isolation -vv
 if errorlevel 1 (
