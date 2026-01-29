@@ -23,7 +23,7 @@ extern "C" __global__ void __raygen__main()
     const uint3        dim        = optixGetLaunchDimensions();
     const uint64_t linear_idx = idx.z * dim.y * dim.x + idx.y * dim.x + idx.x;
 
-    unsigned int t, nx, ny, nz;
+    unsigned int t, nx, ny, nz, prim_id, inst_id;
     Ray ray = params.rays[linear_idx];
     optixTrace(
         params.handle,
@@ -40,7 +40,9 @@ extern "C" __global__ void __raygen__main()
         t,
         nx,
         ny,
-        nz
+        nz,
+        prim_id,
+        inst_id
     );
 
     Hit hit;
@@ -49,6 +51,14 @@ extern "C" __global__ void __raygen__main()
     hit.geom_normal.y       = int_as_float( ny );
     hit.geom_normal.z       = int_as_float( nz );
     params.hits[linear_idx] = hit;
+
+    // Write optional primitive and instance IDs
+    if (params.primitive_ids != nullptr) {
+        params.primitive_ids[linear_idx] = static_cast<int>(prim_id);
+    }
+    if (params.instance_ids != nullptr) {
+        params.instance_ids[linear_idx] = static_cast<int>(inst_id);
+    }
 }
 
 
@@ -58,6 +68,8 @@ extern "C" __global__ void __miss__miss()
     optixSetPayload_1( float_as_int( 1.0f ) );
     optixSetPayload_2( float_as_int( 0.0f ) );
     optixSetPayload_3( float_as_int( 0.0f ) );
+    optixSetPayload_4( static_cast<unsigned int>(-1) );  // primitive_id = -1 for miss
+    optixSetPayload_5( static_cast<unsigned int>(-1) );  // instance_id = -1 for miss
 }
 
 
@@ -99,4 +111,6 @@ extern "C" __global__ void __closesthit__chit()
     optixSetPayload_1(float_as_int(n.x));
     optixSetPayload_2(float_as_int(n.y));
     optixSetPayload_3(float_as_int(n.z));
+    optixSetPayload_4(primIdx);                     // primitive/triangle index
+    optixSetPayload_5(optixGetInstanceId());        // instance/geometry index
 }

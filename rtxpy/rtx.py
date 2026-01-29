@@ -322,7 +322,7 @@ def _init_optix(device: Optional[int] = None):
     pipeline_options = optix.PipelineCompileOptions(
         usesMotionBlur=False,
         traversableGraphFlags=optix.TRAVERSABLE_GRAPH_FLAG_ALLOW_ANY,
-        numPayloadValues=4,
+        numPayloadValues=6,  # t, nx, ny, nz, primitive_id, instance_id
         numAttributeValues=2,
         exceptionFlags=optix.EXCEPTION_FLAG_NONE,
         pipelineLaunchParamsVariableName="params",
@@ -403,7 +403,7 @@ def _init_optix(device: Optional[int] = None):
     _create_sbt()
 
     # Allocate params buffer (24 bytes: handle(8) + rays_ptr(8) + hits_ptr(8))
-    _state.d_params = cupy.zeros(24, dtype=cupy.uint8)
+    _state.d_params = cupy.zeros(40, dtype=cupy.uint8)  # 5 pointers * 8 bytes
 
     _state.initialized = True
     atexit.register(_cleanup_at_exit)
@@ -771,7 +771,7 @@ def _build_accel(hash_value: int, vertices, indices) -> int:
 # Ray tracing
 # -----------------------------------------------------------------------------
 
-def _trace_rays(rays, hits, num_rays: int) -> int:
+def _trace_rays(rays, hits, num_rays: int, primitive_ids=None, instance_ids=None) -> int:
     """
     Trace rays against the current acceleration structure.
 
@@ -782,6 +782,11 @@ def _trace_rays(rays, hits, num_rays: int) -> int:
         rays: Ray buffer (Nx8 float32: ox,oy,oz,tmin,dx,dy,dz,tmax)
         hits: Hit buffer (Nx4 float32: t,nx,ny,nz)
         num_rays: Number of rays to trace
+        primitive_ids: Optional output buffer (Nx1 int32) for triangle indices.
+                       -1 indicates a miss.
+        instance_ids: Optional output buffer (Nx1 int32) for geometry/instance indices.
+                      -1 indicates a miss. Useful in multi-GAS mode to identify
+                      which geometry was hit.
 
     Returns:
         0 on success, non-zero on error
@@ -806,6 +811,12 @@ def _trace_rays(rays, hits, num_rays: int) -> int:
 
     # Size check
     if rays.size != num_rays * 8 or hits.size != num_rays * 4:
+        return -1
+
+    # Validate optional buffers
+    if primitive_ids is not None and primitive_ids.size != num_rays:
+        return -1
+    if instance_ids is not None and instance_ids.size != num_rays:
         return -1
 
     # Ensure rays are on GPU
@@ -835,12 +846,38 @@ def _trace_rays(rays, hits, num_rays: int) -> int:
         d_hits = _state.d_hits
         hits_on_host = True
 
-    # Pack params: handle(8 bytes) + rays_ptr(8 bytes) + hits_ptr(8 bytes)
+    # Handle optional primitive_ids buffer
+    d_prim_ids_ptr = 0
+    prim_ids_on_host = False
+    if primitive_ids is not None:
+        if isinstance(primitive_ids, cupy.ndarray):
+            d_prim_ids = primitive_ids
+            prim_ids_on_host = False
+        else:
+            d_prim_ids = cupy.zeros(num_rays, dtype=cupy.int32)
+            prim_ids_on_host = True
+        d_prim_ids_ptr = d_prim_ids.data.ptr
+
+    # Handle optional instance_ids buffer
+    d_inst_ids_ptr = 0
+    inst_ids_on_host = False
+    if instance_ids is not None:
+        if isinstance(instance_ids, cupy.ndarray):
+            d_inst_ids = instance_ids
+            inst_ids_on_host = False
+        else:
+            d_inst_ids = cupy.zeros(num_rays, dtype=cupy.int32)
+            inst_ids_on_host = True
+        d_inst_ids_ptr = d_inst_ids.data.ptr
+
+    # Pack params: handle(8) + rays_ptr(8) + hits_ptr(8) + prim_ids_ptr(8) + inst_ids_ptr(8)
     params_data = struct.pack(
-        'QQQ',
+        'QQQQQ',
         trace_handle,
         d_rays.data.ptr,
         d_hits.data.ptr,
+        d_prim_ids_ptr,
+        d_inst_ids_ptr,
     )
     _state.d_params[:] = cupy.frombuffer(np.frombuffer(params_data, dtype=np.uint8), dtype=cupy.uint8)
 
@@ -849,17 +886,23 @@ def _trace_rays(rays, hits, num_rays: int) -> int:
         _state.pipeline,
         0,  # stream
         _state.d_params.data.ptr,
-        24,  # sizeof(Params)
+        40,  # sizeof(Params): 5 pointers * 8 bytes
         _state.sbt,
         num_rays,  # width
         1,  # height
         1,  # depth
     )
 
-    # Copy results back if hits was on host
-    if hits_on_host:
+    # Copy results back if buffers were on host
+    if hits_on_host or prim_ids_on_host or inst_ids_on_host:
         cupy.cuda.Stream.null.synchronize()
+
+    if hits_on_host:
         hits[:] = d_hits.get()
+    if prim_ids_on_host:
+        primitive_ids[:] = d_prim_ids.get()
+    if inst_ids_on_host:
+        instance_ids[:] = d_inst_ids.get()
 
     return 0
 
@@ -936,7 +979,7 @@ class RTX:
         """
         return _state.current_hash
 
-    def trace(self, rays, hits, numRays: int) -> int:
+    def trace(self, rays, hits, numRays: int, primitive_ids=None, instance_ids=None) -> int:
         """
         Trace rays against the current acceleration structure.
 
@@ -948,11 +991,17 @@ class RTX:
             hits: Hit buffer (4 float32 per hit: t,nx,ny,nz)
                   t=-1 indicates a miss
             numRays: Number of rays to trace
+            primitive_ids: Optional output buffer (numRays x int32) for triangle indices.
+                           Will contain the index of the hit triangle within its geometry,
+                           or -1 for rays that missed.
+            instance_ids: Optional output buffer (numRays x int32) for geometry/instance indices.
+                          Will contain the instance ID of the hit geometry, or -1 for misses.
+                          Useful in multi-GAS mode to identify which geometry was hit.
 
         Returns:
             0 on success, non-zero on error
         """
-        return _trace_rays(rays, hits, numRays)
+        return _trace_rays(rays, hits, numRays, primitive_ids, instance_ids)
 
     # -------------------------------------------------------------------------
     # Multi-GAS API

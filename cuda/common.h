@@ -53,4 +53,6 @@ struct Params
     OptixTraversableHandle handle;
     Ray*                   rays;
     Hit*                   hits;
+    int*                   primitive_ids;  // Optional: triangle index per ray (-1 for miss)
+    int*                   instance_ids;   // Optional: geometry/instance index per ray (-1 for miss)
 };
