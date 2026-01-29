@@ -64,6 +64,7 @@ nvcc -ptx ^
     -I"%OptiX_INSTALL_DIR%\include" ^
     -I"%SRC_DIR%\cuda" ^
     --use_fast_math ^
+    --allow-unsupported-compiler ^
     -o "%SRC_DIR%\rtxpy\kernel.ptx" ^
     "%SRC_DIR%\cuda\kernel.cu"
 if errorlevel 1 (
