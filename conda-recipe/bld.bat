@@ -118,6 +118,10 @@ where cl
 
 cd /d "%OTK_PYOPTIX_DIR%\optix"
 echo Building and installing otk-pyoptix...
+
+:: Use Ninja generator to avoid VS version detection issues
+set CMAKE_GENERATOR=Ninja
+
 "%PYTHON%" -m pip install . --no-deps --no-build-isolation -vv
 if errorlevel 1 (
     echo ERROR: Failed to install otk-pyoptix
