@@ -21,7 +21,7 @@ requirements:
     - {{ compiler('c') }}
     - {{ compiler('cxx') }}
     - conda-forge::cmake
-    - git
+    - conda-forge::git
     - cuda-nvcc
     - cuda-cudart-dev
     - cuda-nvrtc-dev
