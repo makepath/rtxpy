@@ -927,3 +927,33 @@ def test_cupy_buffers_multi_gas(test_cupy):
         hits_np = hits
 
     np.testing.assert_almost_equal(hits_np[0], 10.0, decimal=1)
+
+
+@pytest.mark.parametrize("test_cupy", [False, True])
+def test_has_geometry(test_cupy):
+    """Test has_geometry() query method."""
+    if test_cupy:
+        if not has_cupy:
+            pytest.skip("cupy not available")
+        import cupy
+        backend = cupy
+    else:
+        backend = np
+
+    rtx = RTX()
+    rtx.clear_scene()
+
+    # Should not exist initially
+    assert rtx.has_geometry("test_geo") == False
+
+    # Add geometry
+    verts = backend.float32([0, 0, 0, 1, 0, 0, 0.5, 1, 0])
+    tris = backend.int32([0, 1, 2])
+    rtx.add_geometry("test_geo", verts, tris)
+
+    # Should exist now
+    assert rtx.has_geometry("test_geo") == True
+
+    # Remove and check again
+    rtx.remove_geometry("test_geo")
+    assert rtx.has_geometry("test_geo") == False
