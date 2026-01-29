@@ -22,9 +22,9 @@ requirements:
     - {{ compiler('cxx') }}
     - conda-forge::cmake
     - conda-forge::git
-    - cuda-nvcc
-    - cuda-cudart-dev
-    - cuda-nvrtc-dev
+    - cuda-nvcc >=12  # [linux]
+    - cuda-cudart-dev >=12  # [linux]
+    - cuda-nvrtc-dev >=12  # [linux]
 
   host:
     - python
@@ -32,8 +32,9 @@ requirements:
     - setuptools >=68
     - wheel
     - cuda-version >=12
-    - cuda-cudart-dev
-    - cuda-nvrtc-dev
+    - cuda-cudart-dev >=12
+    - cuda-nvrtc-dev >=12
+    - cuda-nvcc >=12  # [win]
 
   run:
     - python >=3.10
