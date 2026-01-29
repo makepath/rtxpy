@@ -20,8 +20,8 @@ requirements:
   build:
     - {{ compiler('c') }}  # [linux]
     - {{ compiler('cxx') }}  # [linux]
-    - cmake  # [linux]
-    - git  # [linux]
+    - conda-forge::cmake  # [linux]
+    - conda-forge::git  # [linux]
     - cuda-nvcc >=12  # [linux]
     - cuda-cudart-dev >=12  # [linux]
     - cuda-nvrtc-dev >=12  # [linux]
@@ -32,7 +32,7 @@ requirements:
     - pip
     - setuptools >=68
     - wheel
-    - git  # [win]
+    - conda-forge::git  # [win]
     # Linux CUDA packages
     - cuda-version >=12  # [linux]
     - cuda-cudart-dev >=12  # [linux]
