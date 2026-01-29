@@ -99,66 +99,18 @@ if errorlevel 1 (
 echo Found cmake at:
 where cmake
 
-:: Set up Visual Studio environment if not already set
-:: This finds and activates the Visual Studio Build Tools
-if defined VSINSTALLDIR goto :vs_done
-echo Setting up Visual Studio environment...
-
-if exist "C:\Program Files\Microsoft Visual Studio\18\Community\VC\Auxiliary\Build\vcvars64.bat" (
-    echo Found VS 18 Community
-    call "C:\Program Files\Microsoft Visual Studio\18\Community\VC\Auxiliary\Build\vcvars64.bat"
-    goto :vs_done
-)
-if exist "C:\Program Files\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat" (
-    echo Found VS 2022 BuildTools
-    call "C:\Program Files\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat"
-    goto :vs_done
-)
-if exist "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat" (
-    echo Found VS 2022 Community
-    call "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat"
-    goto :vs_done
-)
-if exist "C:\Program Files\Microsoft Visual Studio\2022\Professional\VC\Auxiliary\Build\vcvars64.bat" (
-    echo Found VS 2022 Professional
-    call "C:\Program Files\Microsoft Visual Studio\2022\Professional\VC\Auxiliary\Build\vcvars64.bat"
-    goto :vs_done
-)
-if exist "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat" (
-    echo Found VS 2022 Enterprise
-    call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
-    goto :vs_done
-)
-if exist "C:\Program Files (x86)\Microsoft Visual Studio\2019\BuildTools\VC\Auxiliary\Build\vcvars64.bat" (
-    echo Found VS 2019 BuildTools
-    call "C:\Program Files (x86)\Microsoft Visual Studio\2019\BuildTools\VC\Auxiliary\Build\vcvars64.bat"
-    goto :vs_done
-)
-if exist "C:\Program Files (x86)\Microsoft Visual Studio\2019\Community\VC\Auxiliary\Build\vcvars64.bat" (
-    echo Found VS 2019 Community
-    call "C:\Program Files (x86)\Microsoft Visual Studio\2019\Community\VC\Auxiliary\Build\vcvars64.bat"
-    goto :vs_done
-)
-if exist "C:\Program Files (x86)\Microsoft Visual Studio\2019\Professional\VC\Auxiliary\Build\vcvars64.bat" (
-    echo Found VS 2019 Professional
-    call "C:\Program Files (x86)\Microsoft Visual Studio\2019\Professional\VC\Auxiliary\Build\vcvars64.bat"
-    goto :vs_done
-)
-if exist "C:\Program Files (x86)\Microsoft Visual Studio\2019\Enterprise\VC\Auxiliary\Build\vcvars64.bat" (
-    echo Found VS 2019 Enterprise
-    call "C:\Program Files (x86)\Microsoft Visual Studio\2019\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
-    goto :vs_done
-)
-echo WARNING: Could not find Visual Studio. Build may fail.
-echo Please ensure Visual Studio 2019/2022 Build Tools are installed.
-
-:vs_done
-
-:: Verify C++ compiler is available
+:: Verify C++ compiler is available (conda-build should set up VS environment)
 where cl >nul 2>&1
 if errorlevel 1 (
-    echo ERROR: C++ compiler (cl.exe) not found.
-    echo Please install Visual Studio Build Tools with C++ workload.
+    echo.
+    echo ERROR: C++ compiler ^(cl.exe^) not found.
+    echo.
+    echo Please ensure Visual Studio Build Tools are installed and activated.
+    echo You can install them from: https://visualstudio.microsoft.com/visual-cpp-build-tools/
+    echo.
+    echo If already installed, run this build from a "Developer Command Prompt"
+    echo or run vcvars64.bat before building.
+    echo.
     exit /b 1
 )
 echo Found C++ compiler at:
