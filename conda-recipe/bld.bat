@@ -123,8 +123,9 @@ echo Building and installing otk-pyoptix...
 set CMAKE_GENERATOR=Ninja
 set "CMAKE_GENERATOR_PLATFORM="
 set "CMAKE_GENERATOR_TOOLSET="
+set "CMAKE_ARGS=-G Ninja"
 
-"%PYTHON%" -m pip install . --no-deps --no-build-isolation -vv
+"%PYTHON%" -m pip install . --no-deps --no-build-isolation -vv --config-settings=cmake.args=-GNinja
 if errorlevel 1 (
     echo ERROR: Failed to install otk-pyoptix
     exit /b 1
