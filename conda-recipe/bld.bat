@@ -151,7 +151,7 @@ powershell -Command "Get-Content CMakeLists.txt -Head 2"
 set "OPTIX_PATH=%OptiX_INSTALL_DIR%"
 set "CMAKE_PREFIX_PATH=%OptiX_INSTALL_DIR%;%CMAKE_PREFIX_PATH%"
 
-:: Use NMake Makefiles generator - works with just cl.exe, doesn't require full VS IDE
+:: Use NMake Makefiles generator - works with any VS version as long as cl.exe is in PATH
 set "CMAKE_GENERATOR=NMake Makefiles"
 
 :: Pass pybind11 source dir to CMake via CMAKE_ARGS (used by scikit-build and setuptools)
