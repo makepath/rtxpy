@@ -33,7 +33,6 @@ requirements:
     - setuptools >=68
     - wheel
     - conda-forge::cmake
-    - conda-forge::ninja  # [win]
     - conda-forge::git  # [win]
     # Linux CUDA packages
     - cuda-version >=12  # [linux]

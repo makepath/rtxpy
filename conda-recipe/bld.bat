@@ -116,40 +116,57 @@ if errorlevel 1 (
 echo Found C++ compiler at:
 where cl
 
+:: Pre-clone pybind11 without submodules to avoid FetchContent submodule update failures
+echo Pre-cloning pybind11 to avoid submodule issues...
+set "PYBIND11_DIR=%SRC_DIR%\pybind11-src"
+git clone --depth 1 --branch v2.13.6 https://github.com/pybind/pybind11.git "%PYBIND11_DIR%"
+if errorlevel 1 (
+    echo ERROR: Failed to clone pybind11
+    exit /b 1
+)
+
+:: Tell CMake to use our pre-cloned pybind11 instead of fetching
+set "FETCHCONTENT_SOURCE_DIR_PYBIND11=%PYBIND11_DIR%"
+echo Using pre-cloned pybind11 at %PYBIND11_DIR%
+
 cd /d "%OTK_PYOPTIX_DIR%\optix"
-echo Building otk-pyoptix with CMake...
 
-:: Create build directory
-mkdir build 2>nul
-cd build
+:: Patch CMakeLists.txt to use our pre-cloned pybind11 and skip submodule updates
+echo Patching CMakeLists.txt to use local pybind11...
 
-:: Configure with Ninja generator
-cmake -G Ninja ^
-    -DCMAKE_BUILD_TYPE=Release ^
-    -DPython_EXECUTABLE="%PYTHON%" ^
-    -DOptiX_INSTALL_DIR="%OptiX_INSTALL_DIR%" ^
-    ..
+:: Convert backslashes to forward slashes for CMake
+set "PYBIND11_DIR_CMAKE=%PYBIND11_DIR:\=/%"
+
+:: Prepend the FETCHCONTENT_SOURCE_DIR_PYBIND11 setting to CMakeLists.txt
+(
+    echo set^(FETCHCONTENT_SOURCE_DIR_PYBIND11 "%PYBIND11_DIR_CMAKE%" CACHE PATH "pybind11 source" FORCE^)
+    type CMakeLists.txt
+) > "%SRC_DIR%\CMakeLists_new.txt"
+move /y "%SRC_DIR%\CMakeLists_new.txt" CMakeLists.txt >nul
+
+echo Patched CMakeLists.txt - first 2 lines:
+powershell -Command "Get-Content CMakeLists.txt -Head 2"
+
+:: Set OptiX path for cmake/pip build process
+set "OPTIX_PATH=%OptiX_INSTALL_DIR%"
+set "CMAKE_PREFIX_PATH=%OptiX_INSTALL_DIR%;%CMAKE_PREFIX_PATH%"
+
+:: Pass pybind11 source dir to CMake via CMAKE_ARGS (used by scikit-build and setuptools)
+set "CMAKE_ARGS=-DFETCHCONTENT_SOURCE_DIR_PYBIND11=%PYBIND11_DIR%"
+
+echo Building with OptiX_INSTALL_DIR=%OptiX_INSTALL_DIR%
+echo FETCHCONTENT_SOURCE_DIR_PYBIND11=%FETCHCONTENT_SOURCE_DIR_PYBIND11%
+
+:: Use pip install with --no-build-isolation so environment variables are visible to CMake
+"%PYTHON%" -m pip install . -v --no-build-isolation
 if errorlevel 1 (
-    echo ERROR: CMake configure failed
+    echo.
+    echo ERROR: Failed to install otk-pyoptix
+    echo.
+    echo If the error mentions OptiX not found, check that OptiX_INSTALL_DIR is set correctly.
+    echo   OptiX_INSTALL_DIR=%OptiX_INSTALL_DIR%
+    echo.
     exit /b 1
-)
-
-:: Build
-ninja
-if errorlevel 1 (
-    echo ERROR: Build failed
-    exit /b 1
-)
-
-:: Install the built module to site-packages
-echo Installing optix module...
-for /f "delims=" %%i in ('"%PYTHON%" -c "import site; print(site.getsitepackages()[0])"') do set SITE_PACKAGES=%%i
-copy /Y optix*.pyd "%SITE_PACKAGES%\" 2>nul
-copy /Y optix.py "%SITE_PACKAGES%\" 2>nul
-copy /Y *.pyd "%SITE_PACKAGES%\" 2>nul
-if exist "..\optix\__init__.py" (
-    mkdir "%SITE_PACKAGES%\optix" 2>nul
-    xcopy /E /Y "..\optix\*" "%SITE_PACKAGES%\optix\"
 )
 
 echo otk-pyoptix installed successfully
