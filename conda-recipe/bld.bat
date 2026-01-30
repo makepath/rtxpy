@@ -129,7 +129,7 @@ if errorlevel 1 (
 set "FETCHCONTENT_SOURCE_DIR_PYBIND11=%PYBIND11_DIR%"
 echo Using pre-cloned pybind11 at %PYBIND11_DIR%
 
-cd /d "%OTK_PYOPTIX_DIR%\optix"
+pushd "%OTK_PYOPTIX_DIR%\optix"
 
 :: Patch CMakeLists.txt to use our pre-cloned pybind11 and skip submodule updates
 echo Patching CMakeLists.txt to use local pybind11...
@@ -139,7 +139,7 @@ set "PYBIND11_DIR_CMAKE=%PYBIND11_DIR:\=/%"
 
 :: Prepend the FETCHCONTENT_SOURCE_DIR_PYBIND11 setting to CMakeLists.txt
 (
-    echo set^(FETCHCONTENT_SOURCE_DIR_PYBIND11 "%PYBIND11_DIR_CMAKE%" CACHE PATH "pybind11 source" FORCE^)
+    echo set^(FETCHCONTENT_SOURCE_DIR_PYBIND11 "!PYBIND11_DIR_CMAKE!" CACHE PATH "pybind11 source" FORCE^)
     type CMakeLists.txt
 ) > "%SRC_DIR%\CMakeLists_new.txt"
 move /y "%SRC_DIR%\CMakeLists_new.txt" CMakeLists.txt >nul
@@ -147,59 +147,39 @@ move /y "%SRC_DIR%\CMakeLists_new.txt" CMakeLists.txt >nul
 echo Patched CMakeLists.txt - first 2 lines:
 powershell -Command "Get-Content CMakeLists.txt -Head 2"
 
-:: Build otk-pyoptix using direct cmake + nmake (avoids conda-build injecting -A x64)
-echo Building otk-pyoptix with CMake + NMake...
+:: Set OptiX path for cmake/pip build process (exactly like run_gpu_test.bat)
+set "OPTIX_PATH=%OptiX_INSTALL_DIR%"
+set "CMAKE_PREFIX_PATH=%OptiX_INSTALL_DIR%;%CMAKE_PREFIX_PATH%"
 
-:: Create build directory
-mkdir build 2>nul
-cd build
+:: Clear conda-build injected CMAKE variables that break the build
+set CMAKE_GENERATOR=
+set CMAKE_GENERATOR_PLATFORM=
+set CMAKE_GENERATOR_TOOLSET=
 
-:: Get Python include and library paths
-for /f "delims=" %%i in ('"%PYTHON%" -c "import sysconfig; print(sysconfig.get_path('include'))"') do set "PYTHON_INCLUDE=%%i"
-for /f "delims=" %%i in ('"%PYTHON%" -c "import sysconfig; print(sysconfig.get_config_var('LIBDIR') or sysconfig.get_path('stdlib'))"') do set "PYTHON_LIBDIR=%%i"
-for /f "delims=" %%i in ('"%PYTHON%" -c "import sys; print(f'python{sys.version_info.major}{sys.version_info.minor}.lib')"') do set "PYTHON_LIB=%%i"
+:: Pre-install build dependencies so we can use --no-build-isolation
+echo Installing build dependencies...
+"%PYTHON%" -m pip install setuptools wheel
 
-echo Python include: %PYTHON_INCLUDE%
-echo Python libdir: %PYTHON_LIBDIR%
+echo Building with OptiX_INSTALL_DIR=%OptiX_INSTALL_DIR%
+echo FETCHCONTENT_SOURCE_DIR_PYBIND11=!FETCHCONTENT_SOURCE_DIR_PYBIND11!
 
-:: Configure with NMake Makefiles generator - explicit command line avoids env var issues
-cmake -G "NMake Makefiles" ^
-    -DCMAKE_BUILD_TYPE=Release ^
-    -DCMAKE_C_COMPILER=cl ^
-    -DCMAKE_CXX_COMPILER=cl ^
-    -DPython_EXECUTABLE="%PYTHON%" ^
-    -DPython_INCLUDE_DIR="%PYTHON_INCLUDE%" ^
-    -DOptiX_INSTALL_DIR="%OptiX_INSTALL_DIR%" ^
-    -DFETCHCONTENT_SOURCE_DIR_PYBIND11="%PYBIND11_DIR%" ^
-    ..
+:: Pass pybind11 source dir to CMake via CMAKE_ARGS (used by scikit-build and setuptools)
+set "CMAKE_ARGS=-DFETCHCONTENT_SOURCE_DIR_PYBIND11=!PYBIND11_DIR!"
+
+:: Use --no-build-isolation so environment variables are visible to CMake
+"%PYTHON%" -m pip install . -v --no-build-isolation
 if errorlevel 1 (
-    echo ERROR: CMake configure failed
+    echo.
+    echo ERROR: Failed to install otk-pyoptix
+    echo.
+    echo If the error mentions OptiX not found, try setting manually:
+    echo   set OptiX_INSTALL_DIR=%OptiX_INSTALL_DIR%
+    echo   set OPTIX_PATH=%OptiX_INSTALL_DIR%
+    echo.
+    popd
     exit /b 1
 )
-
-:: Build with nmake
-nmake
-if errorlevel 1 (
-    echo ERROR: NMake build failed
-    exit /b 1
-)
-
-:: Install the built module to site-packages
-echo Installing optix module...
-for /f "delims=" %%i in ('"%PYTHON%" -c "import site; print(site.getsitepackages()[0])"') do set SITE_PACKAGES=%%i
-echo Site-packages: %SITE_PACKAGES%
-
-:: Copy built files
-copy /Y optix*.pyd "%SITE_PACKAGES%\" 2>nul
-copy /Y *.pyd "%SITE_PACKAGES%\" 2>nul
-if exist "..\optix\__init__.py" (
-    mkdir "%SITE_PACKAGES%\optix" 2>nul
-    xcopy /E /Y "..\optix\*" "%SITE_PACKAGES%\optix\"
-)
-
-:: Return to otk-pyoptix\optix directory
-cd ..
-
+popd
 echo otk-pyoptix installed successfully
 echo.
 
