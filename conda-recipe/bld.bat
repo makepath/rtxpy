@@ -152,10 +152,17 @@ set "OPTIX_PATH=%OptiX_INSTALL_DIR%"
 set "CMAKE_PREFIX_PATH=%OptiX_INSTALL_DIR%;%CMAKE_PREFIX_PATH%"
 
 :: Use NMake Makefiles generator - works with any VS version as long as cl.exe is in PATH
+:: Clear platform specification since NMake doesn't support -A flag
 set "CMAKE_GENERATOR=NMake Makefiles"
+set "CMAKE_GENERATOR_PLATFORM="
+set "CMAKE_GENERATOR_TOOLSET="
 
-:: Pass pybind11 source dir to CMake via CMAKE_ARGS (used by scikit-build and setuptools)
-set "CMAKE_ARGS=-DFETCHCONTENT_SOURCE_DIR_PYBIND11=%PYBIND11_DIR%"
+:: Get the path to cl.exe for explicit compiler settings
+for /f "delims=" %%i in ('where cl.exe') do set "CL_PATH=%%i"
+echo Using compiler: %CL_PATH%
+
+:: Pass pybind11 source dir and compiler settings to CMake
+set "CMAKE_ARGS=-DFETCHCONTENT_SOURCE_DIR_PYBIND11=%PYBIND11_DIR% -DCMAKE_C_COMPILER=cl.exe -DCMAKE_CXX_COMPILER=cl.exe"
 
 echo Building with OptiX_INSTALL_DIR=%OptiX_INSTALL_DIR%
 echo CMAKE_GENERATOR=%CMAKE_GENERATOR%
