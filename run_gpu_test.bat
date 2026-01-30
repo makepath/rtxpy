@@ -182,7 +182,7 @@ if not exist "cuda\kernel.cu" (
     echo ERROR: cuda\kernel.cu not found. Are you in the rtxpy directory?
     exit /b 1
 )
-nvcc -ptx -arch=sm_%GPU_ARCH% -I"%OptiX_INSTALL_DIR%\include" -Icuda --use_fast_math -o rtxpy\kernel.ptx cuda\kernel.cu
+nvcc -ptx -arch=sm_%GPU_ARCH% -I"%OptiX_INSTALL_DIR%\include" -Icuda --use_fast_math -allow-unsupported-compiler -o rtxpy\kernel.ptx cuda\kernel.cu
 if errorlevel 1 (
     echo ERROR: PTX compilation failed
     exit /b 1

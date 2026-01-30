@@ -64,6 +64,7 @@ nvcc -ptx ^
     -I"%OptiX_INSTALL_DIR%\include" ^
     -I"%SRC_DIR%\cuda" ^
     --use_fast_math ^
+    --allow-unsupported-compiler ^
     -o "%SRC_DIR%\rtxpy\kernel.ptx" ^
     "%SRC_DIR%\cuda\kernel.cu"
 if errorlevel 1 (
@@ -89,14 +90,96 @@ if errorlevel 1 (
     exit /b 1
 )
 
-cd /d "%OTK_PYOPTIX_DIR%\optix"
-echo Building and installing otk-pyoptix...
-"%PYTHON%" -m pip install . --no-deps --no-build-isolation -vv
+:: Verify cmake is available (installed via conda)
+where cmake >nul 2>&1
 if errorlevel 1 (
-    echo ERROR: Failed to install otk-pyoptix
+    echo ERROR: cmake not found. Ensure cmake is in build requirements.
+    exit /b 1
+)
+echo Found cmake at:
+where cmake
+
+:: Verify C++ compiler is available (conda-build should set up VS environment)
+where cl >nul 2>&1
+if errorlevel 1 (
+    echo.
+    echo ERROR: C++ compiler ^(cl.exe^) not found.
+    echo.
+    echo Please ensure Visual Studio Build Tools are installed and activated.
+    echo You can install them from: https://visualstudio.microsoft.com/visual-cpp-build-tools/
+    echo.
+    echo If already installed, run this build from a "Developer Command Prompt"
+    echo or run vcvars64.bat before building.
+    echo.
+    exit /b 1
+)
+echo Found C++ compiler at:
+where cl
+
+:: Pre-clone pybind11 without submodules to avoid FetchContent submodule update failures
+echo Pre-cloning pybind11 to avoid submodule issues...
+set "PYBIND11_DIR=%SRC_DIR%\pybind11-src"
+git clone --depth 1 --branch v2.13.6 https://github.com/pybind/pybind11.git "%PYBIND11_DIR%"
+if errorlevel 1 (
+    echo ERROR: Failed to clone pybind11
     exit /b 1
 )
 
+:: Tell CMake to use our pre-cloned pybind11 instead of fetching
+set "FETCHCONTENT_SOURCE_DIR_PYBIND11=%PYBIND11_DIR%"
+echo Using pre-cloned pybind11 at %PYBIND11_DIR%
+
+pushd "%OTK_PYOPTIX_DIR%\optix"
+
+:: Patch CMakeLists.txt to use our pre-cloned pybind11 and skip submodule updates
+echo Patching CMakeLists.txt to use local pybind11...
+
+:: Convert backslashes to forward slashes for CMake
+set "PYBIND11_DIR_CMAKE=%PYBIND11_DIR:\=/%"
+
+:: Prepend the FETCHCONTENT_SOURCE_DIR_PYBIND11 setting to CMakeLists.txt
+(
+    echo set^(FETCHCONTENT_SOURCE_DIR_PYBIND11 "!PYBIND11_DIR_CMAKE!" CACHE PATH "pybind11 source" FORCE^)
+    type CMakeLists.txt
+) > "%SRC_DIR%\CMakeLists_new.txt"
+move /y "%SRC_DIR%\CMakeLists_new.txt" CMakeLists.txt >nul
+
+echo Patched CMakeLists.txt - first 2 lines:
+powershell -Command "Get-Content CMakeLists.txt -Head 2"
+
+:: Set OptiX path for cmake/pip build process (exactly like run_gpu_test.bat)
+set "OPTIX_PATH=%OptiX_INSTALL_DIR%"
+set "CMAKE_PREFIX_PATH=%OptiX_INSTALL_DIR%;%CMAKE_PREFIX_PATH%"
+
+:: Clear conda-build injected CMAKE variables that break the build
+set CMAKE_GENERATOR=
+set CMAKE_GENERATOR_PLATFORM=
+set CMAKE_GENERATOR_TOOLSET=
+
+:: Pre-install build dependencies so we can use --no-build-isolation
+echo Installing build dependencies...
+"%PYTHON%" -m pip install setuptools wheel
+
+echo Building with OptiX_INSTALL_DIR=%OptiX_INSTALL_DIR%
+echo FETCHCONTENT_SOURCE_DIR_PYBIND11=!FETCHCONTENT_SOURCE_DIR_PYBIND11!
+
+:: Pass pybind11 source dir to CMake via CMAKE_ARGS (used by scikit-build and setuptools)
+set "CMAKE_ARGS=-DFETCHCONTENT_SOURCE_DIR_PYBIND11=!PYBIND11_DIR!"
+
+:: Use --no-build-isolation so environment variables are visible to CMake
+"%PYTHON%" -m pip install . -v --no-build-isolation
+if errorlevel 1 (
+    echo.
+    echo ERROR: Failed to install otk-pyoptix
+    echo.
+    echo If the error mentions OptiX not found, try setting manually:
+    echo   set OptiX_INSTALL_DIR=%OptiX_INSTALL_DIR%
+    echo   set OPTIX_PATH=%OptiX_INSTALL_DIR%
+    echo.
+    popd
+    exit /b 1
+)
+popd
 echo otk-pyoptix installed successfully
 echo.
 

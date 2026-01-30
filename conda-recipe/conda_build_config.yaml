@@ -1,10 +1,6 @@
 # Channels to use for build dependencies
 channel_sources:
-  - conda-forge,nvidia
-
-# CUDA versions to build against
-cuda_compiler_version:
-  - "12.6"
+  - conda-forge
 
 # Python versions to support
 python:
@@ -13,7 +9,16 @@ python:
   - "3.12"
   - "3.13"
 
+# NumPy version (needed to avoid conda-build warning)
+numpy:
+  - "1.26"
+
 # NumPy version handling:
 # - Python 3.10-3.12: numpy 1.26 (last 1.x series)
 # - Python 3.13+: numpy 2.1 (required for Python 3.13 support)
 # Note: numpy pins are set conditionally in meta.yaml based on Python version
+#
+# Windows build notes:
+# - Windows builds use system CUDA Toolkit (not conda packages)
+# - Ensure CUDA Toolkit 12.x is installed and nvcc is in PATH
+# - Linux builds use conda-provided CUDA packages
