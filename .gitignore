@@ -36,3 +36,4 @@ __pycache__
 build/
 dist/
 rtxpy.egg-info/
+examples/.ipynb_checkpoints/
