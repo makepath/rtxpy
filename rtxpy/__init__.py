@@ -10,3 +10,9 @@ from .mesh import triangulate_terrain, write_stl
 from .analysis import viewshed, hillshade
 
 __version__ = "0.0.5"
+
+# Register xarray accessor if xarray is available
+try:
+    from . import accessor  # noqa: F401
+except ImportError:
+    pass  # xarray not installed

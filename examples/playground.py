@@ -1,8 +1,8 @@
 """Interactive playground for rtxpy viewshed and hillshade analysis.
 
 This example demonstrates real-time viewshed and hillshade computation
-using GPU-accelerated ray tracing. Click on the terrain to move the
-viewshed origin point.
+using GPU-accelerated ray tracing via the xarray accessor. Click on the
+terrain to move the viewshed origin point.
 
 Requirements:
     pip install rtxpy[analysis] matplotlib xarray rioxarray requests
@@ -15,7 +15,8 @@ import xarray as xr
 import requests
 from pathlib import Path
 
-from rtxpy import RTX, viewshed, hillshade
+# Import rtxpy to register the .rtx accessor
+import rtxpy
 
 
 def download_crater_lake_dem(output_path):
@@ -124,8 +125,8 @@ def load_terrain():
     elev_min = float(terrain.min())
     elev_max = float(terrain.max())
 
-    # Convert to cupy for GPU processing
-    terrain.data = cupy.asarray(terrain.data)
+    # Convert to cupy for GPU processing using the accessor
+    terrain = terrain.rtx.to_cupy()
 
     print(f"Terrain loaded: {terrain.shape}, elevation range: "
           f"{elev_min:.0f}m to {elev_max:.0f}m (scaled)")
@@ -215,9 +216,6 @@ def run_playground():
     runs = 360
     H, W = terrain.data.shape
 
-    # Create RTX instance for reuse across frames
-    rtx = RTX()
-
     # Set up the figure with title
     fig, ax = plt.subplots(figsize=(12, 10))
     fig.canvas.mpl_connect('button_press_event', onclick)
@@ -243,6 +241,7 @@ def run_playground():
     print(f"Starting hiking simulation around Crater Lake...")
     print(f"  Terrain size: {H}x{W}")
     print(f"  Frames: {runs}")
+    print(f"  Using xarray .rtx accessor for GPU acceleration")
     print(f"  Click anywhere to teleport the observer!\n")
 
     for i in range(runs):
@@ -255,18 +254,18 @@ def run_playground():
         # Slowly rotate sun for dynamic lighting
         azimuth = (azimuth + 1) % 360
 
-        # Compute hillshade and viewshed
+        # Compute hillshade and viewshed using the accessor
         rt_start = time.time()
-        hs = hillshade(terrain,
-                       shadows=True,
-                       azimuth=azimuth,
-                       angle_altitude=25,
-                       rtx=rtx)
-        vs = viewshed(terrain,
-                      x=vsw,
-                      y=vsh,
-                      observer_elev=2.0,  # 2 meter observer height (standing hiker)
-                      rtx=rtx)
+        hs = terrain.rtx.hillshade(
+            shadows=True,
+            azimuth=azimuth,
+            angle_altitude=25
+        )
+        vs = terrain.rtx.viewshed(
+            x=vsw,
+            y=vsh,
+            observer_elev=2.0  # 2 meter observer height (standing hiker)
+        )
         rt_time = time.time() - rt_start
 
         # Convert hillshade to grayscale image
