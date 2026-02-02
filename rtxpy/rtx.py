@@ -39,13 +39,16 @@ class _GASEntry:
 
 
 # -----------------------------------------------------------------------------
-# Singleton state management
+# Singleton state management (shared OptiX resources only)
 # -----------------------------------------------------------------------------
 
 class _OptixState:
     """
     Manages the global OptiX state including device context, module, pipeline,
-    shader binding table, and acceleration structure cache.
+    and shader binding table. These resources are shared across all RTX instances.
+
+    Geometry state (acceleration structures) is managed per-RTX-instance to
+    provide isolation between different DataArrays/users.
     """
 
     def __init__(self):
@@ -58,27 +61,8 @@ class _OptixState:
         self.hit_pg = None
         self.sbt = None
 
-        # Single-GAS mode acceleration structure cache
-        self.gas_handle = 0
-        self.gas_buffer = None
-        self.current_hash = 0xFFFFFFFFFFFFFFFF  # uint64(-1)
-
-        # Multi-GAS mode state
-        self.gas_entries: Dict[str, _GASEntry] = {}  # Dict[str, _GASEntry]
-        self.ias_handle = 0
-        self.ias_buffer = None
-        self.ias_dirty = True
-        self.instances_buffer = None
-        self.single_gas_mode = True  # False when multi-GAS active
-
-        # Device memory for params
+        # Device memory for params (shared, overwritten before each trace)
         self.d_params = None
-
-        # Device buffers for CPU->GPU transfers
-        self.d_rays = None
-        self.d_rays_size = 0
-        self.d_hits = None
-        self.d_hits_size = 0
 
         self.initialized = False
 
@@ -89,23 +73,6 @@ class _OptixState:
 
         # Free device buffers
         self.d_params = None
-        self.d_rays = None
-        self.d_hits = None
-        self.d_rays_size = 0
-        self.d_hits_size = 0
-
-        # Free single-GAS mode acceleration structure
-        self.gas_buffer = None
-        self.gas_handle = 0
-        self.current_hash = 0xFFFFFFFFFFFFFFFF
-
-        # Free multi-GAS mode resources
-        self.gas_entries = {}
-        self.ias_handle = 0
-        self.ias_buffer = None
-        self.ias_dirty = True
-        self.instances_buffer = None
-        self.single_gas_mode = True
 
         # OptiX objects are automatically cleaned up by Python GC
         self.sbt = None
@@ -124,6 +91,54 @@ class _OptixState:
 
 
 _state = _OptixState()
+
+
+# -----------------------------------------------------------------------------
+# Per-instance geometry state
+# -----------------------------------------------------------------------------
+
+class _GeometryState:
+    """
+    Per-RTX-instance geometry state. Each RTX instance has its own isolated
+    geometry state, allowing multiple DataArrays to maintain separate scenes.
+    """
+
+    def __init__(self):
+        # Single-GAS mode acceleration structure cache
+        self.gas_handle = 0
+        self.gas_buffer = None
+        self.current_hash = 0xFFFFFFFFFFFFFFFF  # uint64(-1)
+
+        # Multi-GAS mode state
+        self.gas_entries: Dict[str, _GASEntry] = {}
+        self.ias_handle = 0
+        self.ias_buffer = None
+        self.ias_dirty = True
+        self.instances_buffer = None
+        self.single_gas_mode = True  # False when multi-GAS active
+
+        # Device buffers for CPU->GPU transfers (per-instance)
+        self.d_rays = None
+        self.d_rays_size = 0
+        self.d_hits = None
+        self.d_hits_size = 0
+
+    def clear(self):
+        """Clear all geometry state."""
+        # Clear multi-GAS state
+        self.gas_entries = {}
+        self.ias_handle = 0
+        self.ias_buffer = None
+        self.ias_dirty = True
+        self.instances_buffer = None
+
+        # Clear single-GAS state
+        self.gas_handle = 0
+        self.gas_buffer = None
+        self.current_hash = 0xFFFFFFFFFFFFFFFF
+
+        # Reset to single-GAS mode
+        self.single_gas_mode = True
 
 
 def _cleanup_at_exit():
@@ -549,25 +564,28 @@ def _build_gas_for_geometry(vertices, indices):
     return gas_handle, gas_buffer
 
 
-def _build_ias():
+def _build_ias(geom_state: _GeometryState):
     """
     Build an Instance Acceleration Structure (IAS) from all GAS entries.
 
     This creates a top-level acceleration structure that references all
     geometry acceleration structures with their transforms.
+
+    Args:
+        geom_state: The geometry state containing GAS entries to build IAS from.
     """
     global _state
 
     if not _state.initialized:
         _init_optix()
 
-    if not _state.gas_entries:
-        _state.ias_handle = 0
-        _state.ias_buffer = None
-        _state.ias_dirty = False
+    if not geom_state.gas_entries:
+        geom_state.ias_handle = 0
+        geom_state.ias_buffer = None
+        geom_state.ias_dirty = False
         return
 
-    num_instances = len(_state.gas_entries)
+    num_instances = len(geom_state.gas_entries)
 
     # OptixInstance structure is 80 bytes:
     # - transform: float[12] (3x4 row-major) = 48 bytes
@@ -582,7 +600,7 @@ def _build_ias():
     INSTANCE_SIZE = 80
     instances_data = bytearray(num_instances * INSTANCE_SIZE)
 
-    for i, (gas_id, entry) in enumerate(_state.gas_entries.items()):
+    for i, (gas_id, entry) in enumerate(geom_state.gas_entries.items()):
         offset = i * INSTANCE_SIZE
 
         # Pack transform (12 floats, 48 bytes)
@@ -607,13 +625,13 @@ def _build_ias():
         # Padding (8 bytes) - already zeros
 
     # Copy instances to GPU
-    _state.instances_buffer = cupy.array(
+    geom_state.instances_buffer = cupy.array(
         np.frombuffer(instances_data, dtype=np.uint8)
     )
 
     # Build input for IAS
     build_input = optix.BuildInputInstanceArray(
-        instances=_state.instances_buffer.data.ptr,
+        instances=geom_state.instances_buffer.data.ptr,
         numInstances=num_instances,
     )
 
@@ -631,30 +649,31 @@ def _build_ias():
 
     # Allocate buffers
     d_temp = cupy.zeros(buffer_sizes.tempSizeInBytes, dtype=cupy.uint8)
-    _state.ias_buffer = cupy.zeros(buffer_sizes.outputSizeInBytes, dtype=cupy.uint8)
+    geom_state.ias_buffer = cupy.zeros(buffer_sizes.outputSizeInBytes, dtype=cupy.uint8)
 
     # Build IAS
-    _state.ias_handle = _state.context.accelBuild(
+    geom_state.ias_handle = _state.context.accelBuild(
         0,  # stream
         [accel_options],
         [build_input],
         d_temp.data.ptr,
         buffer_sizes.tempSizeInBytes,
-        _state.ias_buffer.data.ptr,
+        geom_state.ias_buffer.data.ptr,
         buffer_sizes.outputSizeInBytes,
         [],  # emitted properties
     )
 
-    _state.ias_dirty = False
+    geom_state.ias_dirty = False
 
 
-def _build_accel(hash_value: int, vertices, indices) -> int:
+def _build_accel(geom_state: _GeometryState, hash_value: int, vertices, indices) -> int:
     """
     Build an OptiX acceleration structure for the given triangle mesh.
 
     This enables single-GAS mode and clears any multi-GAS state.
 
     Args:
+        geom_state: The geometry state to store the acceleration structure in.
         hash_value: Hash to identify this geometry (for caching)
         vertices: Vertex buffer (Nx3 float32, flattened)
         indices: Index buffer (Mx3 int32, flattened)
@@ -668,20 +687,20 @@ def _build_accel(hash_value: int, vertices, indices) -> int:
         _init_optix()
 
     # Clear multi-GAS state when switching to single-GAS mode
-    if not _state.single_gas_mode:
-        _state.gas_entries = {}
-        _state.ias_handle = 0
-        _state.ias_buffer = None
-        _state.ias_dirty = True
-        _state.instances_buffer = None
-        _state.single_gas_mode = True
+    if not geom_state.single_gas_mode:
+        geom_state.gas_entries = {}
+        geom_state.ias_handle = 0
+        geom_state.ias_buffer = None
+        geom_state.ias_dirty = True
+        geom_state.instances_buffer = None
+        geom_state.single_gas_mode = True
 
     # Check if we already have this acceleration structure cached
-    if _state.current_hash == hash_value:
+    if geom_state.current_hash == hash_value:
         return 0
 
     # Reset hash until successful build
-    _state.current_hash = 0xFFFFFFFFFFFFFFFF
+    geom_state.current_hash = 0xFFFFFFFFFFFFFFFF
 
     # Ensure data is on GPU as cupy arrays
     if isinstance(vertices, cupy.ndarray):
@@ -735,7 +754,7 @@ def _build_accel(hash_value: int, vertices, indices) -> int:
     compacted_size_buffer = cupy.zeros(1, dtype=cupy.uint64)
 
     # Build acceleration structure with compacted size emission
-    _state.gas_handle = _state.context.accelBuild(
+    geom_state.gas_handle = _state.context.accelBuild(
         0,  # stream
         [accel_options],
         [build_input],
@@ -753,17 +772,17 @@ def _build_accel(hash_value: int, vertices, indices) -> int:
     compacted_size = int(compacted_size_buffer[0])
     if compacted_size < gas_buffer.nbytes:
         compacted_buffer = cupy.zeros(compacted_size, dtype=cupy.uint8)
-        _state.gas_handle = _state.context.accelCompact(
+        geom_state.gas_handle = _state.context.accelCompact(
             0,  # stream
-            _state.gas_handle,
+            geom_state.gas_handle,
             compacted_buffer.data.ptr,
             compacted_size,
         )
-        _state.gas_buffer = compacted_buffer
+        geom_state.gas_buffer = compacted_buffer
     else:
-        _state.gas_buffer = gas_buffer
+        geom_state.gas_buffer = gas_buffer
 
-    _state.current_hash = hash_value
+    geom_state.current_hash = hash_value
     return 0
 
 
@@ -771,14 +790,16 @@ def _build_accel(hash_value: int, vertices, indices) -> int:
 # Ray tracing
 # -----------------------------------------------------------------------------
 
-def _trace_rays(rays, hits, num_rays: int, primitive_ids=None, instance_ids=None) -> int:
+def _trace_rays(geom_state: _GeometryState, rays, hits, num_rays: int,
+                primitive_ids=None, instance_ids=None) -> int:
     """
-    Trace rays against the current acceleration structure.
+    Trace rays against the acceleration structure in the given geometry state.
 
     Supports both single-GAS mode (using gas_handle) and multi-GAS mode
     (using IAS that references multiple GAS).
 
     Args:
+        geom_state: The geometry state containing the acceleration structure.
         rays: Ray buffer (Nx8 float32: ox,oy,oz,tmin,dx,dy,dz,tmax)
         hits: Hit buffer (Nx4 float32: t,nx,ny,nz)
         num_rays: Number of rays to trace
@@ -797,17 +818,17 @@ def _trace_rays(rays, hits, num_rays: int, primitive_ids=None, instance_ids=None
         return -1
 
     # Determine which traversable handle to use
-    if _state.single_gas_mode:
-        if _state.gas_handle == 0:
+    if geom_state.single_gas_mode:
+        if geom_state.gas_handle == 0:
             return -1
-        trace_handle = _state.gas_handle
+        trace_handle = geom_state.gas_handle
     else:
         # Multi-GAS mode: rebuild IAS if dirty
-        if _state.ias_dirty:
-            _build_ias()
-        if _state.ias_handle == 0:
+        if geom_state.ias_dirty:
+            _build_ias(geom_state)
+        if geom_state.ias_handle == 0:
             return -1
-        trace_handle = _state.ias_handle
+        trace_handle = geom_state.ias_handle
 
     # Size check
     if rays.size != num_rays * 8 or hits.size != num_rays * 4:
@@ -824,13 +845,13 @@ def _trace_rays(rays, hits, num_rays: int, primitive_ids=None, instance_ids=None
         d_rays = rays
         rays_on_host = False
     else:
-        # Allocate/resize device buffer if needed
+        # Allocate/resize device buffer if needed (per-instance)
         rays_size = num_rays * 8 * 4  # 8 floats * 4 bytes
-        if _state.d_rays_size != rays_size:
-            _state.d_rays = cupy.zeros(num_rays * 8, dtype=cupy.float32)
-            _state.d_rays_size = rays_size
-        _state.d_rays[:] = cupy.asarray(rays, dtype=cupy.float32)
-        d_rays = _state.d_rays
+        if geom_state.d_rays_size != rays_size:
+            geom_state.d_rays = cupy.zeros(num_rays * 8, dtype=cupy.float32)
+            geom_state.d_rays_size = rays_size
+        geom_state.d_rays[:] = cupy.asarray(rays, dtype=cupy.float32)
+        d_rays = geom_state.d_rays
         rays_on_host = True
 
     # Ensure hits buffer is on GPU
@@ -838,12 +859,12 @@ def _trace_rays(rays, hits, num_rays: int, primitive_ids=None, instance_ids=None
         d_hits = hits
         hits_on_host = False
     else:
-        # Allocate/resize device buffer if needed
+        # Allocate/resize device buffer if needed (per-instance)
         hits_size = num_rays * 4 * 4  # 4 floats * 4 bytes
-        if _state.d_hits_size != hits_size:
-            _state.d_hits = cupy.zeros(num_rays * 4, dtype=cupy.float32)
-            _state.d_hits_size = hits_size
-        d_hits = _state.d_hits
+        if geom_state.d_hits_size != hits_size:
+            geom_state.d_hits = cupy.zeros(num_rays * 4, dtype=cupy.float32)
+            geom_state.d_hits_size = hits_size
+        d_hits = geom_state.d_hits
         hits_on_host = True
 
     # Handle optional primitive_ids buffer
@@ -916,7 +937,9 @@ class RTX:
     RTX ray tracing interface.
 
     This class provides GPU-accelerated ray-triangle intersection using
-    NVIDIA's OptiX ray tracing engine.
+    NVIDIA's OptiX ray tracing engine. Each RTX instance maintains its own
+    isolated geometry state, allowing multiple instances to manage separate
+    scenes without interference.
 
     Args:
         device: CUDA device ID to use (0, 1, 2, ...). If None (default),
@@ -930,11 +953,17 @@ class RTX:
         # Use specific GPU
         rtx = RTX(device=1)
 
+        # Multiple independent instances
+        rtx1 = RTX()
+        rtx2 = RTX()
+        rtx1.add_geometry("mesh1", v1, i1)  # Only in rtx1's scene
+        rtx2.add_geometry("mesh2", v2, i2)  # Only in rtx2's scene
+
     Note:
-        The RTX context is a singleton - all RTX instances share the same
-        underlying OptiX context. The device can only be set on first
-        initialization. Subsequent RTX() calls with a different device
-        will emit a warning.
+        The underlying OptiX context, pipeline, and shader binding table are
+        shared across all RTX instances (singleton). However, geometry state
+        (acceleration structures, meshes) is per-instance, providing isolation
+        between different users/DataArrays.
     """
 
     def __init__(self, device: Optional[int] = None):
@@ -945,6 +974,8 @@ class RTX:
             device: CUDA device ID to use. If None, uses the current device.
         """
         _init_optix(device)
+        # Each RTX instance has its own isolated geometry state
+        self._geom_state = _GeometryState()
 
     def build(self, hashValue: int, vertexBuffer, indexBuffer) -> int:
         """
@@ -958,7 +989,7 @@ class RTX:
         Returns:
             0 on success, non-zero on error
         """
-        return _build_accel(hashValue, vertexBuffer, indexBuffer)
+        return _build_accel(self._geom_state, hashValue, vertexBuffer, indexBuffer)
 
     @property
     def device(self) -> Optional[int]:
@@ -977,7 +1008,7 @@ class RTX:
         Returns:
             The hash value, or uint64(-1) if no structure is present
         """
-        return _state.current_hash
+        return self._geom_state.current_hash
 
     def trace(self, rays, hits, numRays: int, primitive_ids=None, instance_ids=None) -> int:
         """
@@ -1001,7 +1032,7 @@ class RTX:
         Returns:
             0 on success, non-zero on error
         """
-        return _trace_rays(rays, hits, numRays, primitive_ids, instance_ids)
+        return _trace_rays(self._geom_state, rays, hits, numRays, primitive_ids, instance_ids)
 
     # -------------------------------------------------------------------------
     # Multi-GAS API
@@ -1032,11 +1063,11 @@ class RTX:
             _init_optix()
 
         # Switch to multi-GAS mode if currently in single-GAS mode
-        if _state.single_gas_mode:
-            _state.gas_handle = 0
-            _state.gas_buffer = None
-            _state.current_hash = 0xFFFFFFFFFFFFFFFF
-            _state.single_gas_mode = False
+        if self._geom_state.single_gas_mode:
+            self._geom_state.gas_handle = 0
+            self._geom_state.gas_buffer = None
+            self._geom_state.current_hash = 0xFFFFFFFFFFFFFFFF
+            self._geom_state.single_gas_mode = False
 
         # Build the GAS for this geometry
         gas_handle, gas_buffer = _build_gas_for_geometry(vertices, indices)
@@ -1063,7 +1094,7 @@ class RTX:
                 return -1
 
         # Create or update the GAS entry
-        _state.gas_entries[geometry_id] = _GASEntry(
+        self._geom_state.gas_entries[geometry_id] = _GASEntry(
             gas_id=geometry_id,
             gas_handle=gas_handle,
             gas_buffer=gas_buffer,
@@ -1072,7 +1103,7 @@ class RTX:
         )
 
         # Mark IAS as needing rebuild
-        _state.ias_dirty = True
+        self._geom_state.ias_dirty = True
 
         return 0
 
@@ -1086,13 +1117,11 @@ class RTX:
         Returns:
             0 on success, -1 if geometry not found
         """
-        global _state
-
-        if geometry_id not in _state.gas_entries:
+        if geometry_id not in self._geom_state.gas_entries:
             return -1
 
-        del _state.gas_entries[geometry_id]
-        _state.ias_dirty = True
+        del self._geom_state.gas_entries[geometry_id]
+        self._geom_state.ias_dirty = True
 
         return 0
 
@@ -1110,17 +1139,15 @@ class RTX:
         Returns:
             0 on success, -1 if geometry not found or invalid transform
         """
-        global _state
-
-        if geometry_id not in _state.gas_entries:
+        if geometry_id not in self._geom_state.gas_entries:
             return -1
 
         transform = list(transform)
         if len(transform) != 12:
             return -1
 
-        _state.gas_entries[geometry_id].transform = transform
-        _state.ias_dirty = True
+        self._geom_state.gas_entries[geometry_id].transform = transform
+        self._geom_state.ias_dirty = True
 
         return 0
 
@@ -1131,7 +1158,7 @@ class RTX:
         Returns:
             List of geometry ID strings
         """
-        return list(_state.gas_entries.keys())
+        return list(self._geom_state.gas_entries.keys())
 
     def get_geometry_count(self) -> int:
         """
@@ -1140,7 +1167,7 @@ class RTX:
         Returns:
             Number of geometries (0 in single-GAS mode)
         """
-        return len(_state.gas_entries)
+        return len(self._geom_state.gas_entries)
 
     def has_geometry(self, geometry_id: str) -> bool:
         """
@@ -1152,7 +1179,7 @@ class RTX:
         Returns:
             True if the geometry exists, False otherwise.
         """
-        return geometry_id in _state.gas_entries
+        return geometry_id in self._geom_state.gas_entries
 
     def clear_scene(self) -> None:
         """
@@ -1161,19 +1188,4 @@ class RTX:
         After calling this, you can use either build() for single-GAS mode
         or add_geometry() for multi-GAS mode.
         """
-        global _state
-
-        # Clear multi-GAS state
-        _state.gas_entries = {}
-        _state.ias_handle = 0
-        _state.ias_buffer = None
-        _state.ias_dirty = True
-        _state.instances_buffer = None
-
-        # Clear single-GAS state
-        _state.gas_handle = 0
-        _state.gas_buffer = None
-        _state.current_hash = 0xFFFFFFFFFFFFFFFF
-
-        # Reset to single-GAS mode
-        _state.single_gas_mode = True
+        self._geom_state.clear()
