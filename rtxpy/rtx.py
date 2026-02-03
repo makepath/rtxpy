@@ -24,18 +24,25 @@ import numpy as np
 # Data structures for multi-GAS support
 # -----------------------------------------------------------------------------
 
+def _identity_transform():
+    """Return an identity 3x4 transform matrix."""
+    return [
+        1.0, 0.0, 0.0, 0.0,  # Row 0: [Xx, Xy, Xz, Tx]
+        0.0, 1.0, 0.0, 0.0,  # Row 1: [Yx, Yy, Yz, Ty]
+        0.0, 0.0, 1.0, 0.0,  # Row 2: [Zx, Zy, Zz, Tz]
+    ]
+
+
 @dataclass
 class _GASEntry:
-    """Storage for a single Geometry Acceleration Structure."""
+    """Storage for a single Geometry Acceleration Structure with multiple instances."""
     gas_id: str
     gas_handle: int
     gas_buffer: cupy.ndarray  # Must keep reference to prevent GC
     vertices_hash: int
-    transform: List[float] = field(default_factory=lambda: [
-        1.0, 0.0, 0.0, 0.0,  # Row 0: [Xx, Xy, Xz, Tx]
-        0.0, 1.0, 0.0, 0.0,  # Row 1: [Yx, Yy, Yz, Ty]
-        0.0, 0.0, 1.0, 0.0,  # Row 2: [Zx, Zy, Zz, Tz]
-    ])  # 12 floats (3x4 row-major affine transform)
+    # List of transforms - each transform creates one instance of this geometry
+    # Each transform is 12 floats (3x4 row-major affine matrix)
+    transforms: List[List[float]] = field(default_factory=lambda: [_identity_transform()])
 
 
 # -----------------------------------------------------------------------------
@@ -569,7 +576,9 @@ def _build_ias(geom_state: _GeometryState):
     Build an Instance Acceleration Structure (IAS) from all GAS entries.
 
     This creates a top-level acceleration structure that references all
-    geometry acceleration structures with their transforms.
+    geometry acceleration structures with their transforms. Each GAS entry
+    can have multiple transforms, creating multiple instances of the same
+    geometry (GPU instancing).
 
     Args:
         geom_state: The geometry state containing GAS entries to build IAS from.
@@ -585,7 +594,8 @@ def _build_ias(geom_state: _GeometryState):
         geom_state.ias_dirty = False
         return
 
-    num_instances = len(geom_state.gas_entries)
+    # Count total instances across all GAS entries (each transform = one instance)
+    num_instances = sum(len(entry.transforms) for entry in geom_state.gas_entries.values())
 
     # OptixInstance structure is 80 bytes:
     # - transform: float[12] (3x4 row-major) = 48 bytes
@@ -600,29 +610,35 @@ def _build_ias(geom_state: _GeometryState):
     INSTANCE_SIZE = 80
     instances_data = bytearray(num_instances * INSTANCE_SIZE)
 
-    for i, (gas_id, entry) in enumerate(geom_state.gas_entries.items()):
-        offset = i * INSTANCE_SIZE
+    instance_idx = 0
+    for geometry_idx, (gas_id, entry) in enumerate(geom_state.gas_entries.items()):
+        # Create one instance for each transform of this geometry
+        for transform in entry.transforms:
+            offset = instance_idx * INSTANCE_SIZE
 
-        # Pack transform (12 floats, 48 bytes)
-        transform_bytes = struct.pack('12f', *entry.transform)
-        instances_data[offset:offset + 48] = transform_bytes
+            # Pack transform (12 floats, 48 bytes)
+            transform_bytes = struct.pack('12f', *transform)
+            instances_data[offset:offset + 48] = transform_bytes
 
-        # Pack instanceId (4 bytes)
-        struct.pack_into('I', instances_data, offset + 48, i)
+            # Pack instanceId (4 bytes) - use geometry index so we can identify
+            # which geometry was hit (all instances of same geometry share this ID)
+            struct.pack_into('I', instances_data, offset + 48, geometry_idx)
 
-        # Pack sbtOffset (4 bytes) - all use same hit group (SBT index 0)
-        struct.pack_into('I', instances_data, offset + 52, 0)
+            # Pack sbtOffset (4 bytes) - all use same hit group (SBT index 0)
+            struct.pack_into('I', instances_data, offset + 52, 0)
 
-        # Pack visibilityMask (4 bytes) - 0xFF = visible to all rays
-        struct.pack_into('I', instances_data, offset + 56, 0xFF)
+            # Pack visibilityMask (4 bytes) - 0xFF = visible to all rays
+            struct.pack_into('I', instances_data, offset + 56, 0xFF)
 
-        # Pack flags (4 bytes) - OPTIX_INSTANCE_FLAG_NONE = 0
-        struct.pack_into('I', instances_data, offset + 60, 0)
+            # Pack flags (4 bytes) - OPTIX_INSTANCE_FLAG_NONE = 0
+            struct.pack_into('I', instances_data, offset + 60, 0)
 
-        # Pack traversableHandle (8 bytes)
-        struct.pack_into('Q', instances_data, offset + 64, entry.gas_handle)
+            # Pack traversableHandle (8 bytes) - same GAS for all instances
+            struct.pack_into('Q', instances_data, offset + 64, entry.gas_handle)
 
-        # Padding (8 bytes) - already zeros
+            # Padding (8 bytes) - already zeros
+
+            instance_idx += 1
 
     # Copy instances to GPU
     geom_state.instances_buffer = cupy.array(
@@ -1039,28 +1055,55 @@ class RTX:
     # -------------------------------------------------------------------------
 
     def add_geometry(self, geometry_id: str, vertices, indices,
-                     transform: Optional[List[float]] = None) -> int:
+                     transform: Optional[List[float]] = None,
+                     transforms: Optional[List[List[float]]] = None) -> int:
         """
-        Add a geometry (GAS) to the scene with an optional transform.
+        Add a geometry (GAS) to the scene with optional transform(s).
 
         This enables multi-GAS mode. If called after build(), the single-GAS
         state is cleared. Adding a geometry with an existing ID replaces it.
+
+        Supports GPU instancing: pass multiple transforms to create multiple
+        instances of the same geometry efficiently (geometry data is stored
+        once, but rendered at multiple locations).
 
         Args:
             geometry_id: Unique identifier for this geometry
             vertices: Vertex buffer (flattened float32 array, 3 floats per vertex)
             indices: Index buffer (flattened int32 array, 3 ints per triangle)
-            transform: Optional 12-float list representing a 3x4 row-major
+            transform: Optional single 12-float list representing a 3x4 row-major
                       affine transform matrix. Defaults to identity.
                       Format: [Xx, Xy, Xz, Tx, Yx, Yy, Yz, Ty, Zx, Zy, Zz, Tz]
+            transforms: Optional list of transforms for GPU instancing. Each
+                       transform is a 12-float list. Use this to efficiently
+                       render the same geometry at multiple locations.
+                       Cannot be used together with `transform` parameter.
 
         Returns:
             0 on success, non-zero on error
+
+        Examples:
+            # Single instance (default)
+            rtx.add_geometry("terrain", verts, indices)
+
+            # Single instance with transform
+            rtx.add_geometry("tower", verts, indices, transform=[1,0,0,x, 0,1,0,y, 0,0,1,z])
+
+            # Multiple instances (GPU instancing) - efficient for many copies
+            transforms = [[1,0,0,x1, 0,1,0,y1, 0,0,1,z1],
+                          [1,0,0,x2, 0,1,0,y2, 0,0,1,z2],
+                          ...]
+            rtx.add_geometry("towers", verts, indices, transforms=transforms)
         """
         global _state
 
         if not _state.initialized:
             _init_optix()
+
+        # Validate transform arguments
+        if transform is not None and transforms is not None:
+            raise ValueError("Cannot specify both 'transform' and 'transforms'. "
+                           "Use 'transform' for a single instance or 'transforms' for multiple.")
 
         # Switch to multi-GAS mode if currently in single-GAS mode
         if self._geom_state.single_gas_mode:
@@ -1081,17 +1124,26 @@ class RTX:
             vertices_for_hash = np.asarray(vertices)
         vertices_hash = hash(vertices_for_hash.tobytes())
 
-        # Set transform (identity if not provided)
-        if transform is None:
-            transform = [
-                1.0, 0.0, 0.0, 0.0,
-                0.0, 1.0, 0.0, 0.0,
-                0.0, 0.0, 1.0, 0.0,
-            ]
-        else:
+        # Build transforms list
+        if transforms is not None:
+            # Multiple transforms provided (GPU instancing)
+            transforms_list = []
+            for t in transforms:
+                t = list(t)
+                if len(t) != 12:
+                    raise ValueError(f"Each transform must have 12 floats, got {len(t)}")
+                transforms_list.append(t)
+            if not transforms_list:
+                raise ValueError("transforms list cannot be empty")
+        elif transform is not None:
+            # Single transform provided
             transform = list(transform)
             if len(transform) != 12:
                 return -1
+            transforms_list = [transform]
+        else:
+            # No transform - use identity
+            transforms_list = [_identity_transform()]
 
         # Create or update the GAS entry
         self._geom_state.gas_entries[geometry_id] = _GASEntry(
@@ -1099,7 +1151,7 @@ class RTX:
             gas_handle=gas_handle,
             gas_buffer=gas_buffer,
             vertices_hash=vertices_hash,
-            transform=transform,
+            transforms=transforms_list,
         )
 
         # Mark IAS as needing rebuild
@@ -1126,30 +1178,110 @@ class RTX:
         return 0
 
     def update_transform(self, geometry_id: str,
-                        transform: List[float]) -> int:
+                        transform: List[float],
+                        instance_index: int = 0) -> int:
         """
-        Update the transform of an existing geometry.
+        Update the transform of a specific instance of a geometry.
 
         Args:
             geometry_id: The ID of the geometry to update
             transform: 12-float list representing a 3x4 row-major affine
                       transform matrix.
                       Format: [Xx, Xy, Xz, Tx, Yx, Yy, Yz, Ty, Zx, Zy, Zz, Tz]
+            instance_index: Which instance to update (default 0, the first instance)
 
         Returns:
-            0 on success, -1 if geometry not found or invalid transform
+            0 on success, -1 if geometry not found, invalid transform, or invalid index
         """
         if geometry_id not in self._geom_state.gas_entries:
+            return -1
+
+        entry = self._geom_state.gas_entries[geometry_id]
+        if instance_index < 0 or instance_index >= len(entry.transforms):
             return -1
 
         transform = list(transform)
         if len(transform) != 12:
             return -1
 
-        self._geom_state.gas_entries[geometry_id].transform = transform
+        entry.transforms[instance_index] = transform
         self._geom_state.ias_dirty = True
 
         return 0
+
+    def set_transforms(self, geometry_id: str,
+                       transforms: List[List[float]]) -> int:
+        """
+        Replace all transforms for a geometry (change instance count and positions).
+
+        Args:
+            geometry_id: The ID of the geometry to update
+            transforms: List of 12-float transform matrices
+
+        Returns:
+            0 on success, -1 if geometry not found or invalid transforms
+        """
+        if geometry_id not in self._geom_state.gas_entries:
+            return -1
+
+        transforms_list = []
+        for t in transforms:
+            t = list(t)
+            if len(t) != 12:
+                return -1
+            transforms_list.append(t)
+
+        if not transforms_list:
+            return -1
+
+        self._geom_state.gas_entries[geometry_id].transforms = transforms_list
+        self._geom_state.ias_dirty = True
+
+        return 0
+
+    def add_instances(self, geometry_id: str,
+                      transforms: List[List[float]]) -> int:
+        """
+        Add additional instances to an existing geometry.
+
+        This is useful for incrementally adding more instances without
+        replacing the existing ones.
+
+        Args:
+            geometry_id: The ID of the geometry to add instances to
+            transforms: List of 12-float transform matrices for new instances
+
+        Returns:
+            0 on success, -1 if geometry not found or invalid transforms
+        """
+        if geometry_id not in self._geom_state.gas_entries:
+            return -1
+
+        entry = self._geom_state.gas_entries[geometry_id]
+
+        for t in transforms:
+            t = list(t)
+            if len(t) != 12:
+                return -1
+            entry.transforms.append(t)
+
+        self._geom_state.ias_dirty = True
+
+        return 0
+
+    def get_instance_count(self, geometry_id: str) -> int:
+        """
+        Get the number of instances for a geometry.
+
+        Args:
+            geometry_id: The ID of the geometry
+
+        Returns:
+            Number of instances, or -1 if geometry not found
+        """
+        if geometry_id not in self._geom_state.gas_entries:
+            return -1
+        return len(self._geom_state.gas_entries[geometry_id].transforms)
 
     def list_geometries(self) -> List[str]:
         """

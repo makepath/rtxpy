@@ -1205,3 +1205,271 @@ def test_primitive_and_instance_ids_optional(test_cupy):
     inst_ids = backend.int32([0])
     res = rtx.trace(rays, hits, 1, instance_ids=inst_ids)
     assert res == 0
+
+
+# -----------------------------------------------------------------------------
+# GPU Instancing Tests
+# -----------------------------------------------------------------------------
+
+@pytest.mark.parametrize("test_cupy", [False, True])
+def test_gpu_instancing_multiple_transforms(test_cupy):
+    """Test adding one geometry with multiple transforms (GPU instancing)."""
+    if test_cupy:
+        if not has_cupy:
+            pytest.skip("cupy not available")
+        import cupy
+        backend = cupy
+    else:
+        backend = np
+
+    rtx = RTX()
+    rtx.clear_scene()
+
+    # Small triangle at origin
+    verts = backend.float32([0, 0, 0, 1, 0, 0, 0.5, 1, 0])
+    tris = backend.int32([0, 1, 2])
+
+    # Create 3 instances at different positions along x-axis
+    transforms = [
+        [1, 0, 0, 0,  0, 1, 0, 0, 0, 0, 1, 0],    # At origin
+        [1, 0, 0, 10, 0, 1, 0, 0, 0, 0, 1, 0],   # At x=10
+        [1, 0, 0, 20, 0, 1, 0, 0, 0, 0, 1, 0],   # At x=20
+    ]
+
+    res = rtx.add_geometry("triangles", verts, tris, transforms=transforms)
+    assert res == 0
+    assert rtx.get_instance_count("triangles") == 3
+
+    # Ray hitting first instance (at origin)
+    rays0 = backend.float32([0.5, 0.33, 10, 0, 0, 0, -1, 1000])
+    hits0 = backend.float32([0, 0, 0, 0])
+    res = rtx.trace(rays0, hits0, 1)
+    assert res == 0
+    np.testing.assert_almost_equal(float(hits0[0]), 10.0, decimal=1)
+
+    # Ray hitting second instance (at x=10)
+    rays1 = backend.float32([10.5, 0.33, 10, 0, 0, 0, -1, 1000])
+    hits1 = backend.float32([0, 0, 0, 0])
+    res = rtx.trace(rays1, hits1, 1)
+    assert res == 0
+    np.testing.assert_almost_equal(float(hits1[0]), 10.0, decimal=1)
+
+    # Ray hitting third instance (at x=20)
+    rays2 = backend.float32([20.5, 0.33, 10, 0, 0, 0, -1, 1000])
+    hits2 = backend.float32([0, 0, 0, 0])
+    res = rtx.trace(rays2, hits2, 1)
+    assert res == 0
+    np.testing.assert_almost_equal(float(hits2[0]), 10.0, decimal=1)
+
+    # Ray at x=5 should miss (between instances)
+    rays_miss = backend.float32([5.5, 0.33, 10, 0, 0, 0, -1, 1000])
+    hits_miss = backend.float32([0, 0, 0, 0])
+    res = rtx.trace(rays_miss, hits_miss, 1)
+    assert res == 0
+    assert float(hits_miss[0]) == -1.0  # Miss
+
+
+@pytest.mark.parametrize("test_cupy", [False, True])
+def test_gpu_instancing_many_instances(test_cupy):
+    """Stress test with many instances of the same geometry."""
+    if test_cupy:
+        if not has_cupy:
+            pytest.skip("cupy not available")
+        import cupy
+        backend = cupy
+    else:
+        backend = np
+
+    rtx = RTX()
+    rtx.clear_scene()
+
+    # Small triangle
+    verts = backend.float32([0, 0, 0, 0.5, 0, 0, 0.25, 0.5, 0])
+    tris = backend.int32([0, 1, 2])
+
+    # Create 100 instances in a 10x10 grid
+    transforms = []
+    for row in range(10):
+        for col in range(10):
+            x, y = col * 2.0, row * 2.0
+            transforms.append([1, 0, 0, x, 0, 1, 0, y, 0, 0, 1, 0])
+
+    res = rtx.add_geometry("grid", verts, tris, transforms=transforms)
+    assert res == 0
+    assert rtx.get_instance_count("grid") == 100
+
+    # Test a few positions
+    for row in [0, 5, 9]:
+        for col in [0, 5, 9]:
+            x, y = col * 2.0 + 0.25, row * 2.0 + 0.25
+            rays = backend.float32([x, y, 10, 0, 0, 0, -1, 1000])
+            hits = backend.float32([0, 0, 0, 0])
+            res = rtx.trace(rays, hits, 1)
+            assert res == 0
+            np.testing.assert_almost_equal(float(hits[0]), 10.0, decimal=1)
+
+
+@pytest.mark.parametrize("test_cupy", [False, True])
+def test_add_instances_to_existing_geometry(test_cupy):
+    """Test adding more instances to an existing geometry."""
+    if test_cupy:
+        if not has_cupy:
+            pytest.skip("cupy not available")
+        import cupy
+        backend = cupy
+    else:
+        backend = np
+
+    rtx = RTX()
+    rtx.clear_scene()
+
+    verts = backend.float32([0, 0, 0, 1, 0, 0, 0.5, 1, 0])
+    tris = backend.int32([0, 1, 2])
+
+    # Start with one instance
+    res = rtx.add_geometry("mesh", verts, tris, transform=[1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0])
+    assert res == 0
+    assert rtx.get_instance_count("mesh") == 1
+
+    # Add two more instances
+    new_transforms = [
+        [1, 0, 0, 10, 0, 1, 0, 0, 0, 0, 1, 0],
+        [1, 0, 0, 20, 0, 1, 0, 0, 0, 0, 1, 0],
+    ]
+    res = rtx.add_instances("mesh", new_transforms)
+    assert res == 0
+    assert rtx.get_instance_count("mesh") == 3
+
+    # Verify all three positions are hittable
+    for x in [0.5, 10.5, 20.5]:
+        rays = backend.float32([x, 0.33, 10, 0, 0, 0, -1, 1000])
+        hits = backend.float32([0, 0, 0, 0])
+        res = rtx.trace(rays, hits, 1)
+        assert res == 0
+        np.testing.assert_almost_equal(float(hits[0]), 10.0, decimal=1)
+
+
+@pytest.mark.parametrize("test_cupy", [False, True])
+def test_set_transforms_replace_all(test_cupy):
+    """Test replacing all transforms for a geometry."""
+    if test_cupy:
+        if not has_cupy:
+            pytest.skip("cupy not available")
+        import cupy
+        backend = cupy
+    else:
+        backend = np
+
+    rtx = RTX()
+    rtx.clear_scene()
+
+    verts = backend.float32([0, 0, 0, 1, 0, 0, 0.5, 1, 0])
+    tris = backend.int32([0, 1, 2])
+
+    # Start with 3 instances
+    transforms = [
+        [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0],
+        [1, 0, 0, 10, 0, 1, 0, 0, 0, 0, 1, 0],
+        [1, 0, 0, 20, 0, 1, 0, 0, 0, 0, 1, 0],
+    ]
+    res = rtx.add_geometry("mesh", verts, tris, transforms=transforms)
+    assert res == 0
+    assert rtx.get_instance_count("mesh") == 3
+
+    # Replace with just 2 instances at different positions
+    new_transforms = [
+        [1, 0, 0, 5, 0, 1, 0, 0, 0, 0, 1, 0],
+        [1, 0, 0, 15, 0, 1, 0, 0, 0, 0, 1, 0],
+    ]
+    res = rtx.set_transforms("mesh", new_transforms)
+    assert res == 0
+    assert rtx.get_instance_count("mesh") == 2
+
+    # Old positions should miss
+    rays_old = backend.float32([0.5, 0.33, 10, 0, 0, 0, -1, 1000])
+    hits_old = backend.float32([0, 0, 0, 0])
+    res = rtx.trace(rays_old, hits_old, 1)
+    assert res == 0
+    assert float(hits_old[0]) == -1.0  # Miss
+
+    # New positions should hit
+    for x in [5.5, 15.5]:
+        rays = backend.float32([x, 0.33, 10, 0, 0, 0, -1, 1000])
+        hits = backend.float32([0, 0, 0, 0])
+        res = rtx.trace(rays, hits, 1)
+        assert res == 0
+        np.testing.assert_almost_equal(float(hits[0]), 10.0, decimal=1)
+
+
+@pytest.mark.parametrize("test_cupy", [False, True])
+def test_update_transform_specific_instance(test_cupy):
+    """Test updating transform of a specific instance."""
+    if test_cupy:
+        if not has_cupy:
+            pytest.skip("cupy not available")
+        import cupy
+        backend = cupy
+    else:
+        backend = np
+
+    rtx = RTX()
+    rtx.clear_scene()
+
+    verts = backend.float32([0, 0, 0, 1, 0, 0, 0.5, 1, 0])
+    tris = backend.int32([0, 1, 2])
+
+    # Two instances
+    transforms = [
+        [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0],
+        [1, 0, 0, 10, 0, 1, 0, 0, 0, 0, 1, 0],
+    ]
+    res = rtx.add_geometry("mesh", verts, tris, transforms=transforms)
+    assert res == 0
+
+    # Move second instance (index 1) to x=20
+    res = rtx.update_transform("mesh", [1, 0, 0, 20, 0, 1, 0, 0, 0, 0, 1, 0], instance_index=1)
+    assert res == 0
+
+    # First instance still at origin
+    rays0 = backend.float32([0.5, 0.33, 10, 0, 0, 0, -1, 1000])
+    hits0 = backend.float32([0, 0, 0, 0])
+    res = rtx.trace(rays0, hits0, 1)
+    assert res == 0
+    np.testing.assert_almost_equal(float(hits0[0]), 10.0, decimal=1)
+
+    # Old position (x=10) should miss
+    rays_old = backend.float32([10.5, 0.33, 10, 0, 0, 0, -1, 1000])
+    hits_old = backend.float32([0, 0, 0, 0])
+    res = rtx.trace(rays_old, hits_old, 1)
+    assert res == 0
+    assert float(hits_old[0]) == -1.0  # Miss
+
+    # New position (x=20) should hit
+    rays_new = backend.float32([20.5, 0.33, 10, 0, 0, 0, -1, 1000])
+    hits_new = backend.float32([0, 0, 0, 0])
+    res = rtx.trace(rays_new, hits_new, 1)
+    assert res == 0
+    np.testing.assert_almost_equal(float(hits_new[0]), 10.0, decimal=1)
+
+
+def test_transforms_validation():
+    """Test error handling for invalid transforms."""
+    rtx = RTX()
+    rtx.clear_scene()
+
+    verts = np.float32([0, 0, 0, 1, 0, 0, 0.5, 1, 0])
+    tris = np.int32([0, 1, 2])
+
+    # Cannot specify both transform and transforms
+    with pytest.raises(ValueError, match="Cannot specify both"):
+        rtx.add_geometry("mesh", verts, tris,
+                        transform=[1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0],
+                        transforms=[[1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0]])
+
+    # Empty transforms list
+    with pytest.raises(ValueError, match="cannot be empty"):
+        rtx.add_geometry("mesh", verts, tris, transforms=[])
+
+    # Wrong transform length
+    with pytest.raises(ValueError, match="must have 12 floats"):
+        rtx.add_geometry("mesh", verts, tris, transforms=[[1, 0, 0]])  # Too short

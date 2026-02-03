@@ -1,12 +1,14 @@
-"""Mesh utilities for terrain triangulation and STL export.
+"""Mesh utilities for terrain triangulation, STL export, and OBJ loading.
 
 This module provides functions for converting raster terrain data into
-triangle meshes suitable for ray tracing, and for exporting meshes to STL format.
+triangle meshes suitable for ray tracing, for exporting meshes to STL format,
+and for loading external mesh files in OBJ format.
 """
 
 import numba as nb
 from numba import cuda
 import numpy as np
+from pathlib import Path
 
 from .rtx import has_cupy
 
@@ -204,3 +206,241 @@ def write_stl(filename, verts, triangles):
         content = np.empty(numTris * 50, np.uint8)
         _fill_stl_contents(content, vb, ib, numTris)
         f.write(content)
+
+
+def load_obj(filepath, scale=1.0, swap_yz=False):
+    """Load a Wavefront OBJ file and return vertices and indices for ray tracing.
+
+    This function parses OBJ files and converts them to the flattened vertex
+    and index arrays expected by the RTX class. Supports triangular and
+    quadrilateral faces (quads are automatically triangulated).
+
+    Parameters
+    ----------
+    filepath : str or Path
+        Path to the OBJ file to load.
+    scale : float, optional
+        Scale factor applied to all vertex coordinates. Default is 1.0.
+    swap_yz : bool, optional
+        If True, swap Y and Z coordinates. Useful when OBJ uses Y-up convention
+        but the scene uses Z-up (common for terrain/DEM scenes). Default is False.
+
+    Returns
+    -------
+    vertices : numpy.ndarray
+        Flattened float32 array of vertex positions with shape (N*3,),
+        where N is the number of vertices. Layout is [x0, y0, z0, x1, y1, z1, ...].
+    indices : numpy.ndarray
+        Flattened int32 array of triangle indices with shape (M*3,),
+        where M is the number of triangles. Layout is [i0, i1, i2, i3, i4, i5, ...].
+
+    Raises
+    ------
+    FileNotFoundError
+        If the specified file does not exist.
+    ValueError
+        If the file contains no valid geometry or has faces with fewer than
+        3 vertices.
+
+    Examples
+    --------
+    Load an OBJ file and add it to a scene:
+
+    >>> from rtxpy import RTX, load_obj
+    >>> verts, indices = load_obj("building.obj", scale=0.1)
+    >>> rtx = RTX()
+    >>> rtx.add_geometry("building", verts, indices)
+
+    Load with coordinate swap for Z-up terrain scenes:
+
+    >>> verts, indices = load_obj("model.obj", swap_yz=True)
+
+    Notes
+    -----
+    - OBJ files use 1-based indexing; this function converts to 0-based.
+    - Only vertex positions (v) and faces (f) are parsed. Texture coordinates (vt),
+      normals (vn), materials, and other OBJ features are ignored.
+    - Faces with more than 4 vertices are triangulated using a fan pattern.
+    - Negative face indices (relative references) are supported.
+    """
+    filepath = Path(filepath)
+    if not filepath.exists():
+        raise FileNotFoundError(f"OBJ file not found: {filepath}")
+
+    vertices = []
+    faces = []
+
+    with open(filepath, 'r') as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith('#'):
+                continue
+
+            parts = line.split()
+            if not parts:
+                continue
+
+            if parts[0] == 'v' and len(parts) >= 4:
+                # Vertex: v x y z [w]
+                x, y, z = float(parts[1]), float(parts[2]), float(parts[3])
+                if swap_yz:
+                    y, z = z, y
+                vertices.append([x * scale, y * scale, z * scale])
+
+            elif parts[0] == 'f' and len(parts) >= 4:
+                # Face: f v1 v2 v3 ... or f v1/vt1/vn1 v2/vt2/vn2 ...
+                face_indices = []
+                for p in parts[1:]:
+                    # Handle v, v/vt, v/vt/vn, or v//vn formats
+                    idx_str = p.split('/')[0]
+                    idx = int(idx_str)
+                    # OBJ uses 1-based indexing, convert to 0-based
+                    # Negative indices are relative to current vertex count
+                    if idx < 0:
+                        idx = len(vertices) + idx
+                    else:
+                        idx = idx - 1
+                    face_indices.append(idx)
+
+                if len(face_indices) < 3:
+                    continue
+
+                # Triangulate: fan triangulation for polygons
+                # Triangle: [0, 1, 2]
+                # Quad: [0, 1, 2], [0, 2, 3]
+                # Pentagon: [0, 1, 2], [0, 2, 3], [0, 3, 4]
+                for i in range(1, len(face_indices) - 1):
+                    faces.append([face_indices[0], face_indices[i], face_indices[i + 1]])
+
+    if not vertices:
+        raise ValueError(f"No vertices found in OBJ file: {filepath}")
+    if not faces:
+        raise ValueError(f"No faces found in OBJ file: {filepath}")
+
+    vertices_array = np.array(vertices, dtype=np.float32).flatten()
+    indices_array = np.array(faces, dtype=np.int32).flatten()
+
+    return vertices_array, indices_array
+
+
+def make_transform(x=0.0, y=0.0, z=0.0, scale=1.0, rotation_z=0.0):
+    """Create a 3x4 affine transform matrix for positioning geometry.
+
+    This is a convenience function for creating transform matrices to use
+    with RTX.add_geometry(). The transform applies scale, then rotation
+    around the Z axis, then translation.
+
+    Parameters
+    ----------
+    x : float, optional
+        X translation. Default is 0.0.
+    y : float, optional
+        Y translation. Default is 0.0.
+    z : float, optional
+        Z translation. Default is 0.0.
+    scale : float, optional
+        Uniform scale factor. Default is 1.0.
+    rotation_z : float, optional
+        Rotation around Z axis in radians. Default is 0.0.
+
+    Returns
+    -------
+    list
+        12-float list representing a 3x4 row-major affine transform matrix.
+        Format: [Xx, Xy, Xz, Tx, Yx, Yy, Yz, Ty, Zx, Zy, Zz, Tz]
+
+    Examples
+    --------
+    Simple translation:
+
+    >>> transform = make_transform(x=100, y=200, z=50)
+    >>> rtx.add_geometry("tower", verts, indices, transform=transform)
+
+    Scale and translate:
+
+    >>> transform = make_transform(x=100, y=200, z=50, scale=0.1)
+
+    Rotate 90 degrees and translate:
+
+    >>> import math
+    >>> transform = make_transform(x=100, y=200, rotation_z=math.pi/2)
+    """
+    import math
+    c = math.cos(rotation_z)
+    s = math.sin(rotation_z)
+
+    # Scale * Rotation * Translation (applied right to left)
+    # Rotation matrix around Z: [[c, -s, 0], [s, c, 0], [0, 0, 1]]
+    return [
+        scale * c, -scale * s, 0.0, x,
+        scale * s,  scale * c, 0.0, y,
+        0.0,        0.0,       scale, z,
+    ]
+
+
+def make_transforms_on_terrain(positions, terrain, scale=1.0, rotation_z=0.0):
+    """Create transforms for placing objects at multiple positions on terrain.
+
+    This convenience function samples terrain elevation at each (x, y) position
+    and creates transform matrices suitable for RTX.add_geometry(transforms=...).
+
+    Parameters
+    ----------
+    positions : array-like
+        Sequence of (x, y) coordinate pairs where objects should be placed.
+        Can be a list of tuples, numpy array of shape (N, 2), etc.
+    terrain : array-like
+        2D array of elevation values with shape (H, W). The terrain uses
+        pixel coordinates where position (x, y) samples terrain[int(y), int(x)].
+    scale : float, optional
+        Uniform scale factor applied to all transforms. Default is 1.0.
+    rotation_z : float or array-like, optional
+        Rotation around Z axis in radians. Can be a single value applied to
+        all instances, or an array of rotations (one per position). Default is 0.0.
+
+    Returns
+    -------
+    list
+        List of 12-float transform matrices, one per position.
+
+    Examples
+    --------
+    Place cell towers at multiple locations:
+
+    >>> tower_verts, tower_indices = load_obj("cell_tower.obj")
+    >>> positions = [(100, 200), (300, 400), (500, 150)]
+    >>> transforms = make_transforms_on_terrain(positions, dem, scale=0.1)
+    >>> rtx.add_geometry("towers", tower_verts, tower_indices, transforms=transforms)
+
+    With random rotations:
+
+    >>> import numpy as np
+    >>> rotations = np.random.uniform(0, 2*np.pi, len(positions))
+    >>> transforms = make_transforms_on_terrain(positions, dem, rotation_z=rotations)
+    """
+    positions = np.asarray(positions)
+    if positions.ndim == 1:
+        positions = positions.reshape(-1, 2)
+
+    n = len(positions)
+
+    # Handle rotation_z as scalar or array
+    if np.isscalar(rotation_z):
+        rotations = np.full(n, rotation_z)
+    else:
+        rotations = np.asarray(rotation_z)
+        if len(rotations) != n:
+            raise ValueError(f"rotation_z length ({len(rotations)}) must match "
+                           f"positions length ({n})")
+
+    transforms = []
+    for i, (x, y) in enumerate(positions):
+        # Sample terrain elevation at this position
+        # Terrain uses row, col indexing: terrain[row, col] = terrain[y, x]
+        row = int(np.clip(y, 0, terrain.shape[0] - 1))
+        col = int(np.clip(x, 0, terrain.shape[1] - 1))
+        z = float(terrain[row, col])
+
+        transforms.append(make_transform(x, y, z, scale, rotations[i]))
+
+    return transforms
