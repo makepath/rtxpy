@@ -33,7 +33,7 @@ extern "C" __global__ void __raygen__main()
         ray.tmax,
         0.0f,
         OptixVisibilityMask( 1 ),
-        OPTIX_RAY_FLAG_NONE,
+        OPTIX_RAY_FLAG_CULL_BACK_FACING_TRIANGLES,
         RAY_TYPE_RADIANCE,
         RAY_TYPE_COUNT,
         RAY_TYPE_RADIANCE,

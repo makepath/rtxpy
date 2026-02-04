@@ -1181,6 +1181,22 @@ class RTX:
         """
         return geometry_id in self._geom_state.gas_entries
 
+    def get_geometry_transform(self, geometry_id: str) -> Optional[List[float]]:
+        """
+        Get the transform of a geometry.
+
+        Args:
+            geometry_id: The ID of the geometry.
+
+        Returns:
+            12-float list representing the 3x4 transform matrix, or None if not found.
+            Format: [Xx, Xy, Xz, Tx, Yx, Yy, Yz, Ty, Zx, Zy, Zz, Tz]
+            The translation (position) is at indices 3, 7, 11 (Tx, Ty, Tz).
+        """
+        if geometry_id not in self._geom_state.gas_entries:
+            return None
+        return self._geom_state.gas_entries[geometry_id].transform.copy()
+
     def clear_scene(self) -> None:
         """
         Remove all geometries and reset to single-GAS mode.

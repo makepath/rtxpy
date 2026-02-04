@@ -1,0 +1,1018 @@
+"""Interactive terrain viewer using matplotlib for display.
+
+This module provides a simple game-engine-like render loop for
+exploring terrain interactively with keyboard controls.
+Uses matplotlib for display (no additional dependencies).
+"""
+
+import time
+import numpy as np
+from typing import Optional, Tuple
+
+from .rtx import RTX, has_cupy
+
+if has_cupy:
+    import cupy as cp
+
+
+class InteractiveViewer:
+    """
+    Interactive terrain viewer using matplotlib.
+
+    Provides keyboard-controlled camera for exploring ray-traced terrain.
+    Uses matplotlib's event system for input handling.
+
+    Controls
+    --------
+    - W/Up: Move forward
+    - S/Down: Move backward
+    - A/Left: Strafe left
+    - D/Right: Strafe right
+    - Q/Page Up: Move up
+    - E/Page Down: Move down
+    - I/J/K/L: Look up/left/down/right
+    - Scroll wheel: Zoom in/out (FOV)
+    - +/=: Increase speed
+    - -: Decrease speed
+    - G: Cycle geometry layers (when meshes are placed)
+    - N: Jump to next geometry in current layer
+    - P: Jump to previous geometry in current layer
+    - O: Place observer (for viewshed) at look-at point
+    - V: Toggle viewshed overlay (teal glow shows visible terrain)
+    - [/]: Decrease/increase observer height
+    - T: Toggle shadows
+    - C: Cycle colormap
+    - F: Save screenshot
+    - H: Toggle help overlay
+    - X: Exit
+
+    Examples
+    --------
+    >>> viewer = InteractiveViewer(dem)
+    >>> viewer.run()
+    """
+
+    def __init__(self, raster, width: int = 800, height: int = 600,
+                 render_scale: float = 0.5, key_repeat_interval: float = 0.05,
+                 rtx: 'RTX' = None,
+                 pixel_spacing_x: float = 1.0, pixel_spacing_y: float = 1.0):
+        """
+        Initialize the interactive viewer.
+
+        Parameters
+        ----------
+        raster : xarray.DataArray
+            Terrain raster data with cupy array.
+        width : int
+            Display width in pixels.
+        height : int
+            Display height in pixels.
+        render_scale : float
+            Render at this fraction of display size (0.25-1.0).
+            Lower values = higher FPS but lower quality.
+        key_repeat_interval : float
+            Minimum seconds between key repeat events (default 0.05 = 20 FPS max).
+            Lower values = more responsive but more GPU load.
+        rtx : RTX, optional
+            Existing RTX instance with geometries (e.g., from place_mesh).
+            If provided, renders the full scene including placed meshes.
+        pixel_spacing_x : float, optional
+            X spacing between pixels in world units (e.g., 30.0 for 30m/pixel).
+            Must match the spacing used when triangulating terrain. Default 1.0.
+        pixel_spacing_y : float, optional
+            Y spacing between pixels in world units. Default 1.0.
+        """
+        if not has_cupy:
+            raise ImportError(
+                "cupy is required for the interactive viewer. "
+                "Install with: conda install -c conda-forge cupy"
+            )
+
+        self.raster = raster
+        self.rtx = rtx
+        self.width = width
+        self.height = height
+        self.render_scale = np.clip(render_scale, 0.25, 1.0)
+        self.render_width = int(width * self.render_scale)
+        self.render_height = int(height * self.render_scale)
+
+        # Pixel spacing for coordinate conversion (world coords -> pixel indices)
+        self.pixel_spacing_x = pixel_spacing_x
+        self.pixel_spacing_y = pixel_spacing_y
+
+        # GAS layer visibility tracking
+        self._all_geometries = []
+        self._hidden_geometries = {}  # geometry_id -> (verts, indices, transform)
+        self._layer_mode = 0  # 0=all, then cycle through geometry groups
+        self._layer_modes = ['all']  # Will be populated with geometry groups
+        self._layer_positions = {}  # layer_name -> [(x, y, z, geometry_id), ...]
+        self._current_geom_idx = 0  # Current geometry index within active layer
+
+        if rtx is not None:
+            self._all_geometries = rtx.list_geometries()
+            # Group geometries by prefix (e.g., 'tower_0', 'tower_1' -> 'tower')
+            groups = set()
+            layer_geoms = {}  # layer_name -> [geometry_ids]
+
+            for g in self._all_geometries:
+                # Extract base name (before _N suffix if present)
+                parts = g.rsplit('_', 1)
+                if len(parts) == 2 and parts[1].isdigit():
+                    base_name = parts[0]
+                else:
+                    base_name = g
+                groups.add(base_name)
+
+                if base_name not in layer_geoms:
+                    layer_geoms[base_name] = []
+                layer_geoms[base_name].append(g)
+
+            self._layer_modes.extend(sorted(groups))
+
+            # Extract positions from transforms for each layer
+            for layer_name, geom_ids in layer_geoms.items():
+                positions = []
+                for geom_id in sorted(geom_ids):  # Sort for consistent ordering
+                    transform = rtx.get_geometry_transform(geom_id)
+                    if transform:
+                        # Position is at indices 3, 7, 11 (Tx, Ty, Tz)
+                        x, y, z = transform[3], transform[7], transform[11]
+                        positions.append((x, y, z, geom_id))
+                self._layer_positions[layer_name] = positions
+
+        # Camera state
+        self.position = None
+        self.yaw = 90.0      # Degrees, 0 = +X, 90 = +Y
+        self.pitch = -15.0   # Degrees, negative = looking down
+        self.move_speed = None  # Set in run() based on terrain extent
+        self.look_speed = 5.0
+
+        # Rendering settings
+        self.fov = 60.0
+        self.sun_azimuth = 225.0
+        self.sun_altitude = 35.0
+        self.shadows = True
+        self.ambient = 0.2
+        self.colormap = 'terrain'
+        self.colormaps = ['terrain', 'viridis', 'plasma', 'cividis', 'gray']
+        self.colormap_idx = 0
+
+        # Viewshed settings
+        self.viewshed_enabled = False
+        self.viewshed_observer_elev = 10.0  # Default 10m above surface (tower height)
+        self.viewshed_target_elev = 0.0
+        self.viewshed_opacity = 0.6
+        self._viewshed_cache = None  # Cached viewshed result
+        self._viewshed_coverage = 0.0  # Percentage of terrain visible
+        self._observer_position = None  # Fixed observer position (x, y) in terrain coords
+
+        # State
+        self.running = False
+        self.show_help = True
+        self.frame_count = 0
+
+        # Held keys tracking for smooth simultaneous input
+        self._held_keys = set()
+        self._tick_interval = int(key_repeat_interval * 1000)  # Convert to ms for timer
+        self._timer = None
+
+        # Get terrain info
+        H, W = raster.shape
+        terrain_data = raster.data
+        if hasattr(terrain_data, 'get'):
+            terrain_np = terrain_data.get()
+        else:
+            terrain_np = np.asarray(terrain_data)
+
+        self.terrain_shape = (H, W)
+        self.elev_min = float(np.nanmin(terrain_np))
+        self.elev_max = float(np.nanmax(terrain_np))
+        self.elev_mean = float(np.nanmean(terrain_np))
+
+    def _get_front(self):
+        """Get the forward direction vector."""
+        yaw_rad = np.radians(self.yaw)
+        pitch_rad = np.radians(self.pitch)
+        return np.array([
+            np.cos(yaw_rad) * np.cos(pitch_rad),
+            np.sin(yaw_rad) * np.cos(pitch_rad),
+            np.sin(pitch_rad)
+        ], dtype=np.float32)
+
+    def _get_right(self):
+        """Get the right direction vector."""
+        front = self._get_front()
+        world_up = np.array([0, 0, 1], dtype=np.float32)
+        right = np.cross(front, world_up)
+        return right / (np.linalg.norm(right) + 1e-8)
+
+    def _get_look_at(self):
+        """Get the current look-at point."""
+        return self.position + self._get_front() * 1000.0
+
+    def _handle_key_press(self, event):
+        """Handle key press - add to held keys or handle instant actions."""
+        key = event.key.lower() if event.key else ''
+
+        # Movement/look keys are tracked as held
+        movement_keys = {'w', 's', 'a', 'd', 'up', 'down', 'left', 'right',
+                         'q', 'e', 'pageup', 'pagedown', 'i', 'j', 'k', 'l'}
+
+        if key in movement_keys:
+            self._held_keys.add(key)
+            return
+
+        # Instant actions (not held)
+        # Speed (limits scale with terrain size)
+        if key in ('+', '='):
+            terrain_diagonal = np.sqrt(self.terrain_shape[0]**2 + self.terrain_shape[1]**2)
+            max_speed = terrain_diagonal * 0.1  # Max 10% of terrain per keystroke
+            self.move_speed = min(max_speed, self.move_speed * 1.2)
+            print(f"Speed: {self.move_speed:.1f}")
+        elif key == '-':
+            terrain_diagonal = np.sqrt(self.terrain_shape[0]**2 + self.terrain_shape[1]**2)
+            min_speed = terrain_diagonal * 0.001  # Min 0.1% of terrain per keystroke
+            self.move_speed = max(min_speed, self.move_speed / 1.2)
+            print(f"Speed: {self.move_speed:.1f}")
+
+        # Toggles
+        elif key == 't':
+            self.shadows = not self.shadows
+            print(f"Shadows: {'ON' if self.shadows else 'OFF'}")
+            self._update_frame()
+        elif key == 'c':
+            self.colormap_idx = (self.colormap_idx + 1) % len(self.colormaps)
+            self.colormap = self.colormaps[self.colormap_idx]
+            print(f"Colormap: {self.colormap}")
+            self._update_frame()
+        elif key == 'g':
+            self._cycle_layer()
+        elif key == 'n':
+            self._jump_to_geometry(1)  # Next geometry
+        elif key == 'p':
+            self._jump_to_geometry(-1)  # Previous geometry
+        elif key == 'h':
+            self.show_help = not self.show_help
+            self._update_frame()
+
+        # Viewshed controls
+        elif key == 'o':
+            self._place_observer()
+        elif key == 'v':
+            self._toggle_viewshed()
+        elif key == '[':
+            self._adjust_observer_elevation(-5.0)
+        elif key == ']':
+            self._adjust_observer_elevation(5.0)
+
+        # Screenshot
+        elif key == 'f':
+            self._save_screenshot()
+
+        # Exit
+        elif key in ('escape', 'x'):
+            self.running = False
+            if self._timer is not None:
+                self._timer.stop()
+            import matplotlib.pyplot as plt
+            plt.close(self.fig)
+
+    def _handle_key_release(self, event):
+        """Handle key release - remove from held keys."""
+        key = event.key.lower() if event.key else ''
+        self._held_keys.discard(key)
+
+    def _tick(self):
+        """Process all held keys and update frame (called by timer)."""
+        if not self.running or not self._held_keys:
+            return
+
+        # Get direction vectors (computed once per tick)
+        front = self._get_front()
+        right = self._get_right()
+
+        # Process all held movement keys
+        if 'w' in self._held_keys or 'up' in self._held_keys:
+            self.position += front * self.move_speed
+        if 's' in self._held_keys or 'down' in self._held_keys:
+            self.position -= front * self.move_speed
+        if 'a' in self._held_keys or 'left' in self._held_keys:
+            self.position -= right * self.move_speed
+        if 'd' in self._held_keys or 'right' in self._held_keys:
+            self.position += right * self.move_speed
+        if 'q' in self._held_keys or 'pageup' in self._held_keys:
+            self.position[2] += self.move_speed
+        if 'e' in self._held_keys or 'pagedown' in self._held_keys:
+            self.position[2] -= self.move_speed
+
+        # Process all held look keys
+        if 'i' in self._held_keys:
+            self.pitch = min(89, self.pitch + self.look_speed)
+        if 'k' in self._held_keys:
+            self.pitch = max(-89, self.pitch - self.look_speed)
+        if 'j' in self._held_keys:
+            self.yaw += self.look_speed
+        if 'l' in self._held_keys:
+            self.yaw -= self.look_speed
+
+        # Trigger redraw
+        self._update_frame()
+
+    def _cycle_layer(self):
+        """Cycle through GAS layer visibility modes."""
+        if not self._layer_modes or self.rtx is None:
+            print("No geometries in scene")
+            return
+
+        self._layer_mode = (self._layer_mode + 1) % len(self._layer_modes)
+        mode = self._layer_modes[self._layer_mode]
+
+        if mode == 'all':
+            # Restore all hidden geometries
+            for geom_id, (verts, indices, transform) in self._hidden_geometries.items():
+                self.rtx.add_geometry(geom_id, verts, indices, transform)
+            self._hidden_geometries.clear()
+            print(f"Layer: ALL ({len(self._all_geometries)} geometries)")
+        else:
+            # Hide geometries that don't match this group
+            # First restore any previously hidden
+            for geom_id, (verts, indices, transform) in self._hidden_geometries.items():
+                self.rtx.add_geometry(geom_id, verts, indices, transform)
+            self._hidden_geometries.clear()
+
+            # Now hide non-matching geometries
+            visible_count = 0
+            for geom_id in self._all_geometries:
+                # Check if this geometry belongs to the current group
+                parts = geom_id.rsplit('_', 1)
+                base_name = parts[0] if len(parts) == 2 and parts[1].isdigit() else geom_id
+
+                if base_name != mode and geom_id != mode:
+                    # Hide this geometry - need to get its data first
+                    # Note: RTX doesn't have get_geometry, so we can't truly hide/show
+                    # For now, just report what would be visible
+                    pass
+                else:
+                    visible_count += 1
+
+            # Since we can't easily hide/show, just print info
+            print(f"Layer: {mode} ({visible_count} visible)")
+
+        # Reset geometry index when changing layers
+        self._current_geom_idx = 0
+        self._update_frame()
+
+    def _jump_to_geometry(self, direction):
+        """Jump camera to next/previous geometry in current layer.
+
+        Parameters
+        ----------
+        direction : int
+            1 for next, -1 for previous.
+        """
+        if self.rtx is None:
+            print("No geometries in scene")
+            return
+
+        # Get current layer name
+        mode = self._layer_modes[self._layer_mode]
+
+        if mode == 'all':
+            print("Select a specific layer with G first (e.g., 'tower', 'house')")
+            return
+
+        # Get positions for current layer
+        if mode not in self._layer_positions:
+            print(f"No positions for layer: {mode}")
+            return
+
+        positions = self._layer_positions[mode]
+        if not positions:
+            print(f"No geometries in layer: {mode}")
+            return
+
+        # Cycle through geometries
+        self._current_geom_idx = (self._current_geom_idx + direction) % len(positions)
+        x, y, z, geom_id = positions[self._current_geom_idx]
+
+        # Position camera at geometry location, slightly above and behind
+        # Calculate offset based on current viewing direction
+        height_offset = 50  # Height above geometry
+        distance_back = 100  # Distance behind geometry
+
+        # Get current forward direction (but level, no pitch)
+        yaw_rad = np.radians(self.yaw)
+        forward_level = np.array([np.cos(yaw_rad), np.sin(yaw_rad), 0], dtype=np.float32)
+
+        # Position camera behind and above the geometry
+        self.position = np.array([
+            x - forward_level[0] * distance_back,
+            y - forward_level[1] * distance_back,
+            z + height_offset
+        ], dtype=np.float32)
+
+        # Look at the geometry
+        self.pitch = -15.0  # Look slightly down
+
+        print(f"Jumped to {geom_id} ({self._current_geom_idx + 1}/{len(positions)})")
+        print(f"  Position: ({x:.0f}, {y:.0f}, {z:.0f})")
+        self._update_frame()
+
+    def _place_observer(self):
+        """Place a viewshed observer at the current camera position on terrain.
+
+        The observer is placed at the camera's x,y location, projected onto
+        the terrain surface. This becomes the fixed point for viewshed analysis.
+        Observer position is stored in world coordinates (same as camera).
+        """
+        H, W = self.terrain_shape
+
+        # Use camera position (in world coordinates if pixel_spacing != 1.0)
+        cam_x = self.position[0]
+        cam_y = self.position[1]
+
+        # Compute terrain bounds in world coordinates
+        max_x = (W - 1) * self.pixel_spacing_x
+        max_y = (H - 1) * self.pixel_spacing_y
+
+        # Clamp to terrain bounds (in world coordinates)
+        obs_x = float(np.clip(cam_x, 0, max_x))
+        obs_y = float(np.clip(cam_y, 0, max_y))
+
+        # Store in world coordinates (for orb rendering)
+        self._observer_position = (obs_x, obs_y)
+
+        # Also compute pixel indices for display
+        px_x = int(obs_x / self.pixel_spacing_x)
+        px_y = int(obs_y / self.pixel_spacing_y)
+
+        print(f"Observer placed at world ({obs_x:.0f}, {obs_y:.0f}), pixel ({px_x}, {px_y})")
+        print(f"  Height: {self.viewshed_observer_elev:.0f}m above terrain")
+        print(f"  Press V to toggle viewshed, [/] to adjust height")
+
+        # If viewshed is already enabled, recalculate
+        if self.viewshed_enabled:
+            self._calculate_viewshed()
+
+        self._update_frame()
+
+    def _calculate_viewshed(self):
+        """Calculate viewshed from the placed observer position.
+
+        Uses GPU ray tracing to compute visibility from the fixed observer.
+        Observer position is in world coordinates; this method converts to
+        pixel indices for the viewshed calculation.
+        """
+        from .analysis.viewshed import _viewshed_rt
+        from .analysis._common import prepare_mesh
+
+        if self._observer_position is None:
+            print("No observer placed. Press O to place an observer first.")
+            return None
+
+        # Observer position is in world coordinates
+        world_x, world_y = self._observer_position
+        H, W = self.terrain_shape
+
+        # Convert world coords to pixel indices
+        px_x = world_x / self.pixel_spacing_x
+        px_y = world_y / self.pixel_spacing_y
+
+        # Validate coordinates are within terrain bounds (in pixel space)
+        if px_x < 0 or px_x >= W or px_y < 0 or px_y >= H:
+            print(f"Observer position pixel ({px_x:.1f}, {px_y:.1f}) outside terrain bounds")
+            return None
+
+        print(f"Computing viewshed... (observer height: {self.viewshed_observer_elev:.0f}m)")
+        print(f"  Raster shape: {self.raster.shape}, pixel_spacing: ({self.pixel_spacing_x:.1f}, {self.pixel_spacing_y:.1f})")
+
+        try:
+            # Always use a fresh mesh for viewshed calculation
+            # (self.rtx might have placed meshes that interfere with viewshed rays)
+            print("  Building fresh terrain mesh...")
+            rtx = prepare_mesh(self.raster, rtx=None)
+            print("  Mesh built successfully")
+
+            # Convert pixel indices to raster coords
+            y_coords = self.raster.indexes.get('y').values
+            x_coords = self.raster.indexes.get('x').values
+
+            # Clamp to valid range and get actual coord values
+            x_idx = int(np.clip(px_x, 0, W - 1))
+            y_idx = int(np.clip(px_y, 0, H - 1))
+            x_coord = x_coords[x_idx] if x_idx < len(x_coords) else x_coords[-1]
+            y_coord = y_coords[y_idx] if y_idx < len(y_coords) else y_coords[-1]
+
+            print(f"  Observer at raster coords: ({x_coord:.1f}, {y_coord:.1f})")
+
+            viewshed = _viewshed_rt(
+                self.raster, rtx,
+                x_coord, y_coord,
+                self.viewshed_observer_elev,
+                self.viewshed_target_elev
+            )
+
+            # Calculate coverage percentage
+            vis_data = viewshed.data
+            if hasattr(vis_data, 'get'):
+                vis_np = vis_data.get()
+            else:
+                vis_np = vis_data
+            visible_cells = np.sum(vis_np >= 0)
+            total_cells = vis_np.size
+            self._viewshed_coverage = 100.0 * visible_cells / total_cells
+
+            # Cache result
+            self._viewshed_cache = viewshed
+
+            print(f"  Coverage: {self._viewshed_coverage:.1f}% terrain visible")
+            return viewshed
+
+        except Exception as e:
+            import traceback
+            print(f"Viewshed calculation failed: {e}")
+            traceback.print_exc()
+            return None
+
+    def _apply_viewshed_overlay(self, img):
+        """Apply viewshed overlay to rendered image.
+
+        Visible areas get a teal glow, invisible areas remain unchanged.
+
+        Parameters
+        ----------
+        img : ndarray
+            RGB image array (H, W, 3) with values 0-255.
+
+        Returns
+        -------
+        ndarray
+            Image with viewshed overlay applied.
+        """
+        if self._viewshed_cache is None:
+            return img
+
+        vis_data = self._viewshed_cache.data
+        if hasattr(vis_data, 'get'):
+            vis_np = vis_data.get()
+        else:
+            vis_np = np.asarray(vis_data)
+
+        # Resize viewshed to match render resolution
+        scale_y = img.shape[0] / vis_np.shape[0]
+        scale_x = img.shape[1] / vis_np.shape[1]
+        if scale_y != 1.0 or scale_x != 1.0:
+            try:
+                from scipy.ndimage import zoom
+                vis_resized = zoom(vis_np, (scale_y, scale_x), order=0)
+            except ImportError:
+                # Fallback: use cv2 for resizing
+                try:
+                    import cv2
+                    vis_resized = cv2.resize(vis_np, (img.shape[1], img.shape[0]),
+                                             interpolation=cv2.INTER_NEAREST)
+                except ImportError:
+                    # Last resort: nearest neighbor with numpy
+                    y_idx = np.linspace(0, vis_np.shape[0]-1, img.shape[0]).astype(int)
+                    x_idx = np.linspace(0, vis_np.shape[1]-1, img.shape[1]).astype(int)
+                    vis_resized = vis_np[np.ix_(y_idx, x_idx)]
+        else:
+            vis_resized = vis_np
+
+        # Create result image
+        img_float = img.astype(np.float32)
+        result = img_float.copy()
+
+        # Visible areas: apply teal glow
+        # Teal color: RGB(0, 200, 200) - cyan/teal
+        visible_mask = vis_resized >= 0
+
+        # Intensity based on viewing angle (0-90 degrees)
+        # Lower angle = more direct view = brighter glow
+        vis_angles = np.clip(vis_resized, 0, 90)
+        glow_intensity = 1.0 - (vis_angles / 90.0)  # 1.0 at 0°, 0.0 at 90°
+        glow_intensity = np.clip(glow_intensity, 0.4, 1.0)  # Min glow level
+
+        # Teal glow color
+        teal_r, teal_g, teal_b = 0, 220, 210  # Bright teal/cyan
+
+        # Apply glow only to visible areas using additive blending
+        alpha = self.viewshed_opacity
+        for c, teal_val in enumerate([teal_r, teal_g, teal_b]):
+            channel = result[:, :, c]
+            glow = glow_intensity * teal_val * alpha
+            channel[visible_mask] = np.clip(
+                channel[visible_mask] * (1 - alpha * 0.3) + glow[visible_mask],
+                0, 255
+            )
+
+        return result.astype(np.uint8)
+
+    def _toggle_viewshed(self):
+        """Toggle viewshed overlay on/off."""
+        if self._observer_position is None:
+            print("No observer placed. Press O to place an observer first.")
+            return
+
+        self.viewshed_enabled = not self.viewshed_enabled
+
+        if self.viewshed_enabled:
+            print("Calculating viewshed...")
+            viewshed = self._calculate_viewshed()
+            if viewshed is None:
+                self.viewshed_enabled = False
+                print("Viewshed: OFF (calculation failed)")
+            else:
+                print(f"Viewshed: ON ({self._viewshed_coverage:.1f}% coverage)")
+                # Debug: verify viewshed cache
+                if self._viewshed_cache is not None:
+                    print(f"  Viewshed cache shape: {self._viewshed_cache.shape}")
+                else:
+                    print("  WARNING: Viewshed cache is None!")
+        else:
+            print("Viewshed: OFF")
+
+        self._update_frame()
+
+    def _clear_observer(self):
+        """Clear the placed observer and viewshed."""
+        self._observer_position = None
+        self._viewshed_cache = None
+        self.viewshed_enabled = False
+        print("Observer cleared")
+        self._update_frame()
+
+    def _adjust_observer_elevation(self, delta):
+        """Adjust observer elevation for viewshed calculation."""
+        self.viewshed_observer_elev = max(0, self.viewshed_observer_elev + delta)
+        print(f"Observer height: {self.viewshed_observer_elev:.0f}m")
+
+        # Clear cache and recalculate viewshed if enabled
+        if self.viewshed_enabled and self._observer_position is not None:
+            self._viewshed_cache = None  # Clear cache to force recalculation
+            self._calculate_viewshed()
+            self._update_frame()
+
+    def _save_screenshot(self):
+        """Save current view as PNG image."""
+        import datetime
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"rtxpy_screenshot_{timestamp}.png"
+
+        # Pass viewshed data directly to render if enabled
+        viewshed_data = None
+        observer_pos = None
+        if self.viewshed_enabled and self._viewshed_cache is not None:
+            viewshed_data = self._viewshed_cache
+            if self._observer_position is not None:
+                observer_pos = self._observer_position
+
+        # Render at full resolution for screenshot
+        from .analysis import render as render_func
+        img = render_func(
+            self.raster,
+            camera_position=tuple(self.position),
+            look_at=tuple(self._get_look_at()),
+            fov=self.fov,
+            width=self.width,
+            height=self.height,
+            sun_azimuth=self.sun_azimuth,
+            sun_altitude=self.sun_altitude,
+            shadows=self.shadows,
+            ambient=self.ambient,
+            colormap=self.colormap,
+            rtx=self.rtx,
+            viewshed_data=viewshed_data,
+            viewshed_opacity=self.viewshed_opacity,
+            observer_position=observer_pos,
+            pixel_spacing_x=self.pixel_spacing_x,
+            pixel_spacing_y=self.pixel_spacing_y,
+        )
+
+        # Convert from float [0-1] to uint8 [0-255]
+        img_uint8 = (np.clip(img, 0, 1) * 255).astype(np.uint8)
+
+        # Save using PIL or matplotlib
+        try:
+            from PIL import Image
+            Image.fromarray(img_uint8).save(filename)
+        except ImportError:
+            import matplotlib.pyplot as plt
+            plt.imsave(filename, img)
+
+        print(f"Screenshot saved: {filename}")
+
+    def _render_frame(self):
+        """Render a frame using rtxpy."""
+        from .analysis import render
+
+        # Pass viewshed data directly to render if enabled
+        viewshed_data = None
+        observer_pos = None
+        if self.viewshed_enabled:
+            if self._viewshed_cache is not None:
+                viewshed_data = self._viewshed_cache
+                if self._observer_position is not None:
+                    observer_pos = self._observer_position
+            else:
+                # Debug: viewshed enabled but no cache
+                if self.frame_count % 100 == 0:  # Only print occasionally
+                    print(f"[DEBUG] Viewshed enabled but cache is None")
+
+        img = render(
+            self.raster,
+            camera_position=tuple(self.position),
+            look_at=tuple(self._get_look_at()),
+            fov=self.fov,
+            width=self.render_width,
+            height=self.render_height,
+            sun_azimuth=self.sun_azimuth,
+            sun_altitude=self.sun_altitude,
+            shadows=self.shadows,
+            ambient=self.ambient,
+            colormap=self.colormap,
+            rtx=self.rtx,
+            viewshed_data=viewshed_data,
+            viewshed_opacity=self.viewshed_opacity,
+            observer_position=observer_pos,
+            pixel_spacing_x=self.pixel_spacing_x,
+            pixel_spacing_y=self.pixel_spacing_y,
+        )
+
+        return img
+
+    def _update_frame(self):
+        """Render and display a new frame."""
+        img = self._render_frame()
+        self.frame_count += 1
+
+        # Update the image
+        self.im.set_data(img)
+
+        # Update title with position info
+        pos = self.position
+        title = f"Pos: ({pos[0]:.0f}, {pos[1]:.0f}, {pos[2]:.0f}) | Speed: {self.move_speed:.0f}"
+        if self._observer_position is not None:
+            obs_x, obs_y = self._observer_position
+            title += f" | Observer: ({obs_x:.0f}, {obs_y:.0f}) @ {self.viewshed_observer_elev:.0f}m"
+            if self.viewshed_enabled:
+                title += f" | Coverage: {self._viewshed_coverage:.1f}%"
+        self.ax.set_title(title, fontsize=10, color='white')
+
+        # Update help text
+        if self.show_help:
+            self.help_text.set_visible(True)
+        else:
+            self.help_text.set_visible(False)
+
+        self.fig.canvas.draw_idle()
+        self.fig.canvas.flush_events()
+
+    def _handle_scroll(self, event):
+        """Handle mouse scroll wheel for zoom."""
+        if event.step > 0:
+            self.fov = max(20, self.fov - 3)
+        else:
+            self.fov = min(120, self.fov + 3)
+        print(f"FOV: {self.fov:.0f}")
+        self._update_frame()
+
+    def run(self, start_position: Optional[Tuple[float, float, float]] = None,
+            look_at: Optional[Tuple[float, float, float]] = None):
+        """
+        Run the interactive viewer.
+
+        Parameters
+        ----------
+        start_position : tuple, optional
+            Starting camera position (x, y, z). If None, positions
+            camera above terrain center.
+        look_at : tuple, optional
+            Initial look-at point. If None, looks toward terrain center.
+        """
+        import matplotlib
+        import matplotlib.pyplot as plt
+
+        # Check if we're in a Jupyter notebook and need to switch backends
+        current_backend = matplotlib.get_backend().lower()
+        in_notebook = False
+        try:
+            from IPython import get_ipython
+            ipy = get_ipython()
+            if ipy is not None and 'IPKernelApp' in ipy.config:
+                in_notebook = True
+        except (ImportError, AttributeError):
+            pass
+
+        # Warn if using a non-interactive backend
+        non_interactive_backends = ['agg', 'module://matplotlib_inline.backend_inline', 'inline']
+        if any(nb in current_backend for nb in non_interactive_backends):
+            if in_notebook:
+                print("\n" + "="*70)
+                print("WARNING: Matplotlib is using a non-interactive backend.")
+                print("Keyboard controls will NOT work with the inline backend.")
+                print("\nTo fix, run this BEFORE calling explore():")
+                print("    %matplotlib qt")
+                print("  OR")
+                print("    %matplotlib tk")
+                print("  OR (if ipympl is installed):")
+                print("    %matplotlib widget")
+                print("\nThen restart the kernel and run the notebook again.")
+                print("="*70 + "\n")
+            else:
+                print("WARNING: Non-interactive matplotlib backend detected.")
+                print("Keyboard controls may not work.")
+
+        # Disable default matplotlib keybindings that conflict with our controls
+        for key in ['s', 'q', 'l', 'k', 'a', 'w', 'e', 'c', 'h', 't']:
+            if key in plt.rcParams.get('keymap.save', []):
+                plt.rcParams['keymap.save'].remove(key)
+            if key in plt.rcParams.get('keymap.quit', []):
+                plt.rcParams['keymap.quit'].remove(key)
+            if key in plt.rcParams.get('keymap.xscale', []):
+                plt.rcParams['keymap.xscale'].remove(key)
+            if key in plt.rcParams.get('keymap.yscale', []):
+                plt.rcParams['keymap.yscale'].remove(key)
+        # Clear all default keymaps to avoid conflicts
+        for param in list(plt.rcParams.keys()):
+            if param.startswith('keymap.'):
+                plt.rcParams[param] = []
+
+        H, W = self.terrain_shape
+
+        # Set initial move speed based on terrain extent (~1% of diagonal per keystroke)
+        terrain_diagonal = np.sqrt(W**2 + H**2)
+        if self.move_speed is None:
+            self.move_speed = terrain_diagonal * 0.01
+
+        # Default start position
+        if start_position is None:
+            start_position = (
+                W / 2,
+                -H * 0.3,
+                self.elev_max + terrain_diagonal * 0.1
+            )
+
+        self.position = np.array(start_position, dtype=np.float32)
+
+        # Calculate initial yaw/pitch from look_at
+        if look_at is not None:
+            direction = np.array(look_at) - self.position
+            direction = direction / (np.linalg.norm(direction) + 1e-8)
+            self.yaw = np.degrees(np.arctan2(direction[1], direction[0]))
+            self.pitch = np.degrees(np.arcsin(np.clip(direction[2], -1, 1)))
+        else:
+            # Look toward terrain center
+            center = np.array([W / 2, H / 2, self.elev_mean])
+            direction = center - self.position
+            direction = direction / (np.linalg.norm(direction) + 1e-8)
+            self.yaw = np.degrees(np.arctan2(direction[1], direction[0]))
+            self.pitch = np.degrees(np.arcsin(np.clip(direction[2], -1, 1)))
+
+        # Create figure
+        plt.ion()  # Interactive mode
+        self.fig, self.ax = plt.subplots(1, 1, figsize=(self.width/100, self.height/100), dpi=100)
+        self.fig.patch.set_facecolor('black')
+        self.ax.set_facecolor('black')
+        self.ax.axis('off')
+        self.fig.subplots_adjust(left=0, right=1, top=0.95, bottom=0)
+
+        # Render initial frame
+        img = self._render_frame()
+        self.im = self.ax.imshow(img, aspect='auto')
+
+        # Help text
+        help_str = (
+            "WASD/Arrows: Move | Q/E: Up/Down | IJKL: Look | Scroll: Zoom | +/-: Speed\n"
+            "G: Layers | N/P: Geometry | O: Place Observer | V: Toggle Viewshed | [/]: Height\n"
+            "T: Shadows | C: Colormap | F: Screenshot | H: Help | X: Exit"
+        )
+        self.help_text = self.ax.text(
+            0.01, 0.02, help_str,
+            transform=self.ax.transAxes,
+            fontsize=8,
+            color='white',
+            alpha=0.8,
+            verticalalignment='bottom',
+            fontfamily='monospace',
+            bbox=dict(boxstyle='round', facecolor='black', alpha=0.5)
+        )
+
+        # Connect event handlers
+        self.fig.canvas.mpl_connect('key_press_event', self._handle_key_press)
+        self.fig.canvas.mpl_connect('key_release_event', self._handle_key_release)
+        self.fig.canvas.mpl_connect('scroll_event', self._handle_scroll)
+
+        # Set up timer for smooth key repeat
+        self._timer = self.fig.canvas.new_timer(interval=self._tick_interval)
+        self._timer.add_callback(self._tick)
+        self._timer.start()
+
+        # Window title
+        self.fig.canvas.manager.set_window_title('rtxpy Interactive Viewer')
+
+        print(f"\nInteractive Viewer Started")
+        print(f"  Window: {self.width}x{self.height}")
+        print(f"  Render: {self.render_width}x{self.render_height} ({self.render_scale:.0%})")
+        print(f"  Terrain: {W}x{H}, elevation {self.elev_min:.0f}m - {self.elev_max:.0f}m")
+        print(f"\nPress H for controls, X or Esc to exit\n")
+
+        self.running = True
+        self._update_frame()
+
+        # Keep window open until closed
+        plt.show(block=True)
+
+        # Clean up timer
+        if self._timer is not None:
+            self._timer.stop()
+            self._timer = None
+
+        print(f"Viewer closed after {self.frame_count} frames")
+
+
+def explore(raster, width: int = 800, height: int = 600,
+            render_scale: float = 0.5,
+            start_position: Optional[Tuple[float, float, float]] = None,
+            look_at: Optional[Tuple[float, float, float]] = None,
+            key_repeat_interval: float = 0.05,
+            rtx: 'RTX' = None,
+            pixel_spacing_x: float = 1.0, pixel_spacing_y: float = 1.0):
+    """
+    Launch an interactive terrain viewer.
+
+    Uses matplotlib for display - no additional dependencies required.
+    Keyboard controls allow flying through the terrain.
+
+    Parameters
+    ----------
+    raster : xarray.DataArray
+        Terrain raster data with cupy array.
+    width : int
+        Display width in pixels. Default is 800.
+    height : int
+        Display height in pixels. Default is 600.
+    render_scale : float
+        Render at this fraction of display size (0.25-1.0).
+        Lower values give higher FPS. Default is 0.5.
+    start_position : tuple, optional
+        Starting camera position (x, y, z).
+    look_at : tuple, optional
+        Initial look-at point.
+    key_repeat_interval : float
+        Minimum seconds between key repeat events (default 0.05 = 20 FPS max).
+        Lower values = more responsive but more GPU load.
+    rtx : RTX, optional
+        Existing RTX instance with geometries (e.g., from place_mesh).
+        If provided, renders the full scene including placed meshes.
+    pixel_spacing_x : float, optional
+        X spacing between pixels in world units (e.g., 30.0 for 30m/pixel).
+        Must match the spacing used when triangulating terrain. Default 1.0.
+    pixel_spacing_y : float, optional
+        Y spacing between pixels in world units. Default 1.0.
+
+    Controls
+    --------
+    - W/Up: Move forward
+    - S/Down: Move backward
+    - A/Left: Strafe left
+    - D/Right: Strafe right
+    - Q/Page Up: Move up
+    - E/Page Down: Move down
+    - I/J/K/L: Look up/left/down/right
+    - Scroll wheel: Zoom in/out (FOV)
+    - +/=: Increase speed
+    - -: Decrease speed
+    - G: Cycle geometry layers (when meshes are placed)
+    - N: Jump to next geometry in current layer
+    - P: Jump to previous geometry in current layer
+    - O: Place observer (for viewshed) at look-at point
+    - V: Toggle viewshed overlay (teal glow shows visible terrain)
+    - [/]: Decrease/increase observer height
+    - T: Toggle shadows
+    - C: Cycle colormap
+    - F: Save screenshot
+    - H: Toggle help overlay
+    - X: Exit
+
+    Examples
+    --------
+    >>> import rtxpy
+    >>> dem = xr.open_dataarray('terrain.tif')
+    >>> dem = dem.copy(data=cupy.asarray(dem.data))
+    >>> rtxpy.explore(dem)
+
+    >>> # Or via accessor
+    >>> dem.rtx.explore()
+    """
+    viewer = InteractiveViewer(
+        raster,
+        width=width,
+        height=height,
+        render_scale=render_scale,
+        key_repeat_interval=key_repeat_interval,
+        rtx=rtx,
+        pixel_spacing_x=pixel_spacing_x,
+        pixel_spacing_y=pixel_spacing_y,
+    )
+    viewer.run(start_position=start_position, look_at=look_at)

@@ -6,8 +6,16 @@ from .rtx import (
     list_devices,
     get_current_device,
 )
-from .mesh import triangulate_terrain, write_stl
-from .analysis import viewshed, hillshade
+from .mesh import (
+    triangulate_terrain,
+    write_stl,
+    load_glb,
+    load_mesh,
+    make_transform,
+    make_transforms_on_terrain,
+)
+from .analysis import viewshed, hillshade, render, flyover, view
+from .engine import explore
 
 __version__ = "0.0.5"
 
