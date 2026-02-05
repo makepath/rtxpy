@@ -19,6 +19,8 @@ Ray tracing using CUDA, accessible from Python.
 
 I included some extra deps. here like rioxarray so the examples can load geotiffs
 
+**Note:** The conda-forge version is currently outdated so please use makepath conda channel...will fix soon.
+
 ### Linux w/ conda
 ```bash
 conda install -c conda-forge cupy rioxarray matplotlib requests jupyter makepath::rtxpy
