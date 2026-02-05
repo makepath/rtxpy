@@ -116,7 +116,7 @@ def load_terrain():
     terrain = terrain[::2, ::2]
 
     # Scale down elevation for visualization (optional)
-    terrain.data = terrain.data * 0.2
+    terrain.data = terrain.data * 0.1
 
     # Ensure contiguous array before GPU transfer
     terrain.data = np.ascontiguousarray(terrain.data)
@@ -155,6 +155,7 @@ if __name__ == "__main__":
 
     # Launch interactive explore mode
     terrain.rtx.explore(
+        mesh_type='voxelate',
         width=1024,
         height=768,
         render_scale=0.5

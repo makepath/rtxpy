@@ -574,6 +574,73 @@ class RTXAccessor:
 
         return vertices, indices
 
+    def voxelate(self, geometry_id='terrain', scale=1.0, base_elevation=None,
+                 pixel_spacing_x=1.0, pixel_spacing_y=1.0):
+        """Voxelate the terrain into box-columns and add to the scene.
+
+        Creates a voxelized mesh where each raster cell becomes a rectangular
+        column extending from base_elevation up to the cell's elevation.
+
+        Parameters
+        ----------
+        geometry_id : str, optional
+            ID for the terrain geometry. Default is 'terrain'.
+        scale : float, optional
+            Scale factor for elevation values. Default is 1.0.
+        base_elevation : float, optional
+            Z coordinate for the bottom of all columns. If None, uses
+            min(terrain) * scale so all columns have visible height.
+        pixel_spacing_x : float, optional
+            X spacing between pixels in world units. Default is 1.0.
+        pixel_spacing_y : float, optional
+            Y spacing between pixels in world units. Default is 1.0.
+
+        Returns
+        -------
+        tuple
+            (vertices, indices) - The voxelized mesh data as numpy arrays.
+        """
+        from .mesh import voxelate_terrain
+        import numpy as np
+
+        H, W = self._obj.shape
+
+        # Auto-compute base elevation from terrain minimum
+        if base_elevation is None:
+            terrain_data = self._obj.data if hasattr(self._obj, 'data') else self._obj
+            if has_cupy:
+                import cupy
+                if isinstance(terrain_data, cupy.ndarray):
+                    base_elevation = float(cupy.nanmin(terrain_data).get()) * scale
+                else:
+                    base_elevation = float(np.nanmin(terrain_data)) * scale
+            else:
+                base_elevation = float(np.nanmin(terrain_data)) * scale
+
+        # Allocate buffers: 8 verts per cell, 12 tris per cell
+        num_vertices = H * W * 8
+        num_triangles = H * W * 12
+        vertices = np.zeros(num_vertices * 3, dtype=np.float32)
+        indices = np.zeros(num_triangles * 3, dtype=np.int32)
+
+        # Voxelate the terrain
+        voxelate_terrain(vertices, indices, self._obj, scale=scale,
+                         base_elevation=base_elevation)
+
+        # Scale x,y coordinates to world units if pixel spacing != 1.0
+        if pixel_spacing_x != 1.0 or pixel_spacing_y != 1.0:
+            vertices[0::3] *= pixel_spacing_x
+            vertices[1::3] *= pixel_spacing_y
+
+        # Store pixel spacing for use in explore/viewshed
+        self._pixel_spacing_x = pixel_spacing_x
+        self._pixel_spacing_y = pixel_spacing_y
+
+        # Add to scene
+        self._rtx.add_geometry(geometry_id, vertices, indices)
+
+        return vertices, indices
+
     def flyover(self, output_path, duration=30.0, fps=10.0, orbit_scale=0.6,
                 altitude_offset=500.0, fov=60.0, fov_range=None,
                 width=1280, height=720, sun_azimuth=225, sun_altitude=35,
@@ -744,7 +811,8 @@ class RTXAccessor:
 
     def explore(self, width=800, height=600, render_scale=0.5,
                 start_position=None, look_at=None, key_repeat_interval=0.05,
-                pixel_spacing_x=None, pixel_spacing_y=None):
+                pixel_spacing_x=None, pixel_spacing_y=None,
+                mesh_type='triangulate'):
         """Launch an interactive terrain viewer with keyboard controls.
 
         Opens a matplotlib window for terrain exploration with keyboard
@@ -776,6 +844,9 @@ class RTXAccessor:
         pixel_spacing_y : float, optional
             Y spacing between pixels in world units. If None, uses the value
             from the last triangulate() call (default 1.0).
+        mesh_type : str, optional
+            Mesh generation method: 'triangulate' or 'voxelate'.
+            Default is 'triangulate'.
 
         Controls
         --------
@@ -797,6 +868,7 @@ class RTXAccessor:
         - T: Toggle shadows
         - C: Cycle colormap
         - F: Save screenshot
+        - M: Toggle minimap overlay
         - H: Toggle help overlay
         - X: Exit
 
@@ -823,4 +895,5 @@ class RTXAccessor:
             rtx=self._rtx,
             pixel_spacing_x=spacing_x,
             pixel_spacing_y=spacing_y,
+            mesh_type=mesh_type,
         )

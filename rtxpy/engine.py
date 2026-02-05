@@ -43,6 +43,7 @@ class InteractiveViewer:
     - T: Toggle shadows
     - C: Cycle colormap
     - F: Save screenshot
+    - M: Toggle minimap overlay
     - H: Toggle help overlay
     - X: Exit
 
@@ -55,7 +56,8 @@ class InteractiveViewer:
     def __init__(self, raster, width: int = 800, height: int = 600,
                  render_scale: float = 0.5, key_repeat_interval: float = 0.05,
                  rtx: 'RTX' = None,
-                 pixel_spacing_x: float = 1.0, pixel_spacing_y: float = 1.0):
+                 pixel_spacing_x: float = 1.0, pixel_spacing_y: float = 1.0,
+                 mesh_type: str = 'triangulate'):
         """
         Initialize the interactive viewer.
 
@@ -81,6 +83,8 @@ class InteractiveViewer:
             Must match the spacing used when triangulating terrain. Default 1.0.
         pixel_spacing_y : float, optional
             Y spacing between pixels in world units. Default 1.0.
+        mesh_type : str, optional
+            Mesh generation method: 'triangulate' or 'voxelate'. Default is 'triangulate'.
         """
         if not has_cupy:
             raise ImportError(
@@ -99,6 +103,7 @@ class InteractiveViewer:
         # Pixel spacing for coordinate conversion (world coords -> pixel indices)
         self.pixel_spacing_x = pixel_spacing_x
         self.pixel_spacing_y = pixel_spacing_y
+        self.mesh_type = mesh_type
 
         # GAS layer visibility tracking
         self._all_geometries = []
@@ -169,7 +174,20 @@ class InteractiveViewer:
         # State
         self.running = False
         self.show_help = True
+        self.show_minimap = True
         self.frame_count = 0
+
+        # Minimap state (initialized in run() via _compute_minimap_background/_create_minimap)
+        self._minimap_ax = None
+        self._minimap_im = None
+        self._minimap_camera_dot = None
+        self._minimap_direction_line = None
+        self._minimap_fov_left = None
+        self._minimap_fov_right = None
+        self._minimap_observer_dot = None
+        self._minimap_background = None
+        self._minimap_scale_x = 1.0
+        self._minimap_scale_y = 1.0
 
         # Held keys tracking for smooth simultaneous input
         self._held_keys = set()
@@ -209,6 +227,174 @@ class InteractiveViewer:
     def _get_look_at(self):
         """Get the current look-at point."""
         return self.position + self._get_front() * 1000.0
+
+    def _compute_minimap_background(self):
+        """Compute a CPU hillshade image for the minimap background.
+
+        Downsamples terrain to max 200px on longest side, then uses
+        numpy gradient-based hillshade. Runs once at startup.
+        """
+        H, W = self.terrain_shape
+        terrain_data = self.raster.data
+        if hasattr(terrain_data, 'get'):
+            terrain_np = terrain_data.get()
+        else:
+            terrain_np = np.asarray(terrain_data)
+
+        # Downsample to max 200px on longest side
+        max_dim = 200
+        longest = max(H, W)
+        if longest > max_dim:
+            scale = max_dim / longest
+            new_h = max(1, int(H * scale))
+            new_w = max(1, int(W * scale))
+            # Simple nearest-neighbor downsample via strided indexing
+            y_idx = np.linspace(0, H - 1, new_h).astype(int)
+            x_idx = np.linspace(0, W - 1, new_w).astype(int)
+            terrain_small = terrain_np[np.ix_(y_idx, x_idx)]
+        else:
+            terrain_small = terrain_np.copy()
+            new_h, new_w = H, W
+
+        # Replace NaNs with median for gradient computation
+        mask = np.isnan(terrain_small)
+        if mask.any():
+            terrain_small[mask] = np.nanmedian(terrain_small)
+
+        # Compute hillshade using gradient
+        dy, dx = np.gradient(terrain_small)
+        # Sun from upper-left (azimuth=315, altitude=45)
+        az_rad = np.radians(315)
+        alt_rad = np.radians(45)
+        slope = np.sqrt(dx**2 + dy**2)
+        aspect = np.arctan2(-dy, dx)
+        shaded = (np.sin(alt_rad) * np.cos(np.arctan(slope)) +
+                  np.cos(alt_rad) * np.sin(np.arctan(slope)) *
+                  np.cos(az_rad - aspect))
+        shaded = np.clip(shaded, 0, 1)
+
+        self._minimap_background = shaded
+        self._minimap_scale_x = new_w / W  # minimap pixels per terrain pixel
+        self._minimap_scale_y = new_h / H
+
+    def _create_minimap(self):
+        """Create the minimap inset axes and persistent artists."""
+        if self._minimap_background is None:
+            return
+
+        # Create inset axes in bottom-right corner (~20% of figure width)
+        mm_h, mm_w = self._minimap_background.shape
+        aspect = mm_h / mm_w
+        ax_width = 0.2
+        ax_height = ax_width * aspect * (self.width / self.height)
+        # Clamp height so it doesn't get too tall
+        ax_height = min(ax_height, 0.35)
+        margin = 0.02
+        self._minimap_ax = self.fig.add_axes(
+            [1 - ax_width - margin, margin, ax_width, ax_height]
+        )
+        self._minimap_ax.set_xticks([])
+        self._minimap_ax.set_yticks([])
+        for spine in self._minimap_ax.spines.values():
+            spine.set_edgecolor('white')
+            spine.set_linewidth(0.8)
+
+        # Display hillshade background (origin='upper' so row 0 is top = +Y)
+        self._minimap_im = self._minimap_ax.imshow(
+            self._minimap_background, cmap='gray', vmin=0, vmax=1,
+            aspect='auto', origin='upper'
+        )
+
+        # Camera position dot (red)
+        self._minimap_camera_dot = self._minimap_ax.scatter(
+            [], [], c='red', s=20, zorder=5, edgecolors='white', linewidths=0.5
+        )
+
+        # Direction line (red)
+        self._minimap_direction_line, = self._minimap_ax.plot(
+            [], [], 'r-', linewidth=1.5, zorder=4
+        )
+
+        # FOV cone edges (red, thinner)
+        self._minimap_fov_left, = self._minimap_ax.plot(
+            [], [], 'r-', linewidth=0.8, alpha=0.6, zorder=3
+        )
+        self._minimap_fov_right, = self._minimap_ax.plot(
+            [], [], 'r-', linewidth=0.8, alpha=0.6, zorder=3
+        )
+
+        # Observer dot (magenta star)
+        self._minimap_observer_dot = self._minimap_ax.scatter(
+            [], [], c='magenta', s=50, marker='*', zorder=6,
+            edgecolors='white', linewidths=0.3
+        )
+
+        self._minimap_ax.set_visible(self.show_minimap)
+
+    def _update_minimap(self):
+        """Update minimap artists with current camera/observer state."""
+        if self._minimap_ax is None:
+            return
+
+        self._minimap_ax.set_visible(self.show_minimap)
+        if not self.show_minimap:
+            return
+
+        H, W = self.terrain_shape
+
+        # Convert camera world position to minimap pixel coords
+        # World coords: x = col * pixel_spacing_x, y = row * pixel_spacing_y
+        # Pixel indices: col = x / pixel_spacing_x, row = y / pixel_spacing_y
+        # Minimap coords: mx = col * scale_x, my = row * scale_y
+        cam_col = self.position[0] / self.pixel_spacing_x
+        cam_row = self.position[1] / self.pixel_spacing_y
+
+        mx = cam_col * self._minimap_scale_x
+        # Flip Y: minimap origin='upper', so row 0 is displayed at top
+        # In world coords, +Y is increasing row. With origin='upper',
+        # imshow row 0 is at top, so minimap y = row * scale_y directly.
+        my = cam_row * self._minimap_scale_y
+
+        # Update camera dot
+        self._minimap_camera_dot.set_offsets([[mx, my]])
+
+        # Direction line length in minimap pixels
+        mm_h, mm_w = self._minimap_background.shape
+        line_len = max(mm_h, mm_w) * 0.12
+
+        # Yaw: 0 = +X (right on minimap), 90 = +Y (down on minimap with origin='upper')
+        yaw_rad = np.radians(self.yaw)
+        dx = np.cos(yaw_rad) * line_len
+        dy = np.sin(yaw_rad) * line_len  # +Y in world = +row = down in minimap
+
+        self._minimap_direction_line.set_data([mx, mx + dx], [my, my + dy])
+
+        # FOV cone edges
+        half_fov = np.radians(self.fov / 2)
+        fov_len = line_len * 0.8
+
+        left_angle = yaw_rad + half_fov
+        right_angle = yaw_rad - half_fov
+
+        lx = np.cos(left_angle) * fov_len
+        ly = np.sin(left_angle) * fov_len
+        rx = np.cos(right_angle) * fov_len
+        ry = np.sin(right_angle) * fov_len
+
+        self._minimap_fov_left.set_data([mx, mx + lx], [my, my + ly])
+        self._minimap_fov_right.set_data([mx, mx + rx], [my, my + ry])
+
+        # Observer dot
+        if self._observer_position is not None:
+            obs_x, obs_y = self._observer_position
+            obs_col = obs_x / self.pixel_spacing_x
+            obs_row = obs_y / self.pixel_spacing_y
+            omx = obs_col * self._minimap_scale_x
+            omy = obs_row * self._minimap_scale_y
+            self._minimap_observer_dot.set_offsets([[omx, omy]])
+            self._minimap_observer_dot.set_visible(True)
+        else:
+            self._minimap_observer_dot.set_visible(False)
 
     def _handle_key_press(self, event):
         """Handle key press - add to held keys or handle instant actions."""
@@ -253,6 +439,9 @@ class InteractiveViewer:
             self._jump_to_geometry(-1)  # Previous geometry
         elif key == 'h':
             self.show_help = not self.show_help
+            self._update_frame()
+        elif key == 'm':
+            self.show_minimap = not self.show_minimap
             self._update_frame()
 
         # Viewshed controls
@@ -737,6 +926,7 @@ class InteractiveViewer:
             observer_position=observer_pos,
             pixel_spacing_x=self.pixel_spacing_x,
             pixel_spacing_y=self.pixel_spacing_y,
+            mesh_type=self.mesh_type,
         )
 
         return img
@@ -764,6 +954,8 @@ class InteractiveViewer:
             self.help_text.set_visible(True)
         else:
             self.help_text.set_visible(False)
+
+        self._update_minimap()
 
         self.fig.canvas.draw_idle()
         self.fig.canvas.flush_events()
@@ -885,7 +1077,7 @@ class InteractiveViewer:
         help_str = (
             "WASD/Arrows: Move | Q/E: Up/Down | IJKL: Look | Scroll: Zoom | +/-: Speed\n"
             "G: Layers | N/P: Geometry | O: Place Observer | V: Toggle Viewshed | [/]: Height\n"
-            "T: Shadows | C: Colormap | F: Screenshot | H: Help | X: Exit"
+            "T: Shadows | C: Colormap | F: Screenshot | M: Minimap | H: Help | X: Exit"
         )
         self.help_text = self.ax.text(
             0.01, 0.02, help_str,
@@ -897,6 +1089,10 @@ class InteractiveViewer:
             fontfamily='monospace',
             bbox=dict(boxstyle='round', facecolor='black', alpha=0.5)
         )
+
+        # Initialize minimap
+        self._compute_minimap_background()
+        self._create_minimap()
 
         # Connect event handlers
         self.fig.canvas.mpl_connect('key_press_event', self._handle_key_press)
@@ -937,7 +1133,8 @@ def explore(raster, width: int = 800, height: int = 600,
             look_at: Optional[Tuple[float, float, float]] = None,
             key_repeat_interval: float = 0.05,
             rtx: 'RTX' = None,
-            pixel_spacing_x: float = 1.0, pixel_spacing_y: float = 1.0):
+            pixel_spacing_x: float = 1.0, pixel_spacing_y: float = 1.0,
+            mesh_type: str = 'triangulate'):
     """
     Launch an interactive terrain viewer.
 
@@ -970,6 +1167,8 @@ def explore(raster, width: int = 800, height: int = 600,
         Must match the spacing used when triangulating terrain. Default 1.0.
     pixel_spacing_y : float, optional
         Y spacing between pixels in world units. Default 1.0.
+    mesh_type : str, optional
+        Mesh generation method: 'triangulate' or 'voxelate'. Default is 'triangulate'.
 
     Controls
     --------
@@ -992,6 +1191,7 @@ def explore(raster, width: int = 800, height: int = 600,
     - T: Toggle shadows
     - C: Cycle colormap
     - F: Save screenshot
+    - M: Toggle minimap overlay
     - H: Toggle help overlay
     - X: Exit
 
@@ -1014,5 +1214,6 @@ def explore(raster, width: int = 800, height: int = 600,
         rtx=rtx,
         pixel_spacing_x=pixel_spacing_x,
         pixel_spacing_y=pixel_spacing_y,
+        mesh_type=mesh_type,
     )
     viewer.run(start_position=start_position, look_at=look_at)

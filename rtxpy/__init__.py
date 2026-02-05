@@ -8,6 +8,7 @@ from .rtx import (
 )
 from .mesh import (
     triangulate_terrain,
+    voxelate_terrain,
     write_stl,
     load_glb,
     load_mesh,

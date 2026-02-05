@@ -7,7 +7,7 @@ from numba import cuda
 import numpy as np
 
 from .._cuda_utils import calc_dims
-from ..mesh import triangulate_terrain
+from ..mesh import triangulate_terrain, voxelate_terrain
 from ..rtx import RTX, has_cupy
 
 if has_cupy:
@@ -83,13 +83,13 @@ def generate_primary_rays(rays, x_coords, y_coords, H, W):
     return 0
 
 
-def prepare_mesh(raster, rtx=None):
+def prepare_mesh(raster, rtx=None, mesh_type='triangulate'):
     """Prepare a triangle mesh from raster data and build the RTX acceleration structure.
 
     This function handles the common pattern of:
     1. Creating or reusing an RTX instance
     2. Checking if the mesh needs rebuilding (via hash comparison)
-    3. Triangulating the terrain
+    3. Triangulating or voxelating the terrain
     4. Building the GAS (Geometry Acceleration Structure)
 
     Parameters
@@ -98,6 +98,8 @@ def prepare_mesh(raster, rtx=None):
         Raster terrain data with coordinates.
     rtx : RTX, optional
         Existing RTX instance to reuse. If None, a new instance is created.
+    mesh_type : str, optional
+        Mesh generation method: 'triangulate' or 'voxelate'. Default is 'triangulate'.
 
     Returns
     -------
@@ -109,22 +111,38 @@ def prepare_mesh(raster, rtx=None):
     ValueError
         If mesh generation or GAS building fails.
     """
+    valid_types = ('triangulate', 'voxelate')
+    if mesh_type not in valid_types:
+        raise ValueError(
+            f"Invalid mesh_type '{mesh_type}'. Must be one of: {valid_types}"
+        )
+
     if rtx is None:
         rtx = RTX()
 
     H, W = raster.shape
 
-    # Check if we need to rebuild the mesh
-    datahash = np.uint64(hash(str(raster.data.get())) % (1 << 64))
+    # Include mesh_type in hash so switching types triggers rebuild
+    datahash = np.uint64(hash(str(raster.data.get()) + mesh_type) % (1 << 64))
     optixhash = np.uint64(rtx.getHash())
 
     if optixhash != datahash:
-        numTris = (H - 1) * (W - 1) * 2
-        verts = cupy.empty(H * W * 3, np.float32)
-        triangles = cupy.empty(numTris * 3, np.int32)
+        if mesh_type == 'voxelate':
+            numVerts = H * W * 8
+            numTris = H * W * 12
+            verts = cupy.empty(numVerts * 3, np.float32)
+            triangles = cupy.empty(numTris * 3, np.int32)
 
-        # Generate mesh from terrain
-        res = triangulate_terrain(verts, triangles, raster)
+            # Use terrain minimum as base elevation
+            base_elevation = float(cupy.nanmin(raster.data))
+            res = voxelate_terrain(verts, triangles, raster,
+                                   base_elevation=base_elevation)
+        else:
+            numTris = (H - 1) * (W - 1) * 2
+            verts = cupy.empty(H * W * 3, np.float32)
+            triangles = cupy.empty(numTris * 3, np.int32)
+            res = triangulate_terrain(verts, triangles, raster)
+
         if res:
             raise ValueError(f"Failed to generate mesh from terrain. Error code: {res}")
 

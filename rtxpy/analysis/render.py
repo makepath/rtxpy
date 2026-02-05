@@ -535,6 +535,7 @@ def render(
     observer_position: Optional[Tuple[float, float]] = None,
     pixel_spacing_x: float = 1.0,
     pixel_spacing_y: float = 1.0,
+    mesh_type: str = 'triangulate',
 ) -> np.ndarray:
     """Render terrain with a perspective camera for movie-quality visualization.
 
@@ -658,10 +659,10 @@ def render(
         # Create a temporary raster with scaled elevations
         scaled_raster = raster.copy(data=scaled_elevation)
         # Don't reuse rtx when scaling - need fresh mesh
-        optix = prepare_mesh(scaled_raster, rtx=None)
+        optix = prepare_mesh(scaled_raster, rtx=None, mesh_type=mesh_type)
     else:
         scaled_raster = raster
-        optix = prepare_mesh(raster, rtx)
+        optix = prepare_mesh(raster, rtx, mesh_type=mesh_type)
 
     # Scale camera position and look_at z coordinates
     scaled_camera_position = (
