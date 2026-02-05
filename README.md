@@ -17,6 +17,20 @@ Ray tracing using CUDA, accessible from Python.
 
 ## Installation
 
+I included some extra deps. here like rioxarray so the examples can load geotiffs
+
+### Linux w/ conda
+```bash
+conda install -c conda-forge cupy rioxarray matplotlib requests jupyter makepath::rtxpy
+```
+
+### Windows w/ conda
+```bash
+conda install -c conda-forge cupy rioxarray matplotlib requests jupyter nvidia::cudatoolkit makepath::rtxpy
+```
+
+## Build from Source
+
 First, install the OptiX Python bindings (otk-pyoptix):
 
 ```bash
