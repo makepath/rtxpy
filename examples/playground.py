@@ -155,7 +155,7 @@ if __name__ == "__main__":
 
     # Launch interactive explore mode
     terrain.rtx.explore(
-        mesh_type='voxelate',
+        mesh_type='voxel',
         width=1024,
         height=768,
         render_scale=0.5

@@ -57,7 +57,7 @@ class InteractiveViewer:
                  render_scale: float = 0.5, key_repeat_interval: float = 0.05,
                  rtx: 'RTX' = None,
                  pixel_spacing_x: float = 1.0, pixel_spacing_y: float = 1.0,
-                 mesh_type: str = 'triangulate'):
+                 mesh_type: str = 'tin'):
         """
         Initialize the interactive viewer.
 
@@ -84,7 +84,7 @@ class InteractiveViewer:
         pixel_spacing_y : float, optional
             Y spacing between pixels in world units. Default 1.0.
         mesh_type : str, optional
-            Mesh generation method: 'triangulate' or 'voxelate'. Default is 'triangulate'.
+            Mesh generation method: 'tin' or 'voxel'. Default is 'tin'.
         """
         if not has_cupy:
             raise ImportError(
@@ -1134,7 +1134,7 @@ def explore(raster, width: int = 800, height: int = 600,
             key_repeat_interval: float = 0.05,
             rtx: 'RTX' = None,
             pixel_spacing_x: float = 1.0, pixel_spacing_y: float = 1.0,
-            mesh_type: str = 'triangulate'):
+            mesh_type: str = 'tin'):
     """
     Launch an interactive terrain viewer.
 
@@ -1168,7 +1168,7 @@ def explore(raster, width: int = 800, height: int = 600,
     pixel_spacing_y : float, optional
         Y spacing between pixels in world units. Default 1.0.
     mesh_type : str, optional
-        Mesh generation method: 'triangulate' or 'voxelate'. Default is 'triangulate'.
+        Mesh generation method: 'tin' or 'voxel'. Default is 'tin'.
 
     Controls
     --------

@@ -83,7 +83,7 @@ def generate_primary_rays(rays, x_coords, y_coords, H, W):
     return 0
 
 
-def prepare_mesh(raster, rtx=None, mesh_type='triangulate'):
+def prepare_mesh(raster, rtx=None, mesh_type='tin'):
     """Prepare a triangle mesh from raster data and build the RTX acceleration structure.
 
     This function handles the common pattern of:
@@ -99,7 +99,7 @@ def prepare_mesh(raster, rtx=None, mesh_type='triangulate'):
     rtx : RTX, optional
         Existing RTX instance to reuse. If None, a new instance is created.
     mesh_type : str, optional
-        Mesh generation method: 'triangulate' or 'voxelate'. Default is 'triangulate'.
+        Mesh generation method: 'tin' or 'voxel'. Default is 'tin'.
 
     Returns
     -------
@@ -111,7 +111,7 @@ def prepare_mesh(raster, rtx=None, mesh_type='triangulate'):
     ValueError
         If mesh generation or GAS building fails.
     """
-    valid_types = ('triangulate', 'voxelate')
+    valid_types = ('tin', 'voxel')
     if mesh_type not in valid_types:
         raise ValueError(
             f"Invalid mesh_type '{mesh_type}'. Must be one of: {valid_types}"
@@ -127,7 +127,7 @@ def prepare_mesh(raster, rtx=None, mesh_type='triangulate'):
     optixhash = np.uint64(rtx.getHash())
 
     if optixhash != datahash:
-        if mesh_type == 'voxelate':
+        if mesh_type == 'voxel':
             numVerts = H * W * 8
             numTris = H * W * 12
             verts = cupy.empty(numVerts * 3, np.float32)

@@ -535,7 +535,7 @@ def render(
     observer_position: Optional[Tuple[float, float]] = None,
     pixel_spacing_x: float = 1.0,
     pixel_spacing_y: float = 1.0,
-    mesh_type: str = 'triangulate',
+    mesh_type: str = 'tin',
 ) -> np.ndarray:
     """Render terrain with a perspective camera for movie-quality visualization.
 

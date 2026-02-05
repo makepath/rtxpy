@@ -812,7 +812,7 @@ class RTXAccessor:
     def explore(self, width=800, height=600, render_scale=0.5,
                 start_position=None, look_at=None, key_repeat_interval=0.05,
                 pixel_spacing_x=None, pixel_spacing_y=None,
-                mesh_type='triangulate'):
+                mesh_type='tin'):
         """Launch an interactive terrain viewer with keyboard controls.
 
         Opens a matplotlib window for terrain exploration with keyboard
@@ -845,8 +845,8 @@ class RTXAccessor:
             Y spacing between pixels in world units. If None, uses the value
             from the last triangulate() call (default 1.0).
         mesh_type : str, optional
-            Mesh generation method: 'triangulate' or 'voxelate'.
-            Default is 'triangulate'.
+            Mesh generation method: 'tin' or 'voxel'.
+            Default is 'tin'.
 
         Controls
         --------
