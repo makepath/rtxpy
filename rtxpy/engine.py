@@ -40,6 +40,12 @@ class InteractiveViewer:
     - O: Place observer (for viewshed) at look-at point
     - V: Toggle viewshed overlay (teal glow shows visible terrain)
     - [/]: Decrease/increase observer height
+    - R: Decrease terrain resolution (coarser, up to 8x subsample)
+    - Shift+R: Increase terrain resolution (finer, down to 1x)
+    - Z: Decrease vertical exaggeration
+    - Shift+Z: Increase vertical exaggeration
+    - B: Toggle mesh type (TIN / voxel)
+    - Y: Cycle color stretch (linear, sqrt, cbrt, log)
     - T: Toggle shadows
     - C: Cycle colormap
     - F: Save screenshot
@@ -57,7 +63,8 @@ class InteractiveViewer:
                  render_scale: float = 0.5, key_repeat_interval: float = 0.05,
                  rtx: 'RTX' = None,
                  pixel_spacing_x: float = 1.0, pixel_spacing_y: float = 1.0,
-                 mesh_type: str = 'tin'):
+                 mesh_type: str = 'tin',
+                 overlay_layers: dict = None):
         """
         Initialize the interactive viewer.
 
@@ -105,9 +112,29 @@ class InteractiveViewer:
         self.pixel_spacing_y = pixel_spacing_y
         self.mesh_type = mesh_type
 
+        # Dynamic resolution state — preserve originals for subsampling
+        self._base_raster = raster
+        self._base_pixel_spacing_x = pixel_spacing_x
+        self._base_pixel_spacing_y = pixel_spacing_y
+        self._base_overlay_layers = overlay_layers.copy() if overlay_layers else {}
+        self.subsample_factor = 1
+
+        # Color stretch cycling (Y key)
+        self._color_stretches = ['linear', 'sqrt', 'cbrt', 'log']
+        self._color_stretch_idx = 0
+
+        # Vertical exaggeration (Z / Shift+Z)
+        self.vertical_exaggeration = 1.0
+
+        # Overlay layers for Dataset variable cycling (G key)
+        # Dict of {name: 2D cupy/numpy array} — colormap data alternatives
+        self._overlay_layers = overlay_layers or {}
+        self._overlay_names = list(self._overlay_layers.keys())
+        self._overlay_idx = -1  # -1 = elevation (default), 0+ = overlay index
+        self._active_color_data = None  # None = use elevation_data
+
         # GAS layer visibility tracking
         self._all_geometries = []
-        self._hidden_geometries = {}  # geometry_id -> (verts, indices, transform)
         self._layer_mode = 0  # 0=all, then cycle through geometry groups
         self._layer_modes = ['all']  # Will be populated with geometry groups
         self._layer_positions = {}  # layer_name -> [(x, y, z, geometry_id), ...]
@@ -161,6 +188,7 @@ class InteractiveViewer:
         self.colormap = 'terrain'
         self.colormaps = ['terrain', 'viridis', 'plasma', 'cividis', 'gray']
         self.colormap_idx = 0
+        self.color_stretch = 'linear'
 
         # Viewshed settings
         self.viewshed_enabled = False
@@ -182,8 +210,7 @@ class InteractiveViewer:
         self._minimap_im = None
         self._minimap_camera_dot = None
         self._minimap_direction_line = None
-        self._minimap_fov_left = None
-        self._minimap_fov_right = None
+        self._minimap_fov_wedge = None
         self._minimap_observer_dot = None
         self._minimap_background = None
         self._minimap_scale_x = 1.0
@@ -207,6 +234,33 @@ class InteractiveViewer:
         self.elev_max = float(np.nanmax(terrain_np))
         self.elev_mean = float(np.nanmean(terrain_np))
 
+        # Build terrain geometry if RTX exists but has no terrain.
+        # Without this, render() falls into the auto-VE / prepare_mesh path
+        # which computes vertical_exaggeration from pixel dimensions (not world
+        # units), producing wrong results when pixel_spacing != 1.
+        if rtx is not None and not rtx.has_geometry('terrain'):
+            from . import mesh as mesh_mod
+            if mesh_type == 'voxel':
+                nv = H * W * 8
+                nt = H * W * 12
+                verts = np.zeros(nv * 3, dtype=np.float32)
+                idxs = np.zeros(nt * 3, dtype=np.int32)
+                base_elev = float(np.nanmin(terrain_np))
+                mesh_mod.voxelate_terrain(verts, idxs, raster, scale=1.0,
+                                          base_elevation=base_elev)
+            else:
+                nv = H * W
+                nt = (H - 1) * (W - 1) * 2
+                verts = np.zeros(nv * 3, dtype=np.float32)
+                idxs = np.zeros(nt * 3, dtype=np.int32)
+                mesh_mod.triangulate_terrain(verts, idxs, raster, scale=1.0)
+
+            if pixel_spacing_x != 1.0 or pixel_spacing_y != 1.0:
+                verts[0::3] *= pixel_spacing_x
+                verts[1::3] *= pixel_spacing_y
+
+            rtx.add_geometry('terrain', verts, idxs)
+
     def _get_front(self):
         """Get the forward direction vector."""
         yaw_rad = np.radians(self.yaw)
@@ -221,7 +275,7 @@ class InteractiveViewer:
         """Get the right direction vector."""
         front = self._get_front()
         world_up = np.array([0, 0, 1], dtype=np.float32)
-        right = np.cross(front, world_up)
+        right = np.cross(world_up, front)
         return right / (np.linalg.norm(right) + 1e-8)
 
     def _get_look_at(self):
@@ -277,6 +331,207 @@ class InteractiveViewer:
         self._minimap_scale_x = new_w / W  # minimap pixels per terrain pixel
         self._minimap_scale_y = new_h / H
 
+    def _rebuild_at_resolution(self, factor):
+        """Rebuild terrain mesh at a different subsample factor.
+
+        Subsamples the original raster by ``factor`` (1 = full res, 2 = half,
+        etc.), rebuilds the terrain geometry, re-snaps any placed meshes to the
+        new surface, and refreshes the minimap.
+
+        Parameters
+        ----------
+        factor : int
+            Subsample factor (1, 2, 4, or 8).
+        """
+        from . import mesh as mesh_mod
+
+        self.subsample_factor = factor
+        base = self._base_raster
+
+        # 1. Subsample the raster
+        if factor > 1:
+            sub = base.isel(
+                {base.dims[0]: slice(None, None, factor),
+                 base.dims[1]: slice(None, None, factor)}
+            )
+        else:
+            sub = base
+
+        self.raster = sub
+        H, W = sub.shape
+        self.terrain_shape = (H, W)
+
+        # 2. Update pixel spacing
+        self.pixel_spacing_x = self._base_pixel_spacing_x * factor
+        self.pixel_spacing_y = self._base_pixel_spacing_y * factor
+
+        # 3. Update elevation stats
+        terrain_data = sub.data
+        if hasattr(terrain_data, 'get'):
+            terrain_np = terrain_data.get()
+        else:
+            terrain_np = np.asarray(terrain_data)
+        self.elev_min = float(np.nanmin(terrain_np))
+        self.elev_max = float(np.nanmax(terrain_np))
+        self.elev_mean = float(np.nanmean(terrain_np))
+
+        # 4. Remove old terrain geometry and rebuild
+        if self.rtx is not None and self.rtx.has_geometry('terrain'):
+            self.rtx.remove_geometry('terrain')
+
+        if self.rtx is not None:
+            if self.mesh_type == 'voxel':
+                # Voxel mesh: 8 verts/cell, 12 tris/cell
+                num_verts = H * W * 8
+                num_tris = H * W * 12
+                vertices = np.zeros(num_verts * 3, dtype=np.float32)
+                indices = np.zeros(num_tris * 3, dtype=np.int32)
+                base_elev = float(np.nanmin(terrain_np))
+                mesh_mod.voxelate_terrain(vertices, indices, sub, scale=1.0,
+                                          base_elevation=base_elev)
+            else:
+                # TIN mesh: 1 vert/cell, 2 tris/quad
+                num_verts = H * W
+                num_tris = (H - 1) * (W - 1) * 2
+                vertices = np.zeros(num_verts * 3, dtype=np.float32)
+                indices = np.zeros(num_tris * 3, dtype=np.int32)
+                mesh_mod.triangulate_terrain(vertices, indices, sub, scale=1.0)
+
+            # Scale x,y to world units
+            if self.pixel_spacing_x != 1.0 or self.pixel_spacing_y != 1.0:
+                vertices[0::3] *= self.pixel_spacing_x
+                vertices[1::3] *= self.pixel_spacing_y
+
+            self.rtx.add_geometry('terrain', vertices, indices)
+
+        # 5. Subsample overlay layers
+        if self._base_overlay_layers:
+            self._overlay_layers = {}
+            for name, data in self._base_overlay_layers.items():
+                if factor > 1:
+                    self._overlay_layers[name] = data[::factor, ::factor]
+                else:
+                    self._overlay_layers[name] = data
+            self._overlay_names = list(self._overlay_layers.keys())
+            # Reset active color data if an overlay is selected
+            if self._overlay_idx >= 0 and self._overlay_idx < len(self._overlay_names):
+                oname = self._overlay_names[self._overlay_idx]
+                self._active_color_data = self._overlay_layers[oname]
+
+        # 6. Re-snap placed meshes to new terrain surface
+        if self.rtx is not None:
+            for geom_id in self.rtx.list_geometries():
+                if geom_id == 'terrain':
+                    continue
+                transform = self.rtx.get_geometry_transform(geom_id)
+                if transform is None:
+                    continue
+                # World position
+                wx, wy = transform[3], transform[7]
+                # Convert to pixel coords in the new subsampled grid
+                px = wx / self.pixel_spacing_x
+                py = wy / self.pixel_spacing_y
+                # Clamp and sample Z
+                ix = int(np.clip(px, 0, W - 1))
+                iy = int(np.clip(py, 0, H - 1))
+                z = float(terrain_np[iy, ix])
+                transform[11] = z
+                self.rtx.update_transform(geom_id, transform)
+
+        # 7. Recompute minimap
+        self._compute_minimap_background()
+        if self._minimap_im is not None:
+            self._minimap_im.set_data(self._minimap_background)
+            # Update minimap axes limits for new background size
+            mm_h, mm_w = self._minimap_background.shape
+            self._minimap_im.set_extent([-0.5, mm_w - 0.5, mm_h - 0.5, -0.5])
+
+        # 8. Clear viewshed cache (no longer matches terrain)
+        self._viewshed_cache = None
+        if self.viewshed_enabled:
+            self.viewshed_enabled = False
+            print("  Viewshed disabled (terrain changed). Press V to recalculate.")
+
+        print(f"Resolution: {W}x{H} (subsample {factor}x)")
+        self._update_frame()
+
+    def _rebuild_vertical_exaggeration(self, ve):
+        """Rebuild terrain mesh with a new vertical exaggeration factor.
+
+        Parameters
+        ----------
+        ve : float
+            Vertical exaggeration multiplier applied to elevation values.
+        """
+        from . import mesh as mesh_mod
+
+        self.vertical_exaggeration = ve
+        H, W = self.terrain_shape
+
+        terrain_data = self.raster.data
+        if hasattr(terrain_data, 'get'):
+            terrain_np = terrain_data.get()
+        else:
+            terrain_np = np.asarray(terrain_data)
+
+        # Remove old terrain and rebuild with new scale
+        if self.rtx is not None and self.rtx.has_geometry('terrain'):
+            self.rtx.remove_geometry('terrain')
+
+        if self.rtx is not None:
+            if self.mesh_type == 'voxel':
+                nv = H * W * 8
+                nt = H * W * 12
+                vertices = np.zeros(nv * 3, dtype=np.float32)
+                indices = np.zeros(nt * 3, dtype=np.int32)
+                base_elev = float(np.nanmin(terrain_np)) * ve
+                mesh_mod.voxelate_terrain(vertices, indices, self.raster,
+                                          scale=ve, base_elevation=base_elev)
+            else:
+                nv = H * W
+                nt = (H - 1) * (W - 1) * 2
+                vertices = np.zeros(nv * 3, dtype=np.float32)
+                indices = np.zeros(nt * 3, dtype=np.int32)
+                mesh_mod.triangulate_terrain(vertices, indices, self.raster,
+                                             scale=ve)
+
+            if self.pixel_spacing_x != 1.0 or self.pixel_spacing_y != 1.0:
+                vertices[0::3] *= self.pixel_spacing_x
+                vertices[1::3] *= self.pixel_spacing_y
+
+            self.rtx.add_geometry('terrain', vertices, indices)
+
+        # Update elevation stats (scaled)
+        self.elev_min = float(np.nanmin(terrain_np)) * ve
+        self.elev_max = float(np.nanmax(terrain_np)) * ve
+        self.elev_mean = float(np.nanmean(terrain_np)) * ve
+
+        # Re-snap placed meshes to scaled terrain
+        if self.rtx is not None:
+            for geom_id in self.rtx.list_geometries():
+                if geom_id == 'terrain':
+                    continue
+                transform = self.rtx.get_geometry_transform(geom_id)
+                if transform is None:
+                    continue
+                wx, wy = transform[3], transform[7]
+                px = wx / self.pixel_spacing_x
+                py = wy / self.pixel_spacing_y
+                ix = int(np.clip(px, 0, W - 1))
+                iy = int(np.clip(py, 0, H - 1))
+                z = float(terrain_np[iy, ix]) * ve
+                transform[11] = z
+                self.rtx.update_transform(geom_id, transform)
+
+        # Clear viewshed cache
+        self._viewshed_cache = None
+        if self.viewshed_enabled:
+            self.viewshed_enabled = False
+            print("  Viewshed disabled (terrain changed). Press V to recalculate.")
+
+        print(f"Vertical exaggeration: {ve:.2f}x")
+        self._update_frame()
+
     def _create_minimap(self):
         """Create the minimap inset axes and persistent artists."""
         if self._minimap_background is None:
@@ -305,22 +560,22 @@ class InteractiveViewer:
             aspect='auto', origin='upper'
         )
 
-        # Camera position dot (red)
-        self._minimap_camera_dot = self._minimap_ax.scatter(
-            [], [], c='red', s=20, zorder=5, edgecolors='white', linewidths=0.5
+        # FOV wedge (filled semi-transparent cone showing visible area)
+        from matplotlib.patches import Polygon
+        self._minimap_fov_wedge = Polygon(
+            [[0, 0]], closed=True, facecolor='red', alpha=0.25,
+            edgecolor='red', linewidth=0.8, zorder=3
         )
+        self._minimap_ax.add_patch(self._minimap_fov_wedge)
 
-        # Direction line (red)
+        # Direction line (bright, with arrowhead effect via thicker line)
         self._minimap_direction_line, = self._minimap_ax.plot(
-            [], [], 'r-', linewidth=1.5, zorder=4
+            [], [], color='#ff4444', linewidth=2.0, solid_capstyle='round', zorder=4
         )
 
-        # FOV cone edges (red, thinner)
-        self._minimap_fov_left, = self._minimap_ax.plot(
-            [], [], 'r-', linewidth=0.8, alpha=0.6, zorder=3
-        )
-        self._minimap_fov_right, = self._minimap_ax.plot(
-            [], [], 'r-', linewidth=0.8, alpha=0.6, zorder=3
+        # Camera position dot (white-outlined red)
+        self._minimap_camera_dot = self._minimap_ax.scatter(
+            [], [], c='red', s=30, zorder=5, edgecolors='white', linewidths=0.8
         )
 
         # Observer dot (magenta star)
@@ -369,20 +624,23 @@ class InteractiveViewer:
 
         self._minimap_direction_line.set_data([mx, mx + dx], [my, my + dy])
 
-        # FOV cone edges
+        # FOV wedge (filled triangle from camera through left/right edges)
         half_fov = np.radians(self.fov / 2)
         fov_len = line_len * 0.8
 
-        left_angle = yaw_rad + half_fov
-        right_angle = yaw_rad - half_fov
+        left_angle = yaw_rad - half_fov
+        right_angle = yaw_rad + half_fov
 
         lx = np.cos(left_angle) * fov_len
         ly = np.sin(left_angle) * fov_len
         rx = np.cos(right_angle) * fov_len
         ry = np.sin(right_angle) * fov_len
 
-        self._minimap_fov_left.set_data([mx, mx + lx], [my, my + ly])
-        self._minimap_fov_right.set_data([mx, mx + rx], [my, my + ry])
+        self._minimap_fov_wedge.set_xy([
+            [mx, my],
+            [mx + lx, my + ly],
+            [mx + rx, my + ry],
+        ])
 
         # Observer dot
         if self._observer_position is not None:
@@ -398,7 +656,8 @@ class InteractiveViewer:
 
     def _handle_key_press(self, event):
         """Handle key press - add to held keys or handle instant actions."""
-        key = event.key.lower() if event.key else ''
+        raw_key = event.key if event.key else ''
+        key = raw_key.lower()
 
         # Movement/look keys are tracked as held
         movement_keys = {'w', 's', 'a', 'd', 'up', 'down', 'left', 'right',
@@ -458,6 +717,39 @@ class InteractiveViewer:
         elif key == 'f':
             self._save_screenshot()
 
+        # Terrain resolution: R = coarser, Shift+R = finer
+        elif key == 'r':
+            if raw_key == 'R':
+                # Shift+R → finer (halve factor, min 1)
+                new_factor = max(1, self.subsample_factor // 2)
+            else:
+                # r → coarser (double factor, max 8)
+                new_factor = min(8, self.subsample_factor * 2)
+            if new_factor != self.subsample_factor:
+                self._rebuild_at_resolution(new_factor)
+
+        # Color stretch cycling
+        elif key == 'y':
+            self._color_stretch_idx = (self._color_stretch_idx + 1) % len(self._color_stretches)
+            self.color_stretch = self._color_stretches[self._color_stretch_idx]
+            print(f"Color stretch: {self.color_stretch}")
+            self._update_frame()
+
+        # Toggle mesh type (tin ↔ voxel)
+        elif key == 'b':
+            self.mesh_type = 'voxel' if self.mesh_type == 'tin' else 'tin'
+            self._rebuild_vertical_exaggeration(self.vertical_exaggeration)
+            print(f"Mesh type: {self.mesh_type}")
+
+        # Vertical exaggeration: Z = decrease, Shift+Z = increase
+        elif key == 'z':
+            if raw_key == 'Z':
+                new_ve = min(10.0, self.vertical_exaggeration * 1.5)
+            else:
+                new_ve = max(0.25, self.vertical_exaggeration / 1.5)
+            if new_ve != self.vertical_exaggeration:
+                self._rebuild_vertical_exaggeration(new_ve)
+
         # Exit
         elif key in ('escape', 'x'):
             self.running = False
@@ -500,15 +792,40 @@ class InteractiveViewer:
         if 'k' in self._held_keys:
             self.pitch = max(-89, self.pitch - self.look_speed)
         if 'j' in self._held_keys:
-            self.yaw += self.look_speed
-        if 'l' in self._held_keys:
             self.yaw -= self.look_speed
+        if 'l' in self._held_keys:
+            self.yaw += self.look_speed
 
         # Trigger redraw
         self._update_frame()
 
     def _cycle_layer(self):
-        """Cycle through GAS layer visibility modes."""
+        """Cycle through layer modes.
+
+        When overlay layers are present (Dataset mode): cycles the colormap
+        data source (elevation → overlay1 → overlay2 → … → elevation).
+
+        When geometry groups are present (placed-mesh mode): uses RTX
+        visibility masks to hide/show geometry groups.
+        """
+        # Dataset overlay mode: cycle color data source
+        if self._overlay_names:
+            # -1 = elevation, 0..N-1 = overlay layers
+            self._overlay_idx += 1
+            if self._overlay_idx >= len(self._overlay_names):
+                self._overlay_idx = -1
+
+            if self._overlay_idx == -1:
+                self._active_color_data = None
+                print(f"Layer: elevation (terrain coloring)")
+            else:
+                name = self._overlay_names[self._overlay_idx]
+                self._active_color_data = self._overlay_layers[name]
+                print(f"Layer: {name}")
+            self._update_frame()
+            return
+
+        # Placed-mesh geometry mode: toggle visibility
         if not self._layer_modes or self.rtx is None:
             print("No geometries in scene")
             return
@@ -517,37 +834,23 @@ class InteractiveViewer:
         mode = self._layer_modes[self._layer_mode]
 
         if mode == 'all':
-            # Restore all hidden geometries
-            for geom_id, (verts, indices, transform) in self._hidden_geometries.items():
-                self.rtx.add_geometry(geom_id, verts, indices, transform)
-            self._hidden_geometries.clear()
+            for geom_id in self._all_geometries:
+                self.rtx.set_geometry_visible(geom_id, True)
             print(f"Layer: ALL ({len(self._all_geometries)} geometries)")
         else:
-            # Hide geometries that don't match this group
-            # First restore any previously hidden
-            for geom_id, (verts, indices, transform) in self._hidden_geometries.items():
-                self.rtx.add_geometry(geom_id, verts, indices, transform)
-            self._hidden_geometries.clear()
-
-            # Now hide non-matching geometries
             visible_count = 0
             for geom_id in self._all_geometries:
-                # Check if this geometry belongs to the current group
                 parts = geom_id.rsplit('_', 1)
                 base_name = parts[0] if len(parts) == 2 and parts[1].isdigit() else geom_id
 
-                if base_name != mode and geom_id != mode:
-                    # Hide this geometry - need to get its data first
-                    # Note: RTX doesn't have get_geometry, so we can't truly hide/show
-                    # For now, just report what would be visible
-                    pass
-                else:
+                if base_name == mode or geom_id == mode or geom_id == 'terrain':
+                    self.rtx.set_geometry_visible(geom_id, True)
                     visible_count += 1
+                else:
+                    self.rtx.set_geometry_visible(geom_id, False)
 
-            # Since we can't easily hide/show, just print info
             print(f"Layer: {mode} ({visible_count} visible)")
 
-        # Reset geometry index when changing layers
         self._current_geom_idx = 0
         self._update_frame()
 
@@ -876,6 +1179,7 @@ class InteractiveViewer:
             observer_position=observer_pos,
             pixel_spacing_x=self.pixel_spacing_x,
             pixel_spacing_y=self.pixel_spacing_y,
+            color_stretch=self.color_stretch,
         )
 
         # Convert from float [0-1] to uint8 [0-255]
@@ -927,6 +1231,8 @@ class InteractiveViewer:
             pixel_spacing_x=self.pixel_spacing_x,
             pixel_spacing_y=self.pixel_spacing_y,
             mesh_type=self.mesh_type,
+            color_data=self._active_color_data,
+            color_stretch=self.color_stretch,
         )
 
         return img
@@ -1077,6 +1383,7 @@ class InteractiveViewer:
         help_str = (
             "WASD/Arrows: Move | Q/E: Up/Down | IJKL: Look | Scroll: Zoom | +/-: Speed\n"
             "G: Layers | N/P: Geometry | O: Place Observer | V: Toggle Viewshed | [/]: Height\n"
+            "R/Shift+R: Resolution | Z/Shift+Z: Vert. Exag. | B: TIN/Voxel | Y: Stretch\n"
             "T: Shadows | C: Colormap | F: Screenshot | M: Minimap | H: Help | X: Exit"
         )
         self.help_text = self.ax.text(
@@ -1134,7 +1441,9 @@ def explore(raster, width: int = 800, height: int = 600,
             key_repeat_interval: float = 0.05,
             rtx: 'RTX' = None,
             pixel_spacing_x: float = 1.0, pixel_spacing_y: float = 1.0,
-            mesh_type: str = 'tin'):
+            mesh_type: str = 'tin',
+            overlay_layers: dict = None,
+            color_stretch: str = 'linear'):
     """
     Launch an interactive terrain viewer.
 
@@ -1188,6 +1497,12 @@ def explore(raster, width: int = 800, height: int = 600,
     - O: Place observer (for viewshed) at look-at point
     - V: Toggle viewshed overlay (teal glow shows visible terrain)
     - [/]: Decrease/increase observer height
+    - R: Decrease terrain resolution (coarser, up to 8x subsample)
+    - Shift+R: Increase terrain resolution (finer, down to 1x)
+    - Z: Decrease vertical exaggeration
+    - Shift+Z: Increase vertical exaggeration
+    - B: Toggle mesh type (TIN / voxel)
+    - Y: Cycle color stretch (linear, sqrt, cbrt, log)
     - T: Toggle shadows
     - C: Cycle colormap
     - F: Save screenshot
@@ -1215,5 +1530,9 @@ def explore(raster, width: int = 800, height: int = 600,
         pixel_spacing_x=pixel_spacing_x,
         pixel_spacing_y=pixel_spacing_y,
         mesh_type=mesh_type,
+        overlay_layers=overlay_layers,
     )
+    viewer.color_stretch = color_stretch
+    if color_stretch in viewer._color_stretches:
+        viewer._color_stretch_idx = viewer._color_stretches.index(color_stretch)
     viewer.run(start_position=start_position, look_at=look_at)

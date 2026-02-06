@@ -36,6 +36,7 @@ class _GASEntry:
         0.0, 1.0, 0.0, 0.0,  # Row 1: [Yx, Yy, Yz, Ty]
         0.0, 0.0, 1.0, 0.0,  # Row 2: [Zx, Zy, Zz, Tz]
     ])  # 12 floats (3x4 row-major affine transform)
+    visible: bool = True
 
 
 # -----------------------------------------------------------------------------
@@ -613,8 +614,9 @@ def _build_ias(geom_state: _GeometryState):
         # Pack sbtOffset (4 bytes) - all use same hit group (SBT index 0)
         struct.pack_into('I', instances_data, offset + 52, 0)
 
-        # Pack visibilityMask (4 bytes) - 0xFF = visible to all rays
-        struct.pack_into('I', instances_data, offset + 56, 0xFF)
+        # Pack visibilityMask (4 bytes) - 0xFF = visible, 0x00 = hidden
+        mask = 0xFF if entry.visible else 0x00
+        struct.pack_into('I', instances_data, offset + 56, mask)
 
         # Pack flags (4 bytes) - OPTIX_INSTANCE_FLAG_NONE = 0
         struct.pack_into('I', instances_data, offset + 60, 0)
@@ -1196,6 +1198,26 @@ class RTX:
         if geometry_id not in self._geom_state.gas_entries:
             return None
         return self._geom_state.gas_entries[geometry_id].transform.copy()
+
+    def set_geometry_visible(self, geometry_id: str, visible: bool) -> int:
+        """
+        Set whether a geometry is visible to rays.
+
+        Uses the OptiX visibility mask to hide/show geometries without
+        removing them from the scene.
+
+        Args:
+            geometry_id: The ID of the geometry to show/hide.
+            visible: True to make visible, False to hide.
+
+        Returns:
+            0 on success, -1 if geometry not found.
+        """
+        if geometry_id not in self._geom_state.gas_entries:
+            return -1
+        self._geom_state.gas_entries[geometry_id].visible = visible
+        self._geom_state.ias_dirty = True
+        return 0
 
     def clear_scene(self) -> None:
         """

@@ -1,5 +1,6 @@
 """xarray accessor for rtxpy GPU-accelerated terrain analysis."""
 
+import numpy as np
 import xarray as xr
 from .rtx import RTX, has_cupy
 
@@ -398,7 +399,7 @@ class RTXAccessor:
             rtx=rtx,  # User can override, but default None creates fresh instance
         )
 
-    def place_mesh(self, filepath, positions, geometry_id=None, scale=1.0,
+    def place_mesh(self, mesh_source, positions, geometry_id=None, scale=1.0,
                    rotation_z=0.0, swap_yz=False, center_xy=True, base_at_zero=True,
                    pixel_spacing_x=1.0, pixel_spacing_y=1.0):
         """Load a mesh and place instances on the terrain at specified positions.
@@ -408,27 +409,38 @@ class RTXAccessor:
 
         Parameters
         ----------
-        filepath : str or Path
-            Path to the mesh file (GLB, OBJ, STL, etc.).
-        positions : list of tuple
+        mesh_source : str, Path, or callable
+            Either a path to a mesh file (GLB, OBJ, STL, etc.) or a callable
+            that returns ``(vertices, indices)`` as flat numpy arrays
+            (float32 vertices, int32 indices). When a callable is provided,
+            ``scale``, ``swap_yz``, ``center_xy``, and ``base_at_zero`` are
+            ignored since the callable is responsible for producing
+            ready-to-use mesh data.
+        positions : list of tuple, or callable
             List of (x, y) positions in pixel coordinates where instances
-            should be placed. The Z coordinate is automatically sampled
-            from the terrain.
+            should be placed, or a callable that returns such a list.
+            The callable receives the terrain as a 2D numpy array and
+            should return a list of ``(x, y)`` pixel-coordinate tuples.
+            The Z coordinate is automatically sampled from the terrain.
         geometry_id : str, optional
             Base ID for the geometries. If placing multiple instances,
             they will be named "{geometry_id}_{i}". If None, uses the
-            filename stem.
+            filename stem (filepath) or the callable's ``__name__``.
         scale : float, optional
-            Scale factor for the mesh. Default is 1.0.
+            Scale factor for the mesh. Only used when ``mesh_source`` is a
+            filepath. Default is 1.0.
         rotation_z : float or 'random', optional
             Rotation around Z axis in radians, or 'random' for random
             rotations per instance. Default is 0.0.
         swap_yz : bool, optional
-            If True, swap Y and Z coordinates (for Y-up models). Default is False.
+            If True, swap Y and Z coordinates (for Y-up models). Only used
+            when ``mesh_source`` is a filepath. Default is False.
         center_xy : bool, optional
-            If True, center the mesh at the XY origin. Default is True.
+            If True, center the mesh at the XY origin. Only used when
+            ``mesh_source`` is a filepath. Default is True.
         base_at_zero : bool, optional
-            If True, place the mesh base at Z=0. Default is True.
+            If True, place the mesh base at Z=0. Only used when
+            ``mesh_source`` is a filepath. Default is True.
         pixel_spacing_x : float, optional
             X spacing between pixels in world units. Default is 1.0 (pixel coords).
         pixel_spacing_y : float, optional
@@ -450,11 +462,15 @@ class RTXAccessor:
         ...     scale=0.1
         ... )
 
-        >>> # Place with world coordinates (25m per pixel)
-        >>> dem.rtx.place_mesh(
-        ...     'house.glb',
-        ...     house_positions,
-        ...     geometry_id='house',
+        >>> # Place with callables for both mesh and positions
+        >>> def make_tower():
+        ...     return load_mesh('tower.glb', scale=2.7, center_xy=True, base_at_zero=True)
+        >>> def pick_hilltops(terrain):
+        ...     # return [(x, y), ...] pixel coords chosen from terrain
+        ...     ...
+        >>> verts, indices, transforms = dem.rtx.place_mesh(
+        ...     make_tower,
+        ...     pick_hilltops,
         ...     pixel_spacing_x=25.0,
         ...     pixel_spacing_y=25.0
         ... )
@@ -463,18 +479,23 @@ class RTXAccessor:
         from .mesh import load_mesh, make_transform
         import numpy as np
 
-        filepath = Path(filepath)
-        if geometry_id is None:
-            geometry_id = filepath.stem
+        if callable(mesh_source):
+            vertices, indices = mesh_source()
+            if geometry_id is None:
+                geometry_id = getattr(mesh_source, '__name__', 'mesh')
+        else:
+            filepath = Path(mesh_source)
+            if geometry_id is None:
+                geometry_id = filepath.stem
 
-        # Load the mesh
-        vertices, indices = load_mesh(
-            filepath,
-            scale=scale,
-            swap_yz=swap_yz,
-            center_xy=center_xy,
-            base_at_zero=base_at_zero
-        )
+            # Load the mesh
+            vertices, indices = load_mesh(
+                filepath,
+                scale=scale,
+                swap_yz=swap_yz,
+                center_xy=center_xy,
+                base_at_zero=base_at_zero
+            )
 
         # Get terrain data as numpy array
         terrain_data = self._obj.data
@@ -484,6 +505,10 @@ class RTXAccessor:
             terrain_data = np.asarray(terrain_data)
 
         H, W = terrain_data.shape
+
+        # Resolve positions callable
+        if callable(positions):
+            positions = positions(terrain_data)
 
         # Create transforms for each position with pixel spacing
         transforms = []
@@ -565,9 +590,10 @@ class RTXAccessor:
             vertices[0::3] *= pixel_spacing_x  # Scale all x coordinates
             vertices[1::3] *= pixel_spacing_y  # Scale all y coordinates
 
-        # Store pixel spacing for use in explore/viewshed
+        # Store pixel spacing and mesh type for use in explore/viewshed
         self._pixel_spacing_x = pixel_spacing_x
         self._pixel_spacing_y = pixel_spacing_y
+        self._terrain_mesh_type = 'tin'
 
         # Add to scene
         self._rtx.add_geometry(geometry_id, vertices, indices)
@@ -632,9 +658,10 @@ class RTXAccessor:
             vertices[0::3] *= pixel_spacing_x
             vertices[1::3] *= pixel_spacing_y
 
-        # Store pixel spacing for use in explore/viewshed
+        # Store pixel spacing and mesh type for use in explore/viewshed
         self._pixel_spacing_x = pixel_spacing_x
         self._pixel_spacing_y = pixel_spacing_y
+        self._terrain_mesh_type = 'voxel'
 
         # Add to scene
         self._rtx.add_geometry(geometry_id, vertices, indices)
@@ -812,7 +839,7 @@ class RTXAccessor:
     def explore(self, width=800, height=600, render_scale=0.5,
                 start_position=None, look_at=None, key_repeat_interval=0.05,
                 pixel_spacing_x=None, pixel_spacing_y=None,
-                mesh_type='tin'):
+                mesh_type='tin', color_stretch='linear'):
         """Launch an interactive terrain viewer with keyboard controls.
 
         Opens a matplotlib window for terrain exploration with keyboard
@@ -865,6 +892,12 @@ class RTXAccessor:
         - O: Place observer (for viewshed) at camera position
         - V: Toggle viewshed overlay (teal glow shows visible terrain)
         - [/]: Decrease/increase observer height
+        - R: Decrease terrain resolution (coarser, up to 8x subsample)
+        - Shift+R: Increase terrain resolution (finer, down to 1x)
+        - Z: Decrease vertical exaggeration
+        - Shift+Z: Increase vertical exaggeration
+        - B: Toggle mesh type (TIN / voxel)
+        - Y: Cycle color stretch (linear, sqrt, cbrt, log)
         - T: Toggle shadows
         - C: Cycle colormap
         - F: Save screenshot
@@ -884,6 +917,19 @@ class RTXAccessor:
         spacing_x = pixel_spacing_x if pixel_spacing_x is not None else self._pixel_spacing_x
         spacing_y = pixel_spacing_y if pixel_spacing_y is not None else self._pixel_spacing_y
 
+        # Rebuild terrain geometry if mesh_type doesn't match current state
+        current_mesh_type = getattr(self, '_terrain_mesh_type', 'tin')
+        if mesh_type != current_mesh_type and 'terrain' in (self._rtx.list_geometries() or []):
+            self._rtx.remove_geometry('terrain')
+            if mesh_type == 'voxel':
+                self.voxelate(geometry_id='terrain',
+                              pixel_spacing_x=spacing_x,
+                              pixel_spacing_y=spacing_y)
+            else:
+                self.triangulate(geometry_id='terrain',
+                                 pixel_spacing_x=spacing_x,
+                                 pixel_spacing_y=spacing_y)
+
         _explore(
             self._obj,
             width=width,
@@ -896,4 +942,133 @@ class RTXAccessor:
             pixel_spacing_x=spacing_x,
             pixel_spacing_y=spacing_y,
             mesh_type=mesh_type,
+            color_stretch=color_stretch,
+        )
+
+
+@xr.register_dataset_accessor("rtx")
+class RTXDatasetAccessor:
+    """xarray Dataset accessor for rtxpy GPU-accelerated terrain analysis.
+
+    Allows exploring a Dataset with multiple 2D variables as separate
+    geometry layers, toggled with the G key.
+
+    Examples
+    --------
+    >>> ds = xr.Dataset({'elevation': dem, 'slope': slope_arr})
+    >>> ds.rtx.explore(z='elevation')
+    """
+
+    def __init__(self, xarray_obj):
+        self._obj = xarray_obj
+        self._rtx_instance = None
+        self._z_var = None
+        self._pixel_spacing_x = 1.0
+        self._pixel_spacing_y = 1.0
+
+    @property
+    def _rtx(self):
+        """Lazily create and cache an RTX instance."""
+        if self._rtx_instance is None:
+            self._rtx_instance = RTX()
+        return self._rtx_instance
+
+    def explore(self, z, width=800, height=600, render_scale=0.5,
+                start_position=None, look_at=None, key_repeat_interval=0.05,
+                pixel_spacing_x=None, pixel_spacing_y=None,
+                mesh_type='tin', color_stretch='linear'):
+        """Launch an interactive terrain viewer with Dataset variables as
+        overlay layers cycled with the G key.
+
+        The variable named by ``z`` provides the 3D terrain surface.
+        Other 2D variables with matching spatial dimensions become
+        colormap overlays: press **G** to cycle which variable drives
+        the terrain coloring (elevation → landcover → slope → …).
+
+        Parameters
+        ----------
+        z : str
+            Name of the Dataset variable to use as the primary terrain
+            elevation surface.
+        width : int, optional
+            Window width in pixels. Default is 800.
+        height : int, optional
+            Window height in pixels. Default is 600.
+        render_scale : float, optional
+            Render at this fraction of window size (0.25-1.0). Default is 0.5.
+        start_position : tuple of float, optional
+            Starting camera position (x, y, z).
+        look_at : tuple of float, optional
+            Initial look-at point.
+        key_repeat_interval : float, optional
+            Minimum seconds between key repeat events. Default is 0.05.
+        pixel_spacing_x : float, optional
+            X spacing between pixels in world units. Default is 1.0.
+        pixel_spacing_y : float, optional
+            Y spacing between pixels in world units. Default is 1.0.
+        mesh_type : str, optional
+            Mesh generation method: 'tin' or 'voxel'. Default is 'tin'.
+
+        Examples
+        --------
+        >>> ds.rtx.explore(z='elevation')
+        """
+        from .engine import explore as _explore
+
+        if z not in self._obj:
+            raise ValueError(
+                f"Variable '{z}' not found in Dataset. "
+                f"Available: {list(self._obj.data_vars)}"
+            )
+
+        self._z_var = z
+        terrain_da = self._obj[z]
+
+        spacing_x = pixel_spacing_x if pixel_spacing_x is not None else self._pixel_spacing_x
+        spacing_y = pixel_spacing_y if pixel_spacing_y is not None else self._pixel_spacing_y
+
+        # Build the terrain surface using the DataArray accessor
+        if mesh_type == 'voxel':
+            terrain_da.rtx.voxelate(
+                geometry_id='terrain',
+                pixel_spacing_x=spacing_x,
+                pixel_spacing_y=spacing_y,
+            )
+        else:
+            terrain_da.rtx.triangulate(
+                geometry_id='terrain',
+                pixel_spacing_x=spacing_x,
+                pixel_spacing_y=spacing_y,
+            )
+
+        # Collect other compatible 2D variables as overlay layers.
+        # These share the same terrain mesh but change the colormap data.
+        overlay_layers = {}
+        terrain_dims = terrain_da.dims
+        terrain_shape = terrain_da.shape
+        for var_name in self._obj.data_vars:
+            if var_name == z:
+                continue
+            var = self._obj[var_name]
+            if var.dims == terrain_dims and var.shape == terrain_shape:
+                overlay_layers[var_name] = var.data
+
+        if overlay_layers:
+            names = ', '.join(overlay_layers.keys())
+            print(f"Overlay layers: {names}  (press G to cycle)")
+
+        _explore(
+            terrain_da,
+            width=width,
+            height=height,
+            render_scale=render_scale,
+            start_position=start_position,
+            look_at=look_at,
+            key_repeat_interval=key_repeat_interval,
+            rtx=terrain_da.rtx._rtx,
+            pixel_spacing_x=spacing_x,
+            pixel_spacing_y=spacing_y,
+            mesh_type=mesh_type,
+            overlay_layers=overlay_layers,
+            color_stretch=color_stretch,
         )

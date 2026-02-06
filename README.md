@@ -6,6 +6,28 @@ Ray tracing using CUDA, accessible from Python.
 
 *Real-time viewshed analysis with GPU-accelerated ray tracing. Green areas are visible from the observer position (blue dot). Run `python examples/playground.py` to try it interactively.*
 
+## Quick Start
+
+```python
+import rtxpy  # registers the .rtx xarray accessor
+import rioxarray
+
+# Load a GeoTIFF DEM as an xarray DataArray
+dem = rioxarray.open_rasterio('elevation.tif').squeeze()
+
+# Move data to GPU
+dem = dem.rtx.to_cupy()
+
+# Compute hillshade with ray-traced shadows
+hillshade = dem.rtx.hillshade(shadows=True)
+
+# Compute viewshed from an observer location (pixel coordinates)
+viewshed = dem.rtx.viewshed(x=500, y=300, observer_elev=2)
+
+# Launch interactive 3D terrain explorer
+dem.rtx.explore()
+```
+
 ## Prerequisites
 
 - NVIDIA GPU with RTX support (Maxwell architecture or newer)

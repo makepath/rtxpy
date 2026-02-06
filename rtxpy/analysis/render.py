@@ -83,23 +83,23 @@ def _compute_camera_basis(camera_position, look_at, up):
     forward = target - camera_pos
     forward = forward / np.linalg.norm(forward)
 
-    right = np.cross(forward, world_up)
+    right = np.cross(world_up, forward)
     right_norm = np.linalg.norm(right)
 
     # Handle case where forward is parallel to up vector
     if right_norm < 1e-6:
         # Use a different up vector to compute right
         alt_up = np.array([1.0, 0.0, 0.0], dtype=np.float32)
-        right = np.cross(forward, alt_up)
+        right = np.cross(alt_up, forward)
         right_norm = np.linalg.norm(right)
         if right_norm < 1e-6:
             alt_up = np.array([0.0, 1.0, 0.0], dtype=np.float32)
-            right = np.cross(forward, alt_up)
+            right = np.cross(alt_up, forward)
             right_norm = np.linalg.norm(right)
 
     right = right / right_norm
 
-    cam_up = np.cross(right, forward)
+    cam_up = np.cross(forward, right)
     cam_up = cam_up / np.linalg.norm(cam_up)
 
     return forward, right, cam_up
@@ -302,7 +302,8 @@ def _shade_terrain_kernel(
     elev_min, elev_range, alpha_channel,
     viewshed_data, viewshed_enabled, viewshed_opacity,
     observer_x, observer_y,
-    pixel_spacing_x, pixel_spacing_y
+    pixel_spacing_x, pixel_spacing_y,
+    color_stretch
 ):
     """GPU kernel for terrain shading with lighting, shadows, fog, colormapping, and viewshed."""
     idx = cuda.grid(1)
@@ -361,6 +362,14 @@ def _shade_terrain_kernel(
                 elev_norm = 0.0
             elif elev_norm > 1:
                 elev_norm = 1.0
+
+            # Apply nonlinear stretch: 0=linear, 1=cbrt, 2=log, 3=sqrt
+            if color_stretch == 1:
+                elev_norm = math.pow(elev_norm, 1.0 / 3.0)
+            elif color_stretch == 2:
+                elev_norm = math.log(1.0 + elev_norm * 9.0) / math.log(10.0)
+            elif color_stretch == 3:
+                elev_norm = math.sqrt(elev_norm)
 
             # Color lookup
             lut_idx = int(elev_norm * 255)
@@ -459,14 +468,13 @@ def _shade_terrain(
     elev_min, elev_range, alpha,
     viewshed_data=None, viewshed_opacity=0.6,
     observer_x=0.0, observer_y=0.0,
-    pixel_spacing_x=1.0, pixel_spacing_y=1.0
+    pixel_spacing_x=1.0, pixel_spacing_y=1.0,
+    color_stretch=0,
+    sky_color=(0.0, 0.0, 0.0),
 ):
     """Apply terrain shading with all effects."""
     threadsperblock = 256
     blockspergrid = (num_rays + threadsperblock - 1) // threadsperblock
-
-    # Sky color (light blue)
-    sky_color = (0.6, 0.75, 0.9)
 
     # Handle viewshed - need a placeholder if not provided
     viewshed_enabled = viewshed_data is not None
@@ -483,7 +491,8 @@ def _shade_terrain(
         elev_min, elev_range, alpha,
         viewshed_data, viewshed_enabled, viewshed_opacity,
         observer_x, observer_y,
-        pixel_spacing_x, pixel_spacing_y
+        pixel_spacing_x, pixel_spacing_y,
+        color_stretch
     )
 
 
@@ -536,6 +545,9 @@ def render(
     pixel_spacing_x: float = 1.0,
     pixel_spacing_y: float = 1.0,
     mesh_type: str = 'tin',
+    color_data=None,
+    color_stretch: str = 'linear',
+    sky_color: Tuple[float, float, float] = (0.0, 0.0, 0.0),
 ) -> np.ndarray:
     """Render terrain with a perspective camera for movie-quality visualization.
 
@@ -695,12 +707,22 @@ def render(
     color_lut = _get_colormap_lut(colormap)
     d_color_lut = cupy.array(color_lut, dtype=np.float32)
 
+    # Determine which data drives the colormap lookup.
+    # color_data overrides elevation_data for coloring (e.g. landcover on terrain).
+    if color_data is not None:
+        if not isinstance(color_data, cupy.ndarray):
+            colormap_data = cupy.asarray(color_data, dtype=cupy.float32)
+        else:
+            colormap_data = color_data.astype(cupy.float32)
+    else:
+        colormap_data = elevation_data
+
     # Elevation range for colormap
     if color_range is not None:
         elev_min, elev_max = color_range
     else:
-        elev_min = float(cupy.nanmin(elevation_data))
-        elev_max = float(cupy.nanmax(elevation_data))
+        elev_min = float(cupy.nanmin(colormap_data))
+        elev_max = float(cupy.nanmax(colormap_data))
     elev_range = elev_max - elev_min
 
     # Allocate buffers
@@ -753,16 +775,22 @@ def render(
     obs_x = float(observer_position[0]) if observer_position else 0.0
     obs_y = float(observer_position[1]) if observer_position else 0.0
 
+    # Color stretch mode: string -> int for CUDA kernel
+    _stretch_modes = {'linear': 0, 'cbrt': 1, 'log': 2, 'sqrt': 3}
+    stretch_int = _stretch_modes.get(color_stretch, 0)
+
     # Step 4: Shade terrain
     _shade_terrain(
         d_output, d_primary_rays, d_primary_hits, d_shadow_hits,
-        elevation_data, d_color_lut, num_rays, width, height,
+        colormap_data, d_color_lut, num_rays, width, height,
         d_sun_dir, ambient, shadows,
         fog_density, fog_color,
         elev_min, elev_range, alpha,
         d_viewshed, viewshed_opacity,
         obs_x, obs_y,
-        pixel_spacing_x, pixel_spacing_y
+        pixel_spacing_x, pixel_spacing_y,
+        stretch_int,
+        sky_color=sky_color,
     )
     device.synchronize()
 

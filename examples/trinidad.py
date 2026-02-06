@@ -1,11 +1,11 @@
-"""Interactive playground for rtxpy terrain exploration.
+"""Interactive playground for the island of Trinidad.
 
-This example demonstrates real-time terrain exploration using
-GPU-accelerated ray tracing via the xarray accessor's explore mode.
+Explore the terrain of Trinidad using GPU-accelerated ray tracing.
+Elevation data is sourced from the Copernicus GLO-30 DEM (30 m).
 
 Supports two modes:
-  python playground.py           # single-layer elevation explorer
-  python playground.py --dataset # multi-layer Dataset with landcover overlay
+  python trinidad.py           # single-layer elevation explorer
+  python trinidad.py --dataset # multi-layer Dataset with landcover overlay
 
 In Dataset mode, press G to cycle between elevation and landcover coloring.
 
@@ -16,24 +16,24 @@ Requirements:
 import numpy as np
 import requests
 import xarray as xr
-from pathlib import Path
 
-from xrspatial import slope, aspect, quantile
+from xrspatial import slope, aspect, quantile, curvature
+from pathlib import Path
 
 # Import rtxpy to register the .rtx accessor
 import rtxpy
 
 
-def download_crater_lake_dem(output_path):
-    """Download SRTM elevation data for Crater Lake National Park.
+def download_trinidad_dem(output_path):
+    """Download Copernicus GLO-30 DEM tiles for Trinidad and merge.
 
-    Downloads 1-arc-second (~30m) SRTM tiles from the USGS National Map
-    and clips to the Crater Lake area.
+    Downloads 30 m resolution tiles from the Copernicus DEM hosted on
+    AWS S3 (no authentication required) and clips to the island extent.
 
     Parameters
     ----------
     output_path : Path
-        Path to save the downloaded/processed DEM file.
+        Path to save the merged/clipped DEM file.
 
     Returns
     -------
@@ -42,40 +42,41 @@ def download_crater_lake_dem(output_path):
     """
     import rioxarray as rxr
 
-    # Crater Lake National Park bounds (WGS84)
-    # The park is centered around 42.94°N, 122.10°W
-    # Note: north bound limited to 43.0 to match n42 SRTM tile coverage
-    bounds = (-122.3, 42.8, -121.9, 43.0)
+    # Trinidad bounding box (WGS84)
+    # Northern Range peaks at ~940 m (El Cerro del Aripo)
+    bounds = (-61.95, 10.04, -60.85, 10.85)
     west, south, east, north = bounds
 
-    # SRTM tiles needed (1x1 degree tiles, named by northern latitude boundary)
-    # For Crater Lake at ~42.94°N: n43 tiles cover lat 42-43
+    # Copernicus GLO-30 tiles needed (1x1 degree, named by SW corner)
+    # Trinidad spans two tiles: W062 (62-61°W) and W061 (61-60°W)
     tiles_needed = [
-        ("n43", "w123"),
-        ("n43", "w122"),
+        ("N10", "W062"),
+        ("N10", "W061"),
     ]
 
-    base_url = "https://prd-tnm.s3.amazonaws.com/StagedProducts/Elevation/1/TIFF/current"
+    base_url = "https://copernicus-dem-30m.s3.amazonaws.com"
     tile_paths = []
 
-    print("Downloading Crater Lake elevation data from USGS...")
+    print("Downloading Trinidad elevation data from Copernicus GLO-30 DEM...")
 
     for ns, ew in tiles_needed:
-        tile_name = f"{ns}{ew}"
-        url = f"{base_url}/{tile_name}/USGS_1_{tile_name}.tif"
-        tile_path = output_path.parent / f"USGS_1_{tile_name}.tif"
+        tile_name = f"Copernicus_DSM_COG_10_{ns}_00_{ew}_00_DEM"
+        url = f"{base_url}/{tile_name}/{tile_name}.tif"
+        tile_path = output_path.parent / f"{tile_name}.tif"
 
         if not tile_path.exists():
-            print(f"  Downloading {tile_name}...")
+            print(f"  Downloading {ns}_{ew}...")
             try:
-                resp = requests.get(url, timeout=120)
+                resp = requests.get(url, timeout=120, stream=True)
                 resp.raise_for_status()
-                tile_path.write_bytes(resp.content)
+                with open(tile_path, 'wb') as f:
+                    for chunk in resp.iter_content(chunk_size=1 << 20):
+                        f.write(chunk)
             except requests.RequestException as e:
-                print(f"  Warning: Failed to download {tile_name}: {e}")
+                print(f"  Warning: Failed to download {ns}_{ew}: {e}")
                 continue
         else:
-            print(f"  Using cached {tile_name}")
+            print(f"  Using cached {ns}_{ew}")
 
         tile_paths.append(tile_path)
 
@@ -91,48 +92,46 @@ def download_crater_lake_dem(output_path):
         from rioxarray.merge import merge_arrays
         merged = merge_arrays(tiles)
 
-    # Clip to Crater Lake bounds
+    # Clip to Trinidad bounds
     merged = merged.rio.clip_box(minx=west, miny=south, maxx=east, maxy=north)
 
-    # Reproject to EPSG:5070 (Conus Albers Equal Area) for proper metric units
-    merged = merged.rio.reproject("EPSG:5070")
+    # Reproject to UTM Zone 20N (appropriate for Trinidad at ~61°W)
+    merged = merged.rio.reproject("EPSG:32620")
 
     # Save clipped result
     merged.rio.to_raster(str(output_path))
     print(f"  Saved clipped DEM to {output_path}")
 
-    # Clean up individual tiles (optional - keep them for caching)
-    # for p in tile_paths:
-    #     if p != output_path and p.exists():
-    #         p.unlink()
-
     return merged
 
 
 def load_terrain():
-    """Load Crater Lake terrain data, downloading if necessary."""
-    dem_path = Path(__file__).parent / "crater_lake_national_park.tif"
+    """Load Trinidad terrain data, downloading if necessary."""
+    dem_path = Path(__file__).parent / "trinidad_dem.tif"
 
     if not dem_path.exists():
         print(f"DEM file not found at {dem_path}")
-        terrain = download_crater_lake_dem(dem_path)
+        terrain = download_trinidad_dem(dem_path)
     else:
         print(f"Loading existing DEM: {dem_path}")
         import rioxarray as rxr
         terrain = rxr.open_rasterio(str(dem_path), masked=True).squeeze()
 
     # Subsample for faster interactive performance
-    terrain = terrain[::2, ::2]
+    terrain = terrain[::4, ::4]
+
+    # Mask ocean / water pixels so they are not rendered
+    terrain = terrain.where(terrain > 0)
 
     # Scale down elevation for visualization (optional)
-    terrain.data = terrain.data * 0.1
+    terrain.data = terrain.data * 0.025
 
     # Ensure contiguous array before GPU transfer
     terrain.data = np.ascontiguousarray(terrain.data)
 
-    # Get stats before GPU transfer
-    elev_min = float(terrain.min())
-    elev_max = float(terrain.max())
+    # Get stats before GPU transfer (nanmin/nanmax to skip NaN ocean pixels)
+    elev_min = float(np.nanmin(terrain.data))
+    elev_max = float(np.nanmax(terrain.data))
 
     # Convert to cupy for GPU processing using the accessor
     terrain = terrain.rtx.to_cupy()
@@ -144,14 +143,14 @@ def load_terrain():
 
 
 def make_landcover(terrain):
-    """Derive a synthetic landcover classification from terrain elevation.
+    """Derive a synthetic tropical landcover classification from elevation.
 
     Classes (by Z-code):
-        100  Water / lake bottom  — lowest 5 % of elevation
-        500  Barren rock          — steepest 30 % of slopes
-       1000  Shrubland            — default (moderate elevation, moderate slope)
-       1500  Forest               — upper-mid elevation, gentle slope
-       2000  Alpine               — highest 5 % of elevation
+        100  Water / coast        — lowest 3 % of elevation
+        400  Mangrove / wetland   — low-lying flat areas (low elev, gentle slope)
+        800  Tropical lowland     — low-to-mid elevation, moderate slope
+       1200  Tropical forest      — mid-to-upper elevation, moderate slope
+       1800  Cloud forest         — highest 5 % of elevation
 
     Parameters
     ----------
@@ -172,31 +171,33 @@ def make_landcover(terrain):
     dy, dx = np.gradient(data)
     slope = np.sqrt(dx**2 + dy**2)
 
-    p5  = np.nanpercentile(data, 5)
-    p70 = np.nanpercentile(data, 70)
+    p3  = np.nanpercentile(data, 3)
+    p15 = np.nanpercentile(data, 15)
+    p50 = np.nanpercentile(data, 50)
     p95 = np.nanpercentile(data, 95)
-    sp70 = np.nanpercentile(slope, 70)
+    sp30 = np.nanpercentile(slope, 30)
 
-    lc = np.full(data.shape, 1000.0, dtype=np.float32)  # shrubland
-    lc[data <= p5]                      = 100.0   # water
-    lc[slope > sp70]                    = 500.0   # barren rock
-    lc[(data > p70) & (slope <= sp70)]  = 1500.0  # forest
-    lc[data >= p95]                     = 2000.0  # alpine
+    lc = np.full(data.shape, 800.0, dtype=np.float32)    # tropical lowland
+    lc[data <= p3]                       = 100.0   # water / coast
+    lc[(data > p3) & (data <= p15) &
+       (slope <= sp30)]                  = 400.0   # mangrove / wetland
+    lc[(data > p50) & (data < p95)]      = 1200.0  # tropical forest
+    lc[data >= p95]                      = 1800.0  # cloud forest
 
     unique, counts = np.unique(lc, return_counts=True)
-    names = {100: 'Water', 500: 'Barren', 1000: 'Shrubland',
-             1500: 'Forest', 2000: 'Alpine'}
+    names = {100: 'Water/coast', 400: 'Mangrove', 800: 'Tropical low',
+             1200: 'Trop. forest', 1800: 'Cloud forest'}
     total = lc.size
     print("Landcover classes:")
     for val, cnt in zip(unique, counts):
-        print(f"  {names.get(val, val):12s} ({val:5.0f}): {100*cnt/total:5.1f}%")
+        print(f"  {names.get(val, val):14s} ({val:5.0f}): {100*cnt/total:5.1f}%")
 
     return lc
 
 
 if __name__ == "__main__":
     import argparse
-    parser = argparse.ArgumentParser(description="rtxpy terrain playground")
+    parser = argparse.ArgumentParser(description="rtxpy Trinidad terrain explorer")
     parser.add_argument("--dataset", action="store_true",
                         help="Build an xr.Dataset with landcover overlay (G to cycle)")
     args = parser.parse_args()
@@ -243,28 +244,28 @@ if __name__ == "__main__":
         ds = xr.Dataset({
             'elevation': terrain.rename(None),
             'landcover': xr.DataArray(cp.asarray(lc), dims=terrain.dims, coords=coords),
-            'slope': slope(terrain),
+            'slope':  slope(terrain),
             'aspect': aspect(terrain),
-            'quantile': quantile(terrain),
+            'quantile':  quantile(terrain),
         })
         print(ds)
-        print("\nLaunching Dataset explore (press G to cycle elevation ↔ landcover)...\n")
+        print("\nLaunching Dataset explore (press G to cycle elevation <-> landcover)...\n")
         ds.rtx.explore(
             z='elevation',
-            mesh_type='voxel',
             width=1024,
             height=768,
             render_scale=0.5,
+            color_stretch='cbrt',
             start_position=start_pos,
             look_at=look_target,
         )
     else:
         print("Launching explore mode...\n")
         terrain.rtx.explore(
-            mesh_type='voxel',
             width=1024,
             height=768,
             render_scale=0.5,
+            color_stretch='cbrt',
             start_position=start_pos,
             look_at=look_target,
         )
