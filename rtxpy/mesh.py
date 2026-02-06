@@ -273,8 +273,8 @@ def voxelate_terrain(verts, triangles, terrain, scale=1.0, base_elevation=0.0):
         _voxelate_terrain_cpu(verts, triangles, data, H, W, scale, base_z)
     elif has_cupy and isinstance(data, cupy.ndarray):
         jobSize = H * W
-        blockdim = 1024
-        griddim = (jobSize + blockdim - 1) // 1024
+        blockdim = 256
+        griddim = (jobSize + blockdim - 1) // blockdim
         d = 100
         offset = 0
         while jobSize > 0:
