@@ -252,8 +252,8 @@ if __name__ == "__main__":
         print("\nLaunching Dataset explore (press G to cycle elevation <-> landcover)...\n")
         ds.rtx.explore(
             z='elevation',
-            width=1024,
-            height=768,
+            width=2048,
+            height=1600,
             render_scale=0.5,
             color_stretch='cbrt',
             start_position=start_pos,
