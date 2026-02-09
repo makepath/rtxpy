@@ -37,6 +37,8 @@ class _GASEntry:
         0.0, 0.0, 1.0, 0.0,  # Row 2: [Zx, Zy, Zz, Tz]
     ])  # 12 floats (3x4 row-major affine transform)
     visible: bool = True
+    num_vertices: int = 0
+    num_triangles: int = 0
 
 
 # -----------------------------------------------------------------------------
@@ -1071,17 +1073,25 @@ class RTX:
             self._geom_state.current_hash = 0xFFFFFFFFFFFFFFFF
             self._geom_state.single_gas_mode = False
 
-        # Build the GAS for this geometry
-        gas_handle, gas_buffer = _build_gas_for_geometry(vertices, indices)
-        if gas_handle == 0:
-            return -1
-
-        # Compute a hash for caching purposes
+        # Compute hash to skip GAS rebuild when vertices haven't changed
         if isinstance(vertices, cupy.ndarray):
             vertices_for_hash = vertices.get()
         else:
             vertices_for_hash = np.asarray(vertices)
         vertices_hash = hash(vertices_for_hash.tobytes())
+
+        existing = self._geom_state.gas_entries.get(geometry_id)
+        if existing is not None and existing.vertices_hash == vertices_hash:
+            # GAS already built for identical vertices — update transform only
+            if transform is not None:
+                existing.transform = list(transform)
+                self._geom_state.ias_dirty = True
+            return 0
+
+        # Build the GAS for this geometry
+        gas_handle, gas_buffer = _build_gas_for_geometry(vertices, indices)
+        if gas_handle == 0:
+            return -1
 
         # Set transform (identity if not provided)
         if transform is None:
@@ -1095,6 +1105,10 @@ class RTX:
             if len(transform) != 12:
                 return -1
 
+        # Compute vertex/triangle counts from input arrays
+        num_vertices = len(np.asarray(vertices).ravel()) // 3
+        num_triangles = len(np.asarray(indices).ravel()) // 3
+
         # Create or update the GAS entry
         self._geom_state.gas_entries[geometry_id] = _GASEntry(
             gas_id=geometry_id,
@@ -1102,6 +1116,8 @@ class RTX:
             gas_buffer=gas_buffer,
             vertices_hash=vertices_hash,
             transform=transform,
+            num_vertices=num_vertices,
+            num_triangles=num_triangles,
         )
 
         # Mark IAS as needing rebuild
@@ -1227,3 +1243,60 @@ class RTX:
         or add_geometry() for multi-GAS mode.
         """
         self._geom_state.clear()
+
+    def memory_usage(self) -> dict:
+        """Return a breakdown of GPU memory used by the scene.
+
+        Returns
+        -------
+        dict
+            Keys: mode, geometries (list of per-geometry dicts),
+            ias_bytes, instances_bytes, ray_buffers_bytes, total_bytes.
+        """
+        gs = self._geom_state
+
+        if gs.gas_entries:
+            mode = 'multi-gas'
+        elif gs.gas_buffer is not None:
+            mode = 'single-gas'
+        else:
+            mode = 'empty'
+
+        geometries = []
+        total_gas = 0
+
+        if mode == 'multi-gas':
+            for gid, entry in gs.gas_entries.items():
+                nbytes = entry.gas_buffer.nbytes if entry.gas_buffer is not None else 0
+                total_gas += nbytes
+                geometries.append({
+                    'id': gid,
+                    'gas_bytes': nbytes,
+                    'num_vertices': entry.num_vertices,
+                    'num_triangles': entry.num_triangles,
+                    'visible': entry.visible,
+                })
+        elif mode == 'single-gas' and gs.gas_buffer is not None:
+            total_gas = gs.gas_buffer.nbytes
+            geometries.append({
+                'id': 'single-gas',
+                'gas_bytes': total_gas,
+                'num_vertices': 0,
+                'num_triangles': 0,
+                'visible': True,
+            })
+
+        ias_bytes = gs.ias_buffer.nbytes if gs.ias_buffer is not None else 0
+        instances_bytes = gs.instances_buffer.nbytes if gs.instances_buffer is not None else 0
+        ray_buffers_bytes = gs.d_rays_size + gs.d_hits_size
+
+        total_bytes = total_gas + ias_bytes + instances_bytes + ray_buffers_bytes
+
+        return {
+            'mode': mode,
+            'geometries': geometries,
+            'ias_bytes': ias_bytes,
+            'instances_bytes': instances_bytes,
+            'ray_buffers_bytes': ray_buffers_bytes,
+            'total_bytes': total_bytes,
+        }

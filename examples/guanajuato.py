@@ -1,6 +1,10 @@
-"""Interactive playground for Trinidad and Tobago.
+"""Interactive playground for the Guanajuato–San Miguel de Allende highlands.
 
-Explore the terrain of Trinidad and Tobago using GPU-accelerated ray tracing.
+Explore the terrain of central Mexico's Bajío region using GPU-accelerated
+ray tracing.  The area covers the Sierra de Santa Rosa northwest of Guanajuato
+city, the colonial town of San Miguel de Allende to the east, and the
+rugged canyon country in between.
+
 Elevation data is sourced from the Copernicus GLO-30 DEM (30 m).
 
 Builds an xr.Dataset with elevation, slope, aspect, and quantile layers.
@@ -11,6 +15,8 @@ Requirements:
     pip install rtxpy[all] matplotlib xarray rioxarray requests pyproj Pillow
 """
 
+import warnings
+
 import numpy as np
 import xarray as xr
 
@@ -18,8 +24,6 @@ from xrspatial import slope, aspect, quantile
 from pathlib import Path
 
 # Import rtxpy to register the .rtx accessor
-import warnings
-
 from rtxpy import fetch_dem, fetch_buildings, fetch_roads, fetch_water
 import rtxpy
 
@@ -29,23 +33,26 @@ _MINOR_WATER = {'stream', 'drain', 'ditch'}
 
 
 def load_terrain():
-    """Load Trinidad & Tobago terrain data, downloading if necessary."""
-    dem_path = Path(__file__).parent / "trinidad_tobago_dem.tif"
+    """Load Guanajuato terrain data, downloading if necessary."""
+    dem_path = Path(__file__).parent / "guanajuato_dem.tif"
 
     terrain = fetch_dem(
-        bounds=(-61.95, 10.04, -60.44, 11.40),
+        bounds=(-101.50, 20.70, -100.50, 21.30),
         output_path=dem_path,
         source='copernicus',
-        crs='EPSG:32620',
+        crs='EPSG:32614',
     )
 
-    # Scale down elevation for visualization (optional)
+    # Mask nodata / water pixels
+    terrain = terrain.where(terrain > 0)
+
+    # Scale down elevation for visualization
     terrain.data = terrain.data * 0.025
 
     # Ensure contiguous array before GPU transfer
     terrain.data = np.ascontiguousarray(terrain.data)
 
-    # Get stats before GPU transfer (nanmin/nanmax to skip NaN ocean pixels)
+    # Get stats before GPU transfer
     elev_min = float(np.nanmin(terrain.data))
     elev_max = float(np.nanmax(terrain.data))
 
@@ -94,9 +101,9 @@ if __name__ == "__main__":
 
     # --- Microsoft Global Building Footprints --------------------------------
     try:
-        bldg_cache = Path(__file__).parent / "trinidad_buildings.geojson"
+        bldg_cache = Path(__file__).parent / "guanajuato_buildings.geojson"
         bldg_data = fetch_buildings(
-            bounds=(-61.95, 10.04, -60.44, 11.40),
+            bounds=(-101.50, 20.70, -100.50, 21.30),
             cache_path=bldg_cache,
         )
 
@@ -112,7 +119,7 @@ if __name__ == "__main__":
                 h = default_height_m
             props["height"] = h * elev_scale
 
-        mesh_cache_path = Path(__file__).parent / "trinidad_buildings_mesh.npz"
+        mesh_cache_path = Path(__file__).parent / "guanajuato_buildings_mesh.npz"
         with warnings.catch_warnings():
             warnings.filterwarnings("ignore", message="place_geojson called before")
             bldg_info = ds.rtx.place_geojson(
@@ -133,9 +140,9 @@ if __name__ == "__main__":
     # --- OpenStreetMap roads ------------------------------------------------
     try:
         # Major roads: motorways, trunk, primary, secondary
-        major_cache = Path(__file__).parent / "trinidad_roads_major.geojson"
+        major_cache = Path(__file__).parent / "guanajuato_roads_major.geojson"
         major_roads = fetch_roads(
-            bounds=(-61.95, 10.04, -60.44, 11.40),
+            bounds=(-101.50, 20.70, -100.50, 21.30),
             road_type='major',
             cache_path=major_cache,
         )
@@ -148,14 +155,14 @@ if __name__ == "__main__":
                     color=(0.10, 0.10, 0.10),
                     densify=False,
                     merge=True,
-                    mesh_cache=Path(__file__).parent / "trinidad_roads_major_mesh.npz",
+                    mesh_cache=Path(__file__).parent / "guanajuato_roads_major_mesh.npz",
                 )
             print(f"Placed {info['geometries']} major road geometries")
 
         # Minor roads: tertiary, residential, service
-        minor_cache = Path(__file__).parent / "trinidad_roads_minor.geojson"
+        minor_cache = Path(__file__).parent / "guanajuato_roads_minor.geojson"
         minor_roads = fetch_roads(
-            bounds=(-61.95, 10.04, -60.44, 11.40),
+            bounds=(-101.50, 20.70, -100.50, 21.30),
             road_type='minor',
             cache_path=minor_cache,
         )
@@ -168,7 +175,7 @@ if __name__ == "__main__":
                     color=(0.55, 0.55, 0.55),
                     densify=False,
                     merge=True,
-                    mesh_cache=Path(__file__).parent / "trinidad_roads_minor_mesh.npz",
+                    mesh_cache=Path(__file__).parent / "guanajuato_roads_minor_mesh.npz",
                 )
             print(f"Placed {info['geometries']} minor road geometries")
 
@@ -177,9 +184,9 @@ if __name__ == "__main__":
 
     # --- OpenStreetMap water features ---------------------------------------
     try:
-        water_cache = Path(__file__).parent / "trinidad_water.geojson"
+        water_cache = Path(__file__).parent / "guanajuato_water.geojson"
         water_data = fetch_water(
-            bounds=(-61.95, 10.04, -60.44, 11.40),
+            bounds=(-101.50, 20.70, -100.50, 21.30),
             water_type='all',
             cache_path=water_cache,
         )
@@ -209,7 +216,7 @@ if __name__ == "__main__":
                     color=(0.40, 0.70, 0.95, 2.25),
                     densify=False,
                     merge=True,
-                    mesh_cache=Path(__file__).parent / "trinidad_water_major_mesh.npz",
+                    mesh_cache=Path(__file__).parent / "guanajuato_water_major_mesh.npz",
                 )
             print(f"Placed {major_info['geometries']} major water features (rivers, canals)")
 
@@ -223,7 +230,7 @@ if __name__ == "__main__":
                     color=(0.50, 0.75, 0.98, 2.25),
                     densify=False,
                     merge=True,
-                    mesh_cache=Path(__file__).parent / "trinidad_water_minor_mesh.npz",
+                    mesh_cache=Path(__file__).parent / "guanajuato_water_minor_mesh.npz",
                 )
             print(f"Placed {minor_info['geometries']} minor water features (streams, drains)")
 
@@ -237,7 +244,7 @@ if __name__ == "__main__":
                     color=(0.35, 0.55, 0.88, 2.25),
                     extrude=True,
                     merge=True,
-                    mesh_cache=Path(__file__).parent / "trinidad_water_body_mesh.npz",
+                    mesh_cache=Path(__file__).parent / "guanajuato_water_body_mesh.npz",
                 )
             print(f"Placed {body_info['geometries']} water bodies (lakes, ponds)")
 
@@ -248,7 +255,7 @@ if __name__ == "__main__":
     wind = None
     try:
         from rtxpy import fetch_wind
-        wind = fetch_wind((-61.95, 10.04, -60.44, 11.40), grid_size=15)
+        wind = fetch_wind((-101.50, 20.70, -100.50, 21.30), grid_size=15)
     except Exception as e:
         print(f"Skipping wind: {e}")
 

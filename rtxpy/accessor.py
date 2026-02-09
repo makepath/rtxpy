@@ -30,6 +30,12 @@ class RTXAccessor:
         # Track pixel spacing for coordinate conversion (set by triangulate/place_mesh)
         self._pixel_spacing_x = 1.0
         self._pixel_spacing_y = 1.0
+        # Per-geometry solid color overrides: {geometry_id: (r, g, b)}
+        self._geometry_colors = {}
+        self._geometry_colors_dirty = True
+        self._geometry_colors_gpu = None
+        # Baked merged meshes for VE rescaling: {geometry_id: (vertices, indices)}
+        self._baked_meshes = {}
 
     @property
     def _rtx(self):
@@ -154,6 +160,51 @@ class RTXAccessor:
             rtx=rtx
         )
 
+    def slope(self, rtx=None):
+        """Compute terrain slope in degrees.
+
+        Parameters
+        ----------
+        rtx : RTX, optional
+            Existing RTX instance to reuse. If None, uses the accessor's
+            cached RTX instance.
+
+        Returns
+        -------
+        xarray.DataArray
+            Slope in degrees (0° flat, 90° vertical). Edge pixels are NaN.
+
+        Examples
+        --------
+        >>> s = dem.rtx.slope()
+        """
+        from .analysis import slope as _slope
+        return _slope(self._obj, rtx=rtx)
+
+    def aspect(self, rtx=None):
+        """Compute terrain aspect (compass bearing of downhill direction).
+
+        Convention: 0° = North, 90° = East, 180° = South, 270° = West.
+        -1 = flat terrain.
+
+        Parameters
+        ----------
+        rtx : RTX, optional
+            Existing RTX instance to reuse. If None, uses the accessor's
+            cached RTX instance.
+
+        Returns
+        -------
+        xarray.DataArray
+            Aspect in degrees [0, 360) or -1 for flat. Edge pixels are NaN.
+
+        Examples
+        --------
+        >>> a = dem.rtx.aspect()
+        """
+        from .analysis import aspect as _aspect
+        return _aspect(self._obj, rtx=rtx)
+
     def clear(self):
         """Remove all geometries and reset to single-GAS mode.
 
@@ -264,6 +315,61 @@ class RTXAccessor:
         True
         """
         return self._rtx.has_geometry(geometry_id)
+
+    def set_geometry_color(self, geometry_id, color):
+        """Set a solid color override for a geometry.
+
+        When rendering, this geometry will be drawn with the given flat color
+        instead of the elevation colormap.
+
+        Parameters
+        ----------
+        geometry_id : str
+            The ID of the geometry to color.
+        color : tuple of float
+            RGB color as (r, g, b) with values [0-1].
+
+        Examples
+        --------
+        >>> dem.rtx.set_geometry_color('building_0', (0.9, 0.2, 0.2))
+        """
+        self._geometry_colors[geometry_id] = tuple(color[:3])
+        self._geometry_colors_dirty = True
+
+    def _build_geometry_colors_gpu(self):
+        """Build a GPU array mapping instance IDs to solid colors.
+
+        Returns
+        -------
+        cupy.ndarray or None
+            Array of shape (num_geometries, 4) with [r, g, b, active] per
+            instance, or None if no geometry colors are set.
+        """
+        if not self._geometry_colors:
+            return None
+
+        if not self._geometry_colors_dirty and self._geometry_colors_gpu is not None:
+            return self._geometry_colors_gpu
+
+        import cupy
+        geom_ids = self._rtx.list_geometries()
+        if not geom_ids:
+            return None
+
+        n = len(geom_ids)
+        colors = np.zeros((n, 4), dtype=np.float32)
+
+        for i, gid in enumerate(geom_ids):
+            if gid in self._geometry_colors:
+                c = self._geometry_colors[gid]
+                if len(c) == 4:
+                    colors[i] = [c[0], c[1], c[2], c[3]]
+                else:
+                    colors[i] = [c[0], c[1], c[2], 1.0]
+
+        self._geometry_colors_gpu = cupy.asarray(colors)
+        self._geometry_colors_dirty = False
+        return self._geometry_colors_gpu
 
     def trace(self, rays, hits, num_rays, primitive_ids=None, instance_ids=None):
         """Trace rays against the current acceleration structure.
@@ -537,6 +643,486 @@ class RTXAccessor:
             self._rtx.add_geometry(instance_id, vertices, indices, transform=transform)
 
         return vertices, indices, transforms
+
+    _GEOJSON_PALETTE = [
+        (0.90, 0.22, 0.20),  # red
+        (0.20, 0.56, 0.90),  # blue
+        (0.95, 0.75, 0.10),  # yellow
+        (0.20, 0.78, 0.40),  # green
+        (0.75, 0.30, 0.75),  # purple
+        (1.00, 0.50, 0.00),  # orange
+        (0.00, 0.80, 0.80),  # cyan
+        (1.00, 0.40, 0.60),  # pink
+    ]
+
+    def place_geojson(self, geojson, height=10.0,
+                      label_field=None, height_field=None,
+                      fill_mesh=None, fill_spacing=None, fill_scale=1.0,
+                      models=None, model_field=None,
+                      geometry_id='geojson',
+                      densify=True,
+                      merge=False,
+                      extrude=False,
+                      mesh_cache=None,
+                      color=None,
+                      width=None):
+        """Load GeoJSON and place features as 3D meshes on terrain.
+
+        Points become glowing orbs hovering above the terrain (or
+        fill_mesh / model instances), LineStrings become flat ribbon
+        meshes hugging the terrain surface, and Polygons become
+        outline ribbons with optional scattered fill_mesh instances
+        inside.
+
+        When ``models`` and ``model_field`` are provided, features whose
+        ``model_field`` property matches a key in ``models`` use the
+        associated mesh instead.  For Points this replaces the marker cube;
+        for Polygons the wall is suppressed and the matched model is
+        scattered to fill the area.
+
+        Parameters
+        ----------
+        geojson : str, Path, or dict
+            GeoJSON file path or dict (FeatureCollection, Feature, or Geometry).
+        height : float
+            Default extrusion height for walls/markers (world units).
+        label_field : str, optional
+            Property field for grouping/naming geometries.
+        height_field : str, optional
+            Property field for per-feature extrusion height (overrides height).
+        fill_mesh : str, Path, or callable, optional
+            For Polygon/MultiPolygon: mesh to scatter inside polygon areas.
+        fill_spacing : float, optional
+            Spacing between fill instances in pixel units. Required with
+            fill_mesh or models.
+        fill_scale : float
+            Scale factor for fill_mesh and model instances.
+        models : dict, optional
+            Maps GeoJSON property values to mesh sources. Values can be file
+            paths (str/Path) or callables returning ``(vertices, indices)``.
+            Example: ``models={'forest': 'tree.glb', 'urban': make_building}``.
+        model_field : str, optional
+            GeoJSON property name to look up in ``models``.
+            Example: ``model_field='landcover'``.
+        geometry_id : str
+            Base prefix for geometry IDs (default 'geojson').
+        densify : bool or float
+            Controls vertex densification on LineStrings and Polygon
+            outlines. ``True`` (default) densifies at 1-pixel steps so
+            geometry closely follows terrain. ``False`` disables
+            densification. A float sets the step size in pixels (e.g.
+            ``densify=0.5`` for half-pixel resolution, ``densify=5.0``
+            for sparser sampling).
+        merge : bool
+            When ``True``, all non-instanced geometry (LineStrings and
+            Polygon outlines) is concatenated into a single GAS instead
+            of one GAS per feature.  Much faster for large feature counts
+            (e.g. thousands of building footprints) at the cost of
+            per-feature visibility control.  Default ``False``.
+        extrude : bool
+            When ``True``, Polygons are extruded into solid 3D geometry
+            (vertical walls + roof cap) instead of tube outlines.
+            Height comes from ``height_field`` per feature or falls back
+            to the ``height`` parameter.  Ideal for building footprints.
+            Default ``False``.
+        mesh_cache : str or Path, optional
+            Path to a ``.npz`` file for caching the merged mesh.
+            Requires ``merge=True``.  On first run the merged
+            vertex/index arrays are saved; on subsequent runs they are
+            loaded directly, skipping GeoJSON parsing, coordinate
+            projection, and triangulation entirely.
+        color : tuple, optional
+            Solid ``(r, g, b)`` colour override for all features.
+            When set, bypasses the cycling palette.
+        width : float, optional
+            Ribbon half-width when ``height <= 0``.  Defaults to
+            ``pixel_spacing * 0.5`` (roughly one pixel wide).
+
+        Returns
+        -------
+        dict
+            ``{'features': int, 'geometries': int, 'geometry_ids': list}``
+        """
+        import warnings
+        from pathlib import Path as _Path
+        from .mesh import load_mesh, make_transform
+        from .geojson import (
+            _load_geojson, _flatten_multi, _sanitize_label,
+            _geojson_to_world_coords, _build_transformer,
+            _make_marker_cube, _make_marker_orb, _densify_on_terrain,
+            _linestring_to_tube_mesh, _linestring_to_ribbon_mesh,
+            _polygon_to_tube_mesh, _polygon_to_ribbon_mesh,
+            _extrude_polygon, _scatter_in_polygon,
+        )
+
+        # Flat ribbon for LineStrings and Polygon outlines
+        use_ribbon = not extrude
+        if width is None:
+            width = (self._pixel_spacing_x + self._pixel_spacing_y) * 0.08
+        # Small hover above terrain; bilinear Z sampling keeps ribbons close
+        ribbon_hover = (self._pixel_spacing_x + self._pixel_spacing_y) * 0.01
+
+        # Fast path: load pre-computed merged mesh from cache
+        if mesh_cache is not None and merge:
+            cache_p = _Path(mesh_cache)
+            if cache_p.exists():
+                print(f"Loading cached mesh: {cache_p.name}")
+                npz = np.load(cache_p)
+                merged_v = npz['vertices']
+                merged_idx = npz['indices']
+                self._rtx.add_geometry(geometry_id, merged_v, merged_idx)
+                if color is not None:
+                    cache_color = color
+                elif extrude:
+                    cache_color = (0.6, 0.6, 0.6)
+                else:
+                    cache_color = self._GEOJSON_PALETTE[0]
+                self._geometry_colors[geometry_id] = cache_color
+                self._geometry_colors_dirty = True
+                # Compute per-vertex terrain Z for re-snapping on resolution change
+                terrain_data_np = self._obj.data
+                if hasattr(terrain_data_np, 'get'):
+                    terrain_data_np = terrain_data_np.get()
+                else:
+                    terrain_data_np = np.asarray(terrain_data_np)
+                _H, _W = terrain_data_np.shape
+                _psx = self._pixel_spacing_x
+                _psy = self._pixel_spacing_y
+                _vx = merged_v[0::3]
+                _vy = merged_v[1::3]
+                _ix = np.clip(np.round(_vx / _psx).astype(int), 0, _W - 1)
+                _iy = np.clip(np.round(_vy / _psy).astype(int), 0, _H - 1)
+                _base_z = terrain_data_np[_iy, _ix].astype(np.float32)
+                _base_z = np.where(np.isnan(_base_z), 0.0, _base_z)
+                self._baked_meshes[geometry_id] = (merged_v.copy(),
+                                                   merged_idx.copy(),
+                                                   _base_z)
+                return {
+                    'features': -1,
+                    'geometries': 1,
+                    'geometry_ids': [geometry_id],
+                }
+
+        # Resolve pixel spacing
+        psx = self._pixel_spacing_x
+        psy = self._pixel_spacing_y
+
+        if psx == 1.0 and psy == 1.0:
+            warnings.warn(
+                "place_geojson called before triangulate()/voxelate() — "
+                "pixel spacing defaults to 1.0, which may produce wrong "
+                "world coordinates for CRS-referenced rasters.",
+                stacklevel=2,
+            )
+
+        # Get terrain data as numpy
+        terrain_data = self._obj.data
+        if hasattr(terrain_data, 'get'):  # cupy
+            terrain_data = terrain_data.get()
+        else:
+            terrain_data = np.asarray(terrain_data)
+        H, W = terrain_data.shape
+
+        # Build CRS transformer once
+        transformer = _build_transformer(self._obj)
+
+        # Parse GeoJSON
+        features = _load_geojson(geojson)
+        if not features:
+            return {'features': 0, 'geometries': 0, 'geometry_ids': []}
+
+        # Load fill mesh if provided
+        fill_verts = fill_indices = None
+        if fill_mesh is not None:
+            if fill_spacing is None:
+                raise ValueError("fill_spacing is required when fill_mesh is set")
+            if callable(fill_mesh):
+                fill_verts, fill_indices = fill_mesh()
+            else:
+                fill_verts, fill_indices = load_mesh(
+                    _Path(fill_mesh), scale=fill_scale,
+                    swap_yz=True, center_xy=True, base_at_zero=True,
+                )
+
+        # Load per-feature models
+        model_cache = {}
+        if models is not None:
+            if model_field is None:
+                raise ValueError("model_field is required when models is set")
+            if fill_spacing is None:
+                raise ValueError("fill_spacing is required when models is set")
+            for key, msrc in models.items():
+                if callable(msrc):
+                    model_cache[key] = msrc()
+                else:
+                    model_cache[key] = load_mesh(
+                        _Path(msrc), scale=fill_scale,
+                        swap_yz=True, center_xy=True, base_at_zero=True,
+                    )
+
+        geometry_ids = []
+        geom_counter = 0
+        palette = self._GEOJSON_PALETTE
+        oob_counter = [0]  # mutable counter for out-of-bounds coords
+
+        # Merge accumulator: collect verts/indices and flush once at the end
+        _merge_verts = []
+        _merge_indices = []
+        _merge_vert_offset = 0
+        _merge_color = None
+
+        for feat_i, (geom, props) in enumerate(features):
+            if geom is None or not geom.get("coordinates"):
+                continue
+
+            # Per-feature color from cycling palette
+            feat_color = palette[feat_i % len(palette)]
+
+            # Per-feature height
+            feat_height = height
+            if height_field and height_field in props:
+                try:
+                    feat_height = float(props[height_field])
+                except (ValueError, TypeError):
+                    pass
+
+            # Label for geometry ID
+            label = None
+            if label_field and label_field in props:
+                label = _sanitize_label(props[label_field])
+
+            # Per-feature model lookup
+            feat_model_verts = feat_model_indices = None
+            if model_cache and model_field and model_field in props:
+                prop_val = props[model_field]
+                if prop_val in model_cache:
+                    feat_model_verts, feat_model_indices = model_cache[prop_val]
+
+            # Flatten Multi* types
+            primitives = _flatten_multi(geom)
+
+            for prim in primitives:
+                ptype = prim.get("type", "")
+                coords = prim.get("coordinates")
+                if coords is None:
+                    continue
+
+                # Build geometry ID
+                if label:
+                    gid = f"{geometry_id}_{label}_{geom_counter}"
+                else:
+                    gid = f"{geometry_id}_{geom_counter}"
+
+                if ptype == "Point":
+                    # Single point — place per-feature model, fill_mesh, or marker
+                    wc = _geojson_to_world_coords(
+                        [coords], self._obj, terrain_data, psx, psy,
+                        transformer=transformer, oob_counter=oob_counter,
+                    )
+                    if len(wc) == 0:
+                        continue
+                    pt = wc[0]
+
+                    if feat_model_verts is not None:
+                        v, idx = feat_model_verts, feat_model_indices
+                        sc = fill_scale
+                        hover = 0.0
+                        pt_color = feat_color
+                    elif fill_verts is not None:
+                        v, idx = fill_verts, fill_indices
+                        sc = fill_scale
+                        hover = 0.0
+                        pt_color = feat_color
+                    else:
+                        orb_radius = feat_height * 0.12
+                        v, idx = _make_marker_orb(radius=orb_radius)
+                        sc = 1.0
+                        hover = feat_height * 0.5
+                        # Emissive glow: alpha > 1.0 signals min lighting
+                        pt_color = (feat_color[0], feat_color[1],
+                                    feat_color[2], 1.6)
+
+                    t = make_transform(
+                        x=float(pt[0]), y=float(pt[1]),
+                        z=float(pt[2]) + hover,
+                        scale=sc,
+                    )
+                    self._rtx.add_geometry(gid, v, idx, transform=t)
+                    geometry_ids.append(gid)
+                    self._geometry_colors[gid] = color if color is not None else pt_color
+                    geom_counter += 1
+
+                elif ptype == "LineString":
+                    wc = _geojson_to_world_coords(
+                        coords, self._obj, terrain_data, psx, psy,
+                        transformer=transformer, oob_counter=oob_counter,
+                    )
+                    if len(wc) < 2:
+                        continue
+                    if densify is not False:
+                        step = 1.0 if densify is True else float(densify)
+                        wc = _densify_on_terrain(
+                            wc, terrain_data, psx, psy, step=step)
+                    if use_ribbon:
+                        v, idx = _linestring_to_ribbon_mesh(
+                            wc, width=width, hover=ribbon_hover,
+                        )
+                    else:
+                        v, idx = _linestring_to_tube_mesh(
+                            wc, radius=feat_height * 0.1,
+                            hover=feat_height * 0.15,
+                        )
+                    if len(v) == 0:
+                        continue
+                    use_color = color if color is not None else feat_color
+                    if merge:
+                        _merge_indices.append(idx + _merge_vert_offset)
+                        _merge_verts.append(v)
+                        _merge_vert_offset += len(v) // 3
+                        if _merge_color is None:
+                            _merge_color = use_color
+                    else:
+                        self._rtx.add_geometry(gid, v, idx)
+                        geometry_ids.append(gid)
+                        self._geometry_colors[gid] = use_color
+                    geom_counter += 1
+
+                elif ptype == "Polygon":
+                    # coords is [exterior_ring, *hole_rings]
+                    # Determine scatter mesh: per-feature model > fill_mesh > none
+                    scatter_verts = scatter_indices = None
+                    if feat_model_verts is not None:
+                        scatter_verts, scatter_indices = feat_model_verts, feat_model_indices
+                    elif fill_verts is not None:
+                        scatter_verts, scatter_indices = fill_verts, fill_indices
+
+                    rings_world = []
+                    ring_pixel_coords = None  # for fill/scatter
+                    for ri, ring in enumerate(coords):
+                        need_pixels = (ri == 0 and scatter_verts is not None)
+                        result = _geojson_to_world_coords(
+                            ring, self._obj, terrain_data, psx, psy,
+                            transformer=transformer,
+                            return_pixel_coords=need_pixels,
+                            oob_counter=oob_counter,
+                        )
+                        if need_pixels:
+                            wc, ring_pixel_coords = result
+                        else:
+                            wc = result
+                        rings_world.append(wc)
+
+                    # Build polygon mesh (only when no per-feature model)
+                    if feat_model_verts is None:
+                        if extrude:
+                            v, idx = _extrude_polygon(
+                                rings_world, feat_height)
+                        else:
+                            if densify is not False:
+                                step = 1.0 if densify is True else float(densify)
+                                dense_rings = [
+                                    _densify_on_terrain(
+                                        r, terrain_data, psx, psy, step=step)
+                                    for r in rings_world
+                                ]
+                            else:
+                                dense_rings = rings_world
+                            if use_ribbon:
+                                v, idx = _polygon_to_ribbon_mesh(
+                                    dense_rings, width=width,
+                                    hover=ribbon_hover,
+                                )
+                            else:
+                                v, idx = _polygon_to_tube_mesh(
+                                    dense_rings, radius=feat_height * 0.1,
+                                    hover=feat_height * 0.15,
+                                )
+                        if len(v) > 0:
+                            use_color = color if color is not None else feat_color
+                            if merge:
+                                _merge_indices.append(idx + _merge_vert_offset)
+                                _merge_verts.append(v)
+                                _merge_vert_offset += len(v) // 3
+                                if _merge_color is None:
+                                    _merge_color = use_color
+                            else:
+                                self._rtx.add_geometry(gid, v, idx)
+                                geometry_ids.append(gid)
+                                self._geometry_colors[gid] = use_color
+                            geom_counter += 1
+
+                    # Scatter mesh inside polygon
+                    if scatter_verts is not None and ring_pixel_coords is not None:
+                        positions = _scatter_in_polygon(
+                            ring_pixel_coords, fill_spacing, H, W
+                        )
+                        for fi, (px, py) in enumerate(positions):
+                            ix = int(np.clip(px, 0, W - 1))
+                            iy = int(np.clip(py, 0, H - 1))
+                            z = float(terrain_data[iy, ix])
+                            if np.isnan(z):
+                                z = 0.0
+                            wx = px * psx
+                            wy = py * psy
+                            fill_gid = f"{gid}_fill_{fi}"
+                            t = make_transform(
+                                x=wx, y=wy, z=z, scale=fill_scale,
+                            )
+                            self._rtx.add_geometry(
+                                fill_gid, scatter_verts, scatter_indices, transform=t
+                            )
+                            geometry_ids.append(fill_gid)
+                            self._geometry_colors[fill_gid] = feat_color
+                            geom_counter += 1
+
+        # Flush merged geometry as a single GAS
+        if merge and _merge_verts:
+            merged_v = np.concatenate(_merge_verts)
+            merged_idx = np.concatenate(_merge_indices).astype(np.int32)
+            self._rtx.add_geometry(geometry_id, merged_v, merged_idx)
+            geometry_ids.append(geometry_id)
+            # Color: explicit > merge accumulator > defaults
+            if color is not None:
+                self._geometry_colors[geometry_id] = color
+            elif extrude:
+                self._geometry_colors[geometry_id] = (0.6, 0.6, 0.6)
+            elif _merge_color is not None:
+                self._geometry_colors[geometry_id] = _merge_color
+            # Store for VE rescaling / resolution re-snapping in explore()
+            _vx = merged_v[0::3]
+            _vy = merged_v[1::3]
+            _ix = np.clip(np.round(_vx / psx).astype(int), 0, W - 1)
+            _iy = np.clip(np.round(_vy / psy).astype(int), 0, H - 1)
+            _base_z = terrain_data[_iy, _ix].astype(np.float32)
+            _base_z = np.where(np.isnan(_base_z), 0.0, _base_z)
+            self._baked_meshes[geometry_id] = (merged_v.copy(),
+                                               merged_idx.copy(),
+                                               _base_z)
+            # Save merged mesh to cache
+            if mesh_cache is not None:
+                cache_p = _Path(mesh_cache)
+                cache_p.parent.mkdir(parents=True, exist_ok=True)
+                np.savez_compressed(cache_p, vertices=merged_v,
+                                    indices=merged_idx)
+                print(f"Saved mesh cache: {cache_p.name} "
+                      f"({len(merged_v)//3} verts, "
+                      f"{len(merged_idx)//3} tris)")
+
+        if oob_counter[0] > 0:
+            warnings.warn(
+                f"{oob_counter[0]} GeoJSON coordinate(s) outside raster "
+                "extent — clipped to bounds.",
+                stacklevel=2,
+            )
+
+        if geom_counter > 0:
+            self._geometry_colors_dirty = True
+
+        return {
+            'features': len(features),
+            'geometries': geom_counter,
+            'geometry_ids': geometry_ids,
+        }
 
     def triangulate(self, geometry_id='terrain', scale=1.0,
                      pixel_spacing_x=1.0, pixel_spacing_y=1.0):
@@ -836,10 +1422,38 @@ class RTXAccessor:
             rtx=rtx,  # User can override, but default None creates fresh instance
         )
 
+    def place_tiles(self, url='osm'):
+        """Drape XYZ map tiles on terrain. Call before explore().
+
+        Downloads map tiles in the background and composites them into an
+        RGB texture matching the terrain grid. When explore() is called
+        afterwards, the tiles will be displayed on the terrain surface
+        with lighting and shadows applied on top.
+
+        Parameters
+        ----------
+        url : str, optional
+            Provider name or custom URL template with {z}/{x}/{y} placeholders.
+            Built-in providers: 'osm', 'satellite', 'topo'.
+            Default is 'osm' (OpenStreetMap).
+
+        Returns
+        -------
+        XYZTileService
+            The tile service instance (tiles begin fetching immediately).
+        """
+        from .tiles import XYZTileService
+        self._tile_service = XYZTileService(
+            url_template=url, raster=self._obj,
+        )
+        self._tile_service.fetch_visible_tiles()
+        return self._tile_service
+
     def explore(self, width=800, height=600, render_scale=0.5,
                 start_position=None, look_at=None, key_repeat_interval=0.05,
                 pixel_spacing_x=None, pixel_spacing_y=None,
-                mesh_type='tin', color_stretch='linear'):
+                mesh_type='tin', color_stretch='linear', title=None,
+                subsample=1, wind_data=None):
         """Launch an interactive terrain viewer with keyboard controls.
 
         Opens a matplotlib window for terrain exploration with keyboard
@@ -858,8 +1472,8 @@ class RTXAccessor:
             Render at this fraction of window size (0.25-1.0).
             Lower values give faster response. Default is 0.5.
         start_position : tuple of float, optional
-            Starting camera position (x, y, z). If None, auto-positions
-            above the terrain center.
+            Starting camera position (x, y, z). If None, starts at the
+            south edge looking north.
         look_at : tuple of float, optional
             Initial look-at point. If None, looks toward terrain center.
         key_repeat_interval : float, optional
@@ -874,6 +1488,10 @@ class RTXAccessor:
         mesh_type : str, optional
             Mesh generation method: 'tin' or 'voxel'.
             Default is 'tin'.
+        subsample : int, optional
+            Initial terrain subsample factor (1, 2, 4, 8).  Full-resolution
+            data is preserved; press Shift+R / R to change at runtime.
+            Default is 1 (full resolution).
 
         Controls
         --------
@@ -900,6 +1518,7 @@ class RTXAccessor:
         - Y: Cycle color stretch (linear, sqrt, cbrt, log)
         - T: Toggle shadows
         - C: Cycle colormap
+        - U: Toggle tile overlay (if place_tiles() was called)
         - F: Save screenshot
         - M: Toggle minimap overlay
         - H: Toggle help overlay
@@ -910,6 +1529,9 @@ class RTXAccessor:
         >>> dem.rtx.explore()
         >>> dem.rtx.explore(width=1024, height=768, render_scale=0.25)
         >>> dem.rtx.explore(start_position=(500, -200, 3000))
+        >>> # With satellite tiles
+        >>> dem.rtx.place_tiles('satellite')
+        >>> dem.rtx.explore()
         """
         from .engine import explore as _explore
 
@@ -930,6 +1552,11 @@ class RTXAccessor:
                                  pixel_spacing_x=spacing_x,
                                  pixel_spacing_y=spacing_y)
 
+        # Pass geometry color builder if any colors are set
+        geometry_colors_builder = None
+        if self._geometry_colors:
+            geometry_colors_builder = self._build_geometry_colors_gpu
+
         _explore(
             self._obj,
             width=width,
@@ -943,7 +1570,166 @@ class RTXAccessor:
             pixel_spacing_y=spacing_y,
             mesh_type=mesh_type,
             color_stretch=color_stretch,
+            title=title,
+            tile_service=getattr(self, '_tile_service', None),
+            geometry_colors_builder=geometry_colors_builder,
+            baked_meshes=self._baked_meshes if self._baked_meshes else None,
+            subsample=subsample,
+            wind_data=wind_data,
         )
+
+    def memory_usage(self):
+        """Print and return a breakdown of memory used by the scene.
+
+        Shows terrain raster, per-geometry acceleration structures,
+        tile overlay textures, and totals.
+
+        Returns
+        -------
+        dict
+            Raw byte counts for programmatic use.
+        """
+        lines = []
+        lines.append("Memory Usage")
+        lines.append("\u2500" * 44)
+
+        total_gpu = 0
+        total_cpu = 0
+
+        # -- Terrain raster --
+        data = self._obj.data
+        raster_bytes = data.nbytes
+        shape = self._obj.shape
+        dtype = data.dtype
+        on_gpu = hasattr(data, 'device')  # cupy arrays have .device
+        if on_gpu:
+            total_gpu += raster_bytes
+        else:
+            total_cpu += raster_bytes
+        loc = "GPU" if on_gpu else "CPU"
+        lines.append(
+            f"  Terrain raster     {_fmt_bytes(raster_bytes):>10s}"
+            f"   {shape[0]}\u00d7{shape[1]} {dtype} ({loc})"
+        )
+
+        # -- Scene geometries --
+        scene = self._rtx.memory_usage()
+        num_geom = len(scene['geometries'])
+        lines.append("")
+        lines.append(
+            f"  Scene: {scene['mode']}, {num_geom} geometries"
+        )
+
+        # Group geometries by prefix (text before last _)
+        groups = {}
+        for g in scene['geometries']:
+            gid = g['id']
+            parts = gid.rsplit('_', 1)
+            if len(parts) == 2 and parts[1].isdigit():
+                prefix = parts[0]
+            else:
+                prefix = gid
+            if prefix not in groups:
+                groups[prefix] = {
+                    'gas_bytes': 0, 'num_vertices': 0,
+                    'num_triangles': 0, 'count': 0,
+                }
+            grp = groups[prefix]
+            grp['gas_bytes'] += g['gas_bytes']
+            grp['num_vertices'] += g['num_vertices']
+            grp['num_triangles'] += g['num_triangles']
+            grp['count'] += 1
+
+        for prefix, grp in groups.items():
+            label = prefix
+            if grp['count'] > 1:
+                label = f"{prefix} ({grp['count']})"
+            verts = f"{grp['num_vertices']:,} verts"
+            tris = f"{grp['num_triangles']:,} tris"
+            lines.append(
+                f"    {label:<20s}{_fmt_bytes(grp['gas_bytes']):>10s}"
+                f"  {verts:>14s}  {tris:>14s}"
+            )
+            total_gpu += grp['gas_bytes']
+
+        ias_total = scene['ias_bytes'] + scene['instances_bytes']
+        if ias_total > 0:
+            lines.append(
+                f"    {'IAS + instances':<20s}{_fmt_bytes(ias_total):>10s}"
+            )
+            total_gpu += ias_total
+
+        if scene['ray_buffers_bytes'] > 0:
+            lines.append(
+                f"    {'Ray buffers':<20s}"
+                f"{_fmt_bytes(scene['ray_buffers_bytes']):>10s}"
+            )
+            total_gpu += scene['ray_buffers_bytes']
+
+        # -- Tile overlay --
+        tile_svc = getattr(self, '_tile_service', None)
+        if tile_svc is not None:
+            lines.append("")
+            lines.append(
+                f"  Tile overlay"
+                f"       {tile_svc.provider_name}"
+            )
+            cpu_tex = getattr(tile_svc, '_rgb_texture', None)
+            if cpu_tex is not None:
+                cpu_bytes = cpu_tex.nbytes
+                total_cpu += cpu_bytes
+                lines.append(
+                    f"    CPU texture       {_fmt_bytes(cpu_bytes):>10s}"
+                )
+            gpu_tex = getattr(tile_svc, '_gpu_texture', None)
+            if gpu_tex is not None:
+                gpu_bytes = gpu_tex.nbytes
+                total_gpu += gpu_bytes
+                lines.append(
+                    f"    GPU texture       {_fmt_bytes(gpu_bytes):>10s}"
+                )
+            tile_cache = getattr(tile_svc, '_tile_cache', None)
+            if tile_cache:
+                cache_bytes = sum(t.nbytes for t in tile_cache.values())
+                num_tiles = len(tile_cache)
+                total_cpu += cache_bytes
+                lines.append(
+                    f"    Tile cache        {_fmt_bytes(cache_bytes):>10s}"
+                    f"  ({num_tiles} tiles)"
+                )
+
+        # -- Geometry colors --
+        if self._geometry_colors:
+            color_bytes = len(self._geometry_colors) * 16  # 4 floats
+            total_gpu += color_bytes
+
+        # -- Totals --
+        lines.append("")
+        lines.append(f"  Total GPU          {_fmt_bytes(total_gpu):>10s}")
+        lines.append(f"  Total CPU          {_fmt_bytes(total_cpu):>10s}")
+        lines.append("\u2500" * 44)
+
+        print("\n".join(lines))
+
+        return {
+            'raster_bytes': raster_bytes,
+            'raster_on_gpu': on_gpu,
+            'scene': scene,
+            'total_gpu': total_gpu,
+            'total_cpu': total_cpu,
+        }
+
+
+def _fmt_bytes(n):
+    """Format a byte count as a human-readable string."""
+    if n < 1024:
+        return f"{n} B"
+    elif n < 1024 * 1024:
+        return f"{n / 1024:.1f} KB"
+    elif n < 1024 * 1024 * 1024:
+        return f"{n / (1024 * 1024):.2f} MB"
+    else:
+        return f"{n / (1024 * 1024 * 1024):.2f} GB"
 
 
 @xr.register_dataset_accessor("rtx")
@@ -963,6 +1749,7 @@ class RTXDatasetAccessor:
         self._obj = xarray_obj
         self._rtx_instance = None
         self._z_var = None
+        self._terrain_da_cache = None
         self._pixel_spacing_x = 1.0
         self._pixel_spacing_y = 1.0
 
@@ -973,10 +1760,80 @@ class RTXDatasetAccessor:
             self._rtx_instance = RTX()
         return self._rtx_instance
 
+    def _get_terrain_da(self, z):
+        """Return a cached DataArray for the terrain variable *z*.
+
+        xarray's ``Dataset.__getitem__`` returns a new DataArray object
+        each time, so the accessor (and its RTX instance) would differ
+        between calls.  Caching ensures ``place_geojson`` and ``explore``
+        share the same RTX scene.
+        """
+        if self._terrain_da_cache is None or self._z_var != z:
+            if z not in self._obj:
+                raise ValueError(
+                    f"Variable '{z}' not found in Dataset. "
+                    f"Available: {list(self._obj.data_vars)}"
+                )
+            self._z_var = z
+            self._terrain_da_cache = self._obj[z]
+        return self._terrain_da_cache
+
+    def set_geometry_color(self, geometry_id, color, z=None):
+        """Set a solid color override for a geometry.
+
+        Delegates to the cached terrain DataArray's accessor.
+
+        Parameters
+        ----------
+        geometry_id : str
+            The ID of the geometry to color.
+        color : tuple of float
+            RGB color as (r, g, b) with values [0-1].
+        z : str, optional
+            Dataset variable to use as terrain. If None, uses the
+            variable set by a prior call.
+        """
+        if z is None:
+            z = self._z_var
+        if z is None:
+            raise ValueError("z must be specified (no prior terrain variable set)")
+        terrain_da = self._get_terrain_da(z)
+        terrain_da.rtx.set_geometry_color(geometry_id, color)
+
+    def place_geojson(self, geojson, z=None, **kwargs):
+        """Load GeoJSON and place features as 3D meshes on terrain.
+
+        Delegates to the DataArray accessor's ``place_geojson`` on the
+        terrain variable specified by *z*.
+
+        Parameters
+        ----------
+        geojson : str, Path, or dict
+            GeoJSON file path or dict.
+        z : str, optional
+            Dataset variable to use as the terrain surface.  If None,
+            uses the variable set by a prior ``explore()`` or
+            ``place_geojson()`` call.
+        **kwargs
+            Forwarded to :meth:`RTXAccessor.place_geojson`.
+
+        Returns
+        -------
+        dict
+            ``{'features': int, 'geometries': int, 'geometry_ids': list}``
+        """
+        if z is None:
+            z = self._z_var
+        if z is None:
+            raise ValueError("z must be specified (no prior terrain variable set)")
+        terrain_da = self._get_terrain_da(z)
+        return terrain_da.rtx.place_geojson(geojson, **kwargs)
+
     def explore(self, z, width=800, height=600, render_scale=0.5,
                 start_position=None, look_at=None, key_repeat_interval=0.05,
                 pixel_spacing_x=None, pixel_spacing_y=None,
-                mesh_type='tin', color_stretch='linear'):
+                mesh_type='tin', color_stretch='linear', title=None,
+                subsample=1, wind_data=None):
         """Launch an interactive terrain viewer with Dataset variables as
         overlay layers cycled with the G key.
 
@@ -997,7 +1854,8 @@ class RTXDatasetAccessor:
         render_scale : float, optional
             Render at this fraction of window size (0.25-1.0). Default is 0.5.
         start_position : tuple of float, optional
-            Starting camera position (x, y, z).
+            Starting camera position (x, y, z). If None, starts at the
+            south edge looking north.
         look_at : tuple of float, optional
             Initial look-at point.
         key_repeat_interval : float, optional
@@ -1015,31 +1873,13 @@ class RTXDatasetAccessor:
         """
         from .engine import explore as _explore
 
-        if z not in self._obj:
-            raise ValueError(
-                f"Variable '{z}' not found in Dataset. "
-                f"Available: {list(self._obj.data_vars)}"
-            )
-
-        self._z_var = z
-        terrain_da = self._obj[z]
+        terrain_da = self._get_terrain_da(z)
 
         spacing_x = pixel_spacing_x if pixel_spacing_x is not None else self._pixel_spacing_x
         spacing_y = pixel_spacing_y if pixel_spacing_y is not None else self._pixel_spacing_y
 
-        # Build the terrain surface using the DataArray accessor
-        if mesh_type == 'voxel':
-            terrain_da.rtx.voxelate(
-                geometry_id='terrain',
-                pixel_spacing_x=spacing_x,
-                pixel_spacing_y=spacing_y,
-            )
-        else:
-            terrain_da.rtx.triangulate(
-                geometry_id='terrain',
-                pixel_spacing_x=spacing_x,
-                pixel_spacing_y=spacing_y,
-            )
+        # NOTE: terrain mesh is built by the engine at the correct
+        # (possibly subsampled) resolution — not here at full res.
 
         # Collect other compatible 2D variables as overlay layers.
         # These share the same terrain mesh but change the colormap data.
@@ -1057,6 +1897,11 @@ class RTXDatasetAccessor:
             names = ', '.join(overlay_layers.keys())
             print(f"Overlay layers: {names}  (press G to cycle)")
 
+        # Pass geometry color builder if any colors are set on the terrain DA
+        geometry_colors_builder = None
+        if terrain_da.rtx._geometry_colors:
+            geometry_colors_builder = terrain_da.rtx._build_geometry_colors_gpu
+
         _explore(
             terrain_da,
             width=width,
@@ -1071,4 +1916,67 @@ class RTXDatasetAccessor:
             mesh_type=mesh_type,
             overlay_layers=overlay_layers,
             color_stretch=color_stretch,
+            title=title,
+            tile_service=getattr(self, '_tile_service', None),
+            geometry_colors_builder=geometry_colors_builder,
+            baked_meshes=terrain_da.rtx._baked_meshes if terrain_da.rtx._baked_meshes else None,
+            subsample=subsample,
+            wind_data=wind_data,
         )
+
+    def place_tiles(self, url='osm', z=None):
+        """Drape XYZ map tiles on terrain. Call before explore().
+
+        Downloads map tiles in the background and composites them into an
+        RGB texture matching the terrain grid. When explore() is called
+        afterwards, the tiles will be displayed on the terrain surface
+        with lighting and shadows applied on top.
+
+        Parameters
+        ----------
+        url : str, optional
+            Provider name or custom URL template with {z}/{x}/{y} placeholders.
+            Built-in providers: 'osm', 'satellite', 'topo'.
+            Default is 'osm' (OpenStreetMap).
+        z : str, optional
+            Name of the Dataset variable to use as the spatial reference
+            for tile reprojection (CRS, bounds, shape). If None, uses the
+            first data variable.
+
+        Returns
+        -------
+        XYZTileService
+            The tile service instance (tiles begin fetching immediately).
+        """
+        from .tiles import XYZTileService
+        if z is None:
+            z = list(self._obj.data_vars)[0]
+        raster = self._obj[z]
+        self._tile_service = XYZTileService(
+            url_template=url, raster=raster,
+        )
+        self._tile_service.fetch_visible_tiles()
+        return self._tile_service
+
+    def memory_usage(self, z=None):
+        """Print and return a breakdown of memory used by the scene.
+
+        Delegates to the DataArray accessor on the terrain variable.
+
+        Parameters
+        ----------
+        z : str, optional
+            Dataset variable to use as terrain. If None, uses the
+            variable set by a prior call, or the first data variable.
+
+        Returns
+        -------
+        dict
+            Raw byte counts for programmatic use.
+        """
+        if z is None:
+            z = self._z_var
+        if z is None:
+            z = list(self._obj.data_vars)[0]
+        terrain_da = self._get_terrain_da(z)
+        return terrain_da.rtx.memory_usage()

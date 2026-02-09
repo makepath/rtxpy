@@ -38,7 +38,8 @@ dependencies = [
 # See: https://github.com/NVIDIA/otk-pyoptix
 tests = ["pytest"]
 analysis = ["xarray"]
-all = ["xarray", "scipy"]
+tiles = ["Pillow", "pyproj"]
+all = ["xarray", "scipy", "Pillow", "pyproj"]
 
 [project.urls]
 Homepage = "https://github.com/makepath/rtxpy"

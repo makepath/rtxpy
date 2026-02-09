@@ -20,6 +20,12 @@ from .engine import explore
 
 __version__ = "0.0.5"
 
+# Optional convenience — network helpers with lazy dependency checks
+try:
+    from .remote_data import fetch_dem, fetch_osm, fetch_buildings, fetch_roads, fetch_water, fetch_wind
+except ImportError:
+    pass
+
 # Register xarray accessor if xarray is available
 try:
     from . import accessor  # noqa: F401
