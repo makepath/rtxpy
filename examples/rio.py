@@ -21,10 +21,7 @@ import warnings
 
 from rtxpy import fetch_dem, fetch_buildings, fetch_roads, fetch_water
 import rtxpy
-
-# Water feature classification
-_MAJOR_WATER = {'river', 'canal'}
-_MINOR_WATER = {'stream', 'drain', 'ditch'}
+from _utils import print_controls, classify_water_features, scale_building_heights
 
 # Rio de Janeiro bounding box (WGS84)
 # Covers the city from Barra da Tijuca in the west to Ilha do Governador
@@ -67,21 +64,7 @@ if __name__ == "__main__":
     # Load terrain data (downloads if needed)
     terrain = load_terrain()
 
-    print("\nControls:")
-    print("  W/S/A/D or Arrow keys: Move camera")
-    print("  Q/E or Page Up/Down: Move up/down")
-    print("  I/J/K/L: Look around")
-    print("  +/-: Adjust movement speed")
-    print("  G: Cycle overlay layers")
-    print("  O: Place observer (for viewshed)")
-    print("  V: Toggle viewshed (teal glow)")
-    print("  [/]: Adjust observer height")
-    print("  T: Toggle shadows")
-    print("  C: Cycle colormap")
-    print("  U: Toggle tile overlay")
-    print("  F: Screenshot")
-    print("  H: Toggle help overlay")
-    print("  X: Exit\n")
+    print_controls()
 
     # Build Dataset with derived layers
     print("Building Dataset with terrain analysis layers...")
@@ -105,15 +88,9 @@ if __name__ == "__main__":
             cache_path=bldg_cache,
         )
 
-        # Scale building heights to match the 0.025× terrain elevation.
         elev_scale = 0.025
         default_height_m = 8.0
-        for feat in bldg_data.get("features", []):
-            props = feat.get("properties", {})
-            h = props.get("height", -1)
-            if not isinstance(h, (int, float)) or h <= 0:
-                h = default_height_m
-            props["height"] = h * elev_scale
+        scale_building_heights(bldg_data, elev_scale, default_height_m)
 
         mesh_cache_path = Path(__file__).parent / "rio_buildings_mesh.npz"
         with warnings.catch_warnings():
@@ -187,20 +164,7 @@ if __name__ == "__main__":
             cache_path=water_cache,
         )
 
-        major_features = []
-        minor_features = []
-        body_features = []
-        for f in water_data.get('features', []):
-            ww = (f.get('properties') or {}).get('waterway', '')
-            nat = (f.get('properties') or {}).get('natural', '')
-            if ww in _MAJOR_WATER:
-                major_features.append(f)
-            elif ww in _MINOR_WATER:
-                minor_features.append(f)
-            elif nat == 'water':
-                body_features.append(f)
-            else:
-                minor_features.append(f)
+        major_features, minor_features, body_features = classify_water_features(water_data)
 
         if major_features:
             major_fc = {"type": "FeatureCollection", "features": major_features}
