@@ -307,6 +307,22 @@ class InteractiveViewer:
         self._mouse_last_x = None
         self._mouse_last_y = None
 
+        # Dynamic terrain loading (zarr streaming)
+        self._terrain_loader = None          # callback: (lon, lat) → xr.DataArray
+        self._coord_origin_x = 0.0           # lon of pixel (0,0) in current window
+        self._coord_origin_y = 0.0           # lat of pixel (0,0)
+        self._coord_step_x = 1.0             # lon step per pixel
+        self._coord_step_y = -1.0            # lat step per pixel (negative = southward)
+        self._reload_cooldown = 2.0          # min seconds between reloads
+        self._last_reload_time = 0.0
+
+        # Derive coordinate metadata from raster coords if available
+        if hasattr(raster, 'x') and hasattr(raster, 'y') and len(raster.x) > 1:
+            self._coord_origin_x = float(raster.x.values[0])
+            self._coord_origin_y = float(raster.y.values[0])
+            self._coord_step_x = float(raster.x.values[1] - raster.x.values[0])
+            self._coord_step_y = float(raster.y.values[1] - raster.y.values[0])
+
         # Get terrain info
         H, W = raster.shape
         terrain_data = raster.data
@@ -1608,6 +1624,147 @@ class InteractiveViewer:
                 self._viewshed_cache = None
                 self._calculate_viewshed(quiet=True)
 
+    def _check_terrain_reload(self):
+        """Check if camera is near terrain edge and reload a new window if needed."""
+        if self._terrain_loader is None:
+            return
+
+        now = time.time()
+        if now - self._last_reload_time < self._reload_cooldown:
+            return
+
+        if self.position is None:
+            return
+
+        H, W = self.terrain_shape
+        cam_col = self.position[0] / self.pixel_spacing_x
+        cam_row = self.position[1] / self.pixel_spacing_y
+
+        # Check if camera is within 20% of any edge
+        margin_x = W * 0.2
+        margin_y = H * 0.2
+        near_edge = (cam_col < margin_x or cam_col > W - margin_x or
+                     cam_row < margin_y or cam_row > H - margin_y)
+        if not near_edge:
+            return
+
+        # Compute camera lon/lat from world position
+        cam_lon = self._coord_origin_x + cam_col * self._coord_step_x
+        cam_lat = self._coord_origin_y + cam_row * self._coord_step_y
+
+        # Call the terrain loader
+        new_raster = self._terrain_loader(cam_lon, cam_lat)
+        if new_raster is None:
+            self._last_reload_time = now
+            return
+
+        cam_z = self.position[2]
+
+        # Extract coordinate metadata from new raster
+        new_origin_x = float(new_raster.x.values[0])
+        new_origin_y = float(new_raster.y.values[0])
+        new_step_x = float(new_raster.x.values[1] - new_raster.x.values[0])
+        new_step_y = float(new_raster.y.values[1] - new_raster.y.values[0])
+
+        # Compute camera position in new window's pixel space
+        new_col = (cam_lon - new_origin_x) / new_step_x
+        new_row = (cam_lat - new_origin_y) / new_step_y
+
+        # Replace rasters
+        self._base_raster = new_raster
+        self.raster = new_raster
+
+        # Update coordinate tracking
+        self._coord_origin_x = new_origin_x
+        self._coord_origin_y = new_origin_y
+        self._coord_step_x = new_step_x
+        self._coord_step_y = new_step_y
+
+        # Recompute terrain stats
+        new_H, new_W = new_raster.shape
+        self.terrain_shape = (new_H, new_W)
+
+        terrain_data = new_raster.data
+        if hasattr(terrain_data, 'get'):
+            terrain_np = terrain_data.get()
+        else:
+            terrain_np = np.asarray(terrain_data)
+
+        ve = self.vertical_exaggeration
+        self.elev_min = float(np.nanmin(terrain_np)) * ve
+        self.elev_max = float(np.nanmax(terrain_np)) * ve
+        self.elev_mean = float(np.nanmean(terrain_np)) * ve
+
+        # Rebuild water mask
+        floor_val = float(np.nanmin(terrain_np))
+        floor_max = float(np.nanmax(terrain_np))
+        eps = (floor_max - floor_val) * 1e-4 if floor_max > floor_val else 1e-6
+        self._water_mask = (terrain_np <= floor_val + eps) | np.isnan(terrain_np)
+
+        land_pixels = terrain_np[~self._water_mask]
+        if land_pixels.size > 0:
+            self._land_color_range = (float(np.nanmin(land_pixels)) * ve,
+                                      float(np.nanmax(land_pixels)) * ve)
+
+        # Clear terrain mesh cache (old window geometry is stale)
+        self._terrain_mesh_cache.clear()
+        self._baked_mesh_cache.clear()
+
+        # Rebuild terrain mesh
+        from . import mesh as mesh_mod
+
+        H, W = new_H, new_W
+        if self.mesh_type == 'voxel':
+            num_verts = H * W * 8
+            num_tris = H * W * 12
+            vertices = np.zeros(num_verts * 3, dtype=np.float32)
+            indices = np.zeros(num_tris * 3, dtype=np.int32)
+            base_elev = float(np.nanmin(terrain_np))
+            mesh_mod.voxelate_terrain(vertices, indices, new_raster, scale=1.0,
+                                      base_elevation=base_elev)
+        else:
+            num_verts = H * W
+            num_tris = (H - 1) * (W - 1) * 2
+            vertices = np.zeros(num_verts * 3, dtype=np.float32)
+            indices = np.zeros(num_tris * 3, dtype=np.int32)
+            mesh_mod.triangulate_terrain(vertices, indices, new_raster, scale=1.0)
+
+        # Scale x,y to world units
+        if self.pixel_spacing_x != 1.0 or self.pixel_spacing_y != 1.0:
+            vertices[0::3] *= self.pixel_spacing_x
+            vertices[1::3] *= self.pixel_spacing_y
+
+        # Apply vertical exaggeration
+        if ve != 1.0:
+            vertices[2::3] *= ve
+
+        # Cache the new mesh
+        cache_key = (self.subsample_factor, self.mesh_type)
+        base_verts = vertices.copy()
+        if ve != 1.0:
+            base_verts[2::3] /= ve
+        self._terrain_mesh_cache[cache_key] = (base_verts, indices.copy(), terrain_np.copy())
+
+        # Replace terrain geometry
+        if self.rtx is not None:
+            self.rtx.add_geometry('terrain', vertices, indices)
+
+        # Reposition camera in new window
+        self.position = np.array([
+            new_col * self.pixel_spacing_x,
+            new_row * self.pixel_spacing_y,
+            cam_z
+        ], dtype=float)
+
+        # Refresh minimap
+        self._compute_minimap_background()
+        if self._minimap_im is not None:
+            self._minimap_im.set_data(self._minimap_background)
+
+        self._last_reload_time = time.time()
+        print(f"Terrain reloaded: center ({cam_lon:.4f}, {cam_lat:.4f}), "
+              f"window {new_W}x{new_H}")
+
     def _tick(self):
         """Continuous render loop — process held keys and redraw (called by timer)."""
         if not self.running:
@@ -1686,6 +1843,7 @@ class InteractiveViewer:
                 if self._drone_mode == 'fpv' and self._observer_drone_placed:
                     self._sync_drone_from_pos(self.position)
 
+        self._check_terrain_reload()
         self._update_frame()
 
     def _cycle_terrain_layer(self):
@@ -2880,7 +3038,8 @@ def explore(raster, width: int = 800, height: int = 600,
             baked_meshes=None,
             subsample: int = 1,
             wind_data=None,
-            accessor=None):
+            accessor=None,
+            terrain_loader=None):
     """
     Launch an interactive terrain viewer.
 
@@ -2987,6 +3146,7 @@ def explore(raster, width: int = 800, height: int = 600,
     viewer._geometry_colors_builder = geometry_colors_builder
     viewer._baked_meshes = baked_meshes or {}
     viewer._accessor = accessor
+    viewer._terrain_loader = terrain_loader
     viewer.color_stretch = color_stretch
     if color_stretch in viewer._color_stretches:
         viewer._color_stretch_idx = viewer._color_stretches.index(color_stretch)

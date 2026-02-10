@@ -11,32 +11,30 @@ Requirements:
     pip install rtxpy[all] matplotlib xarray rioxarray requests pyproj Pillow
 """
 
+import warnings
+
 import numpy as np
 import xarray as xr
 
 from xrspatial import slope, aspect, quantile
 from pathlib import Path
 
-import warnings
-
 from rtxpy import fetch_dem, fetch_buildings, fetch_roads, fetch_water
 import rtxpy
-from _utils import print_controls, classify_water_features, scale_building_heights
 
 # Rio de Janeiro bounding box (WGS84)
 # Covers the city from Barra da Tijuca in the west to Ilha do Governador
 # in the east, including Sugarloaf, Corcovado, and Tijuca Forest.
 BOUNDS = (-43.42, -23.08, -43.10, -22.84)
 CRS = 'EPSG:32723'  # UTM zone 23S
+CACHE = Path(__file__).parent
 
 
 def load_terrain():
     """Load Rio de Janeiro terrain data, downloading if necessary."""
-    dem_path = Path(__file__).parent / "rio_dem.tif"
-
     terrain = fetch_dem(
         bounds=BOUNDS,
-        output_path=dem_path,
+        output_path=CACHE / "rio_dem.tif",
         source='copernicus',
         crs=CRS,
     )
@@ -61,10 +59,7 @@ def load_terrain():
 
 
 if __name__ == "__main__":
-    # Load terrain data (downloads if needed)
     terrain = load_terrain()
-
-    print_controls()
 
     # Build Dataset with derived layers
     print("Building Dataset with terrain analysis layers...")
@@ -82,134 +77,35 @@ if __name__ == "__main__":
 
     # --- Microsoft Global Building Footprints --------------------------------
     try:
-        bldg_cache = Path(__file__).parent / "rio_buildings.geojson"
-        bldg_data = fetch_buildings(
-            bounds=BOUNDS,
-            cache_path=bldg_cache,
-        )
-
-        elev_scale = 0.025
-        default_height_m = 8.0
-        scale_building_heights(bldg_data, elev_scale, default_height_m)
-
-        mesh_cache_path = Path(__file__).parent / "rio_buildings_mesh.npz"
-        with warnings.catch_warnings():
-            warnings.filterwarnings("ignore", message="place_geojson called before")
-            bldg_info = ds.rtx.place_geojson(
-                bldg_data,
-                z='elevation',
-                height=default_height_m * elev_scale,
-                height_field='height',
-                geometry_id='building',
-                densify=False,
-                merge=True,
-                extrude=True,
-                mesh_cache=mesh_cache_path,
-            )
-        print(f"Placed {bldg_info['geometries']} building footprint geometries")
-    except ImportError as e:
+        bldg_data = fetch_buildings(bounds=BOUNDS, cache_path=CACHE / "rio_buildings.geojson")
+        info = ds.rtx.place_buildings(bldg_data, z='elevation', elev_scale=0.025,
+                                      mesh_cache=CACHE / "rio_buildings_mesh.npz")
+        print(f"Placed {info['geometries']} building geometries")
+    except Exception as e:
         print(f"Skipping buildings: {e}")
 
     # --- OpenStreetMap roads ------------------------------------------------
     try:
-        # Major roads: motorways, trunk, primary, secondary
-        major_cache = Path(__file__).parent / "rio_roads_major.geojson"
-        major_roads = fetch_roads(
-            bounds=BOUNDS,
-            road_type='major',
-            cache_path=major_cache,
-        )
-        if major_roads.get('features'):
-            with warnings.catch_warnings():
-                warnings.filterwarnings("ignore", message="place_geojson called before")
-                info = ds.rtx.place_geojson(
-                    major_roads, z='elevation', height=1,
-                    label_field='name', geometry_id='road_major',
-                    color=(0.10, 0.10, 0.10),
-                    densify=False,
-                    merge=True,
-                    mesh_cache=Path(__file__).parent / "rio_roads_major_mesh.npz",
-                )
-            print(f"Placed {info['geometries']} major road geometries")
-
-        # Minor roads: tertiary, residential, service
-        minor_cache = Path(__file__).parent / "rio_roads_minor.geojson"
-        minor_roads = fetch_roads(
-            bounds=BOUNDS,
-            road_type='minor',
-            cache_path=minor_cache,
-        )
-        if minor_roads.get('features'):
-            with warnings.catch_warnings():
-                warnings.filterwarnings("ignore", message="place_geojson called before")
-                info = ds.rtx.place_geojson(
-                    minor_roads, z='elevation', height=1,
-                    label_field='name', geometry_id='road_minor',
-                    color=(0.55, 0.55, 0.55),
-                    densify=False,
-                    merge=True,
-                    mesh_cache=Path(__file__).parent / "rio_roads_minor_mesh.npz",
-                )
-            print(f"Placed {info['geometries']} minor road geometries")
-
-    except ImportError as e:
+        for rt, gid, clr in [('major', 'road_major', (0.10, 0.10, 0.10)),
+                              ('minor', 'road_minor', (0.55, 0.55, 0.55))]:
+            data = fetch_roads(bounds=BOUNDS, road_type=rt,
+                               cache_path=CACHE / f"rio_roads_{rt}.geojson")
+            info = ds.rtx.place_roads(data, z='elevation', geometry_id=gid, color=clr,
+                                      mesh_cache=CACHE / f"rio_roads_{rt}_mesh.npz")
+            print(f"Placed {info['geometries']} {rt} road geometries")
+    except Exception as e:
         print(f"Skipping roads: {e}")
 
     # --- OpenStreetMap water features ---------------------------------------
     try:
-        water_cache = Path(__file__).parent / "rio_water.geojson"
-        water_data = fetch_water(
-            bounds=BOUNDS,
-            water_type='all',
-            cache_path=water_cache,
-        )
-
-        major_features, minor_features, body_features = classify_water_features(water_data)
-
-        if major_features:
-            major_fc = {"type": "FeatureCollection", "features": major_features}
-            with warnings.catch_warnings():
-                warnings.filterwarnings("ignore", message="place_geojson called before")
-                major_info = ds.rtx.place_geojson(
-                    major_fc, z='elevation', height=0,
-                    label_field='name', geometry_id='water_major',
-                    color=(0.40, 0.70, 0.95, 2.25),
-                    densify=False,
-                    merge=True,
-                    mesh_cache=Path(__file__).parent / "rio_water_major_mesh.npz",
-                )
-            print(f"Placed {major_info['geometries']} major water features (rivers, canals)")
-
-        if minor_features:
-            minor_fc = {"type": "FeatureCollection", "features": minor_features}
-            with warnings.catch_warnings():
-                warnings.filterwarnings("ignore", message="place_geojson called before")
-                minor_info = ds.rtx.place_geojson(
-                    minor_fc, z='elevation', height=0,
-                    label_field='name', geometry_id='water_minor',
-                    color=(0.50, 0.75, 0.98, 2.25),
-                    densify=False,
-                    merge=True,
-                    mesh_cache=Path(__file__).parent / "rio_water_minor_mesh.npz",
-                )
-            print(f"Placed {minor_info['geometries']} minor water features (streams, drains)")
-
-        if body_features:
-            body_fc = {"type": "FeatureCollection", "features": body_features}
-            with warnings.catch_warnings():
-                warnings.filterwarnings("ignore", message="place_geojson called before")
-                body_info = ds.rtx.place_geojson(
-                    body_fc, z='elevation', height=0.5,
-                    label_field='name', geometry_id='water_body',
-                    color=(0.35, 0.55, 0.88, 2.25),
-                    extrude=True,
-                    merge=True,
-                    mesh_cache=Path(__file__).parent / "rio_water_body_mesh.npz",
-                )
-            print(f"Placed {body_info['geometries']} water bodies (lakes, ponds)")
-
-    except ImportError as e:
-        print(f"Skipping water features: {e}")
+        water_data = fetch_water(bounds=BOUNDS, water_type='all',
+                                 cache_path=CACHE / "rio_water.geojson")
+        results = ds.rtx.place_water(water_data, z='elevation',
+                                     mesh_cache_prefix=CACHE / "rio_water")
+        for cat, info in results.items():
+            print(f"Placed {info['geometries']} {cat} water features")
+    except Exception as e:
+        print(f"Skipping water: {e}")
 
     # --- Wind data --------------------------------------------------------
     wind = None

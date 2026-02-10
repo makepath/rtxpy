@@ -1124,6 +1124,166 @@ class RTXAccessor:
             'geometry_ids': geometry_ids,
         }
 
+    def place_buildings(self, geojson, elev_scale=0.025, default_height_m=8.0,
+                        mesh_cache=None):
+        """Place building footprints as extruded 3D geometry on terrain.
+
+        Scales building heights from the GeoJSON ``height`` property (metres)
+        by *elev_scale* to match terrain visualisation scaling.  Features
+        without a valid height get *default_height_m*.
+
+        Parameters
+        ----------
+        geojson : dict
+            GeoJSON FeatureCollection of building footprint polygons
+            (e.g. from :func:`rtxpy.fetch_buildings`).
+        elev_scale : float, optional
+            Factor applied to real-world heights so they match the scaled
+            terrain.  Default is 0.025.
+        default_height_m : float, optional
+            Height in metres used when a feature has no ``height`` property.
+            Default is 8.0.
+        mesh_cache : str or Path, optional
+            Path to an ``.npz`` file for caching the merged mesh.
+
+        Returns
+        -------
+        dict
+            ``{'features': int, 'geometries': int, 'geometry_ids': list}``
+        """
+        import warnings
+        for feat in geojson.get("features", []):
+            props = feat.get("properties", {})
+            h = props.get("height", -1)
+            if not isinstance(h, (int, float)) or h <= 0:
+                h = default_height_m
+            props["height"] = h * elev_scale
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", message="place_geojson called before")
+            return self.place_geojson(
+                geojson,
+                height=default_height_m * elev_scale,
+                height_field='height',
+                geometry_id='building',
+                densify=False,
+                merge=True,
+                extrude=True,
+                mesh_cache=mesh_cache,
+            )
+
+    def place_roads(self, geojson, geometry_id='road', color=None,
+                    height=1, mesh_cache=None):
+        """Place road LineStrings as flat merged ribbon geometry on terrain.
+
+        Parameters
+        ----------
+        geojson : dict
+            GeoJSON FeatureCollection of road LineStrings (e.g. from
+            :func:`rtxpy.fetch_roads`).
+        geometry_id : str, optional
+            Geometry layer name.  Use ``'road_major'`` / ``'road_minor'``
+            when placing separate road classes.  Default is ``'road'``.
+        color : tuple, optional
+            RGB or RGBA colour.  Default is dark grey ``(0.30, 0.30, 0.30)``.
+        height : float, optional
+            Ribbon height above the terrain surface.  Default is 1.
+        mesh_cache : str or Path, optional
+            Path to an ``.npz`` file for caching the merged mesh.
+
+        Returns
+        -------
+        dict
+            ``{'features': int, 'geometries': int, 'geometry_ids': list}``
+        """
+        import warnings
+        if not geojson.get('features'):
+            return {'features': 0, 'geometries': 0, 'geometry_ids': []}
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", message="place_geojson called before")
+            return self.place_geojson(
+                geojson,
+                height=height,
+                label_field='name',
+                geometry_id=geometry_id,
+                color=color or (0.30, 0.30, 0.30),
+                densify=False,
+                merge=True,
+                mesh_cache=mesh_cache,
+            )
+
+    def place_water(self, geojson, body_height=0.5, mesh_cache_prefix=None):
+        """Classify and place water features as coloured geometry on terrain.
+
+        Splits the GeoJSON into three categories based on the ``waterway``
+        and ``natural`` properties:
+
+        * **major** — rivers, canals (bright blue ribbons)
+        * **minor** — streams, drains, ditches (pale blue ribbons)
+        * **body**  — natural water polygons (extruded blue-grey)
+
+        Parameters
+        ----------
+        geojson : dict
+            GeoJSON FeatureCollection of water features (e.g. from
+            :func:`rtxpy.fetch_water` with ``water_type='all'``).
+        body_height : float, optional
+            Extrusion height for water body polygons.  Default is 0.5.
+        mesh_cache_prefix : str or Path, optional
+            Base path for mesh cache files.  Three files are created:
+            ``{prefix}_major_mesh.npz``, ``{prefix}_minor_mesh.npz``,
+            ``{prefix}_body_mesh.npz``.
+
+        Returns
+        -------
+        dict
+            ``{'major': info, 'minor': info, 'body': info}`` where each
+            *info* is the dict returned by :meth:`place_geojson`, keyed
+            only for categories that had features.
+        """
+        import warnings
+        _MAJOR = {'river', 'canal'}
+        _MINOR = {'stream', 'drain', 'ditch'}
+        major, minor, body = [], [], []
+        for f in geojson.get('features', []):
+            ww = (f.get('properties') or {}).get('waterway', '')
+            nat = (f.get('properties') or {}).get('natural', '')
+            if ww in _MAJOR:
+                major.append(f)
+            elif ww in _MINOR:
+                minor.append(f)
+            elif nat == 'water':
+                body.append(f)
+            else:
+                minor.append(f)
+        results = {}
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", message="place_geojson called before")
+            if major:
+                mc = f"{mesh_cache_prefix}_major_mesh.npz" if mesh_cache_prefix else None
+                results['major'] = self.place_geojson(
+                    {"type": "FeatureCollection", "features": major},
+                    height=0, label_field='name', geometry_id='water_major',
+                    color=(0.40, 0.70, 0.95, 2.25),
+                    densify=False, merge=True, mesh_cache=mc,
+                )
+            if minor:
+                mc = f"{mesh_cache_prefix}_minor_mesh.npz" if mesh_cache_prefix else None
+                results['minor'] = self.place_geojson(
+                    {"type": "FeatureCollection", "features": minor},
+                    height=0, label_field='name', geometry_id='water_minor',
+                    color=(0.50, 0.75, 0.98, 2.25),
+                    densify=False, merge=True, mesh_cache=mc,
+                )
+            if body:
+                mc = f"{mesh_cache_prefix}_body_mesh.npz" if mesh_cache_prefix else None
+                results['body'] = self.place_geojson(
+                    {"type": "FeatureCollection", "features": body},
+                    height=body_height, label_field='name', geometry_id='water_body',
+                    color=(0.35, 0.55, 0.88, 2.25),
+                    extrude=True, merge=True, mesh_cache=mc,
+                )
+        return results
+
     def triangulate(self, geometry_id='terrain', scale=1.0,
                      pixel_spacing_x=1.0, pixel_spacing_y=1.0):
         """Triangulate the terrain and add it to the scene.
@@ -1455,7 +1615,7 @@ class RTXAccessor:
                 start_position=None, look_at=None, key_repeat_interval=0.05,
                 pixel_spacing_x=None, pixel_spacing_y=None,
                 mesh_type='tin', color_stretch='linear', title=None,
-                subsample=1, wind_data=None):
+                subsample=1, wind_data=None, terrain_loader=None):
         """Launch an interactive terrain viewer with keyboard controls.
 
         Opens a matplotlib window for terrain exploration with keyboard
@@ -1579,6 +1739,7 @@ class RTXAccessor:
             subsample=subsample,
             wind_data=wind_data,
             accessor=self,
+            terrain_loader=terrain_loader,
         )
 
     def memory_usage(self):
@@ -1831,6 +1992,33 @@ class RTXDatasetAccessor:
             raise ValueError("z must be specified (no prior terrain variable set)")
         terrain_da = self._get_terrain_da(z)
         return terrain_da.rtx.place_geojson(geojson, **kwargs)
+
+    def place_buildings(self, geojson, z=None, **kwargs):
+        """Place building footprints.  Delegates to DataArray accessor."""
+        if z is None:
+            z = self._z_var
+        if z is None:
+            raise ValueError("z must be specified (no prior terrain variable set)")
+        terrain_da = self._get_terrain_da(z)
+        return terrain_da.rtx.place_buildings(geojson, **kwargs)
+
+    def place_roads(self, geojson, z=None, **kwargs):
+        """Place road LineStrings.  Delegates to DataArray accessor."""
+        if z is None:
+            z = self._z_var
+        if z is None:
+            raise ValueError("z must be specified (no prior terrain variable set)")
+        terrain_da = self._get_terrain_da(z)
+        return terrain_da.rtx.place_roads(geojson, **kwargs)
+
+    def place_water(self, geojson, z=None, **kwargs):
+        """Classify and place water features.  Delegates to DataArray accessor."""
+        if z is None:
+            z = self._z_var
+        if z is None:
+            raise ValueError("z must be specified (no prior terrain variable set)")
+        terrain_da = self._get_terrain_da(z)
+        return terrain_da.rtx.place_water(geojson, **kwargs)
 
     def explore(self, z, width=800, height=600, render_scale=0.5,
                 start_position=None, look_at=None, key_repeat_interval=0.05,

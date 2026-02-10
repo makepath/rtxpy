@@ -26,18 +26,19 @@ from xrspatial import slope, aspect, quantile
 # Import rtxpy to register the .rtx accessor
 from rtxpy import fetch_dem, fetch_roads, fetch_water
 import rtxpy
-from _utils import print_controls, classify_water_features
+
+BOUNDS = (-122.3, 42.8, -121.9, 43.0)
+CRS = 'EPSG:5070'
+CACHE = Path(__file__).parent
 
 
 def load_terrain():
     """Load Crater Lake terrain data, downloading if necessary."""
-    dem_path = Path(__file__).parent / "crater_lake_national_park.tif"
-
     terrain = fetch_dem(
-        bounds=(-122.3, 42.8, -121.9, 43.0),
-        output_path=dem_path,
+        bounds=BOUNDS,
+        output_path=CACHE / "crater_lake_national_park.tif",
         source='srtm',
-        crs='EPSG:5070',
+        crs=CRS,
     )
 
     # Subsample for faster interactive performance
@@ -65,8 +66,6 @@ def load_terrain():
 if __name__ == "__main__":
     # Load terrain data (downloads if needed)
     terrain = load_terrain()
-
-    print_controls()
 
     # Build Dataset with derived layers
     print("Building Dataset with terrain analysis layers...")
@@ -167,9 +166,6 @@ if __name__ == "__main__":
         ],
     }
 
-    # Place GeoJSON on the elevation layer's RTX scene.
-    # Pixel spacing is 1.0 (pixel-coord mode) which matches explore()'s
-    # default, so the warning is expected — suppress it.
     with warnings.catch_warnings():
         warnings.filterwarnings("ignore", message="place_geojson called before")
         info = ds.rtx.place_geojson(
@@ -184,90 +180,30 @@ if __name__ == "__main__":
 
     # --- OpenStreetMap roads ------------------------------------------------
     try:
-        roads_cache = Path(__file__).parent / "crater_lake_roads.geojson"
-        roads_data = fetch_roads(
-            bounds=(-122.3, 42.8, -121.9, 43.0),
-            road_type='all',
-            crs='EPSG:5070',
-            cache_path=roads_cache,
-        )
-        roads_mesh = Path(__file__).parent / "crater_lake_roads_mesh.npz"
-        with warnings.catch_warnings():
-            warnings.filterwarnings("ignore", message="place_geojson called before")
-            roads_info = ds.rtx.place_geojson(
-                roads_data,
-                z='elevation',
-                height=5.0,
-                label_field='name',
-                geometry_id='roads',
-                merge=True,
-                mesh_cache=roads_mesh,
-            )
-        print(f"Placed {roads_info['geometries']} road geometries")
-    except ImportError as e:
+        roads_data = fetch_roads(bounds=BOUNDS, road_type='all', crs=CRS,
+                                 cache_path=CACHE / "crater_lake_roads.geojson")
+        info = ds.rtx.place_roads(roads_data, z='elevation', geometry_id='roads',
+                                  height=5, mesh_cache=CACHE / "crater_lake_roads_mesh.npz")
+        print(f"Placed {info['geometries']} road geometries")
+    except Exception as e:
         print(f"Skipping roads: {e}")
 
     # --- OpenStreetMap water features ---------------------------------------
-    # Split into major (rivers, canals → wider tubes) and minor (streams,
-    # drains, ditches → thinner tubes), each in a distinct blue tone.
     try:
-        water_cache = Path(__file__).parent / "crater_lake_water.geojson"
-        water_data = fetch_water(
-            bounds=(-122.3, 42.8, -121.9, 43.0),
-            water_type='all',
-            crs='EPSG:5070',
-            cache_path=water_cache,
-        )
-
-        major_features, minor_features, body_features = classify_water_features(water_data)
-
-        if major_features:
-            major_fc = {"type": "FeatureCollection", "features": major_features}
-            with warnings.catch_warnings():
-                warnings.filterwarnings("ignore", message="place_geojson called before")
-                major_info = ds.rtx.place_geojson(
-                    major_fc, z='elevation', height=10.0,
-                    label_field='name', geometry_id='water_major',
-                    color=(0.40, 0.70, 0.95, 2.25),
-                    merge=True,
-                    mesh_cache=Path(__file__).parent / "crater_lake_water_major_mesh.npz",
-                )
-            print(f"Placed {major_info['geometries']} major water features (rivers, canals)")
-
-        if minor_features:
-            minor_fc = {"type": "FeatureCollection", "features": minor_features}
-            with warnings.catch_warnings():
-                warnings.filterwarnings("ignore", message="place_geojson called before")
-                minor_info = ds.rtx.place_geojson(
-                    minor_fc, z='elevation', height=4.0,
-                    label_field='name', geometry_id='water_minor',
-                    color=(0.50, 0.75, 0.98, 2.25),
-                    merge=True,
-                    mesh_cache=Path(__file__).parent / "crater_lake_water_minor_mesh.npz",
-                )
-            print(f"Placed {minor_info['geometries']} minor water features (streams, drains)")
-
-        if body_features:
-            body_fc = {"type": "FeatureCollection", "features": body_features}
-            with warnings.catch_warnings():
-                warnings.filterwarnings("ignore", message="place_geojson called before")
-                body_info = ds.rtx.place_geojson(
-                    body_fc, z='elevation', height=6.0,
-                    label_field='name', geometry_id='water_body',
-                    color=(0.35, 0.55, 0.88, 2.25),
-                    merge=True,
-                    mesh_cache=Path(__file__).parent / "crater_lake_water_body_mesh.npz",
-                )
-            print(f"Placed {body_info['geometries']} water bodies (lakes, ponds)")
-
-    except ImportError as e:
-        print(f"Skipping water features: {e}")
+        water_data = fetch_water(bounds=BOUNDS, water_type='all', crs=CRS,
+                                 cache_path=CACHE / "crater_lake_water.geojson")
+        results = ds.rtx.place_water(water_data, z='elevation',
+                                     mesh_cache_prefix=CACHE / "crater_lake_water")
+        for cat, info in results.items():
+            print(f"Placed {info['geometries']} {cat} water features")
+    except Exception as e:
+        print(f"Skipping water: {e}")
 
     # --- Wind data --------------------------------------------------------
     wind = None
     try:
         from rtxpy import fetch_wind
-        wind = fetch_wind((-122.3, 42.8, -121.9, 43.0), grid_size=15)
+        wind = fetch_wind(BOUNDS, grid_size=15)
         # Crater Lake is smaller — more particles, faster, shorter lives
         # so they cover the field instead of clumping
         wind['n_particles'] = 15000
