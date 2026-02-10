@@ -133,6 +133,166 @@ def triangulate_terrain(verts, triangles, terrain, scale=1.0):
     return 0
 
 
+@cuda.jit
+def _voxelate_terrain_gpu(verts, triangles, data, H, W, scale, base_z, stride):
+    """GPU kernel for terrain voxelation — one box-column per cell."""
+    globalId = stride + cuda.grid(1)
+    if globalId < W * H:
+        h = globalId // W
+        w = globalId % W
+
+        e = data[h, w] * scale
+        b = base_z
+
+        # 8 vertices per cell, 3 floats each = 24 floats
+        vo = globalId * 24
+        # Bottom: v0=(w,h,b) v1=(w+1,h,b) v2=(w+1,h+1,b) v3=(w,h+1,b)
+        verts[vo + 0] = w;       verts[vo + 1] = h;       verts[vo + 2] = b
+        verts[vo + 3] = w + 1;   verts[vo + 4] = h;       verts[vo + 5] = b
+        verts[vo + 6] = w + 1;   verts[vo + 7] = h + 1;   verts[vo + 8] = b
+        verts[vo + 9] = w;       verts[vo + 10] = h + 1;  verts[vo + 11] = b
+        # Top: v4=(w,h,e) v5=(w+1,h,e) v6=(w+1,h+1,e) v7=(w,h+1,e)
+        verts[vo + 12] = w;      verts[vo + 13] = h;      verts[vo + 14] = e
+        verts[vo + 15] = w + 1;  verts[vo + 16] = h;      verts[vo + 17] = e
+        verts[vo + 18] = w + 1;  verts[vo + 19] = h + 1;  verts[vo + 20] = e
+        verts[vo + 21] = w;      verts[vo + 22] = h + 1;  verts[vo + 23] = e
+
+        # 12 triangles per cell, 3 indices each = 36 indices
+        to = globalId * 36
+        v0 = np.int32(globalId * 8)
+
+        # Top face (+Z) — CCW from above: v4, v5, v6, v7
+        triangles[to + 0] = v0 + 4; triangles[to + 1] = v0 + 5; triangles[to + 2] = v0 + 6
+        triangles[to + 3] = v0 + 4; triangles[to + 4] = v0 + 6; triangles[to + 5] = v0 + 7
+        # Bottom face (-Z) — CCW from below: v0, v3, v2, v1
+        triangles[to + 6] = v0 + 0; triangles[to + 7] = v0 + 3; triangles[to + 8] = v0 + 2
+        triangles[to + 9] = v0 + 0; triangles[to + 10] = v0 + 2; triangles[to + 11] = v0 + 1
+        # Front face (-Y) — v0, v1, v5, v4
+        triangles[to + 12] = v0 + 0; triangles[to + 13] = v0 + 1; triangles[to + 14] = v0 + 5
+        triangles[to + 15] = v0 + 0; triangles[to + 16] = v0 + 5; triangles[to + 17] = v0 + 4
+        # Back face (+Y) — v2, v3, v7, v6
+        triangles[to + 18] = v0 + 2; triangles[to + 19] = v0 + 3; triangles[to + 20] = v0 + 7
+        triangles[to + 21] = v0 + 2; triangles[to + 22] = v0 + 7; triangles[to + 23] = v0 + 6
+        # Right face (+X) — v1, v2, v6, v5
+        triangles[to + 24] = v0 + 1; triangles[to + 25] = v0 + 2; triangles[to + 26] = v0 + 6
+        triangles[to + 27] = v0 + 1; triangles[to + 28] = v0 + 6; triangles[to + 29] = v0 + 5
+        # Left face (-X) — v3, v0, v4, v7
+        triangles[to + 30] = v0 + 3; triangles[to + 31] = v0 + 0; triangles[to + 32] = v0 + 4
+        triangles[to + 33] = v0 + 3; triangles[to + 34] = v0 + 4; triangles[to + 35] = v0 + 7
+
+
+@nb.njit(parallel=True)
+def _voxelate_terrain_cpu(verts, triangles, data, H, W, scale, base_z):
+    """CPU implementation of terrain voxelation using numba."""
+    for h in nb.prange(H):
+        for w in range(W):
+            globalId = h * W + w
+
+            e = data[h, w] * scale
+            b = base_z
+
+            # 8 vertices per cell, 3 floats each = 24 floats
+            vo = globalId * 24
+            # Bottom: v0=(w,h,b) v1=(w+1,h,b) v2=(w+1,h+1,b) v3=(w,h+1,b)
+            verts[vo + 0] = w;       verts[vo + 1] = h;       verts[vo + 2] = b
+            verts[vo + 3] = w + 1;   verts[vo + 4] = h;       verts[vo + 5] = b
+            verts[vo + 6] = w + 1;   verts[vo + 7] = h + 1;   verts[vo + 8] = b
+            verts[vo + 9] = w;       verts[vo + 10] = h + 1;  verts[vo + 11] = b
+            # Top: v4=(w,h,e) v5=(w+1,h,e) v6=(w+1,h+1,e) v7=(w,h+1,e)
+            verts[vo + 12] = w;      verts[vo + 13] = h;      verts[vo + 14] = e
+            verts[vo + 15] = w + 1;  verts[vo + 16] = h;      verts[vo + 17] = e
+            verts[vo + 18] = w + 1;  verts[vo + 19] = h + 1;  verts[vo + 20] = e
+            verts[vo + 21] = w;      verts[vo + 22] = h + 1;  verts[vo + 23] = e
+
+            # 12 triangles per cell, 3 indices each = 36 indices
+            to = globalId * 36
+            v0 = np.int32(globalId * 8)
+
+            # Top face (+Z) — CCW from above: v4, v5, v6, v7
+            triangles[to + 0] = v0 + 4; triangles[to + 1] = v0 + 5; triangles[to + 2] = v0 + 6
+            triangles[to + 3] = v0 + 4; triangles[to + 4] = v0 + 6; triangles[to + 5] = v0 + 7
+            # Bottom face (-Z) — CCW from below: v0, v3, v2, v1
+            triangles[to + 6] = v0 + 0; triangles[to + 7] = v0 + 3; triangles[to + 8] = v0 + 2
+            triangles[to + 9] = v0 + 0; triangles[to + 10] = v0 + 2; triangles[to + 11] = v0 + 1
+            # Front face (-Y) — v0, v1, v5, v4
+            triangles[to + 12] = v0 + 0; triangles[to + 13] = v0 + 1; triangles[to + 14] = v0 + 5
+            triangles[to + 15] = v0 + 0; triangles[to + 16] = v0 + 5; triangles[to + 17] = v0 + 4
+            # Back face (+Y) — v2, v3, v7, v6
+            triangles[to + 18] = v0 + 2; triangles[to + 19] = v0 + 3; triangles[to + 20] = v0 + 7
+            triangles[to + 21] = v0 + 2; triangles[to + 22] = v0 + 7; triangles[to + 23] = v0 + 6
+            # Right face (+X) — v1, v2, v6, v5
+            triangles[to + 24] = v0 + 1; triangles[to + 25] = v0 + 2; triangles[to + 26] = v0 + 6
+            triangles[to + 27] = v0 + 1; triangles[to + 28] = v0 + 6; triangles[to + 29] = v0 + 5
+            # Left face (-X) — v3, v0, v4, v7
+            triangles[to + 30] = v0 + 3; triangles[to + 31] = v0 + 0; triangles[to + 32] = v0 + 4
+            triangles[to + 33] = v0 + 3; triangles[to + 34] = v0 + 4; triangles[to + 35] = v0 + 7
+
+
+def voxelate_terrain(verts, triangles, terrain, scale=1.0, base_elevation=0.0):
+    """Convert a 2D terrain array into a voxelized box-column mesh.
+
+    Each cell in the terrain becomes a rectangular column (box) extending from
+    base_elevation up to the cell's elevation. Each box has 8 vertices and 12
+    triangles (6 faces x 2 triangles). All triangle windings are CCW for
+    outward-facing normals.
+
+    Parameters
+    ----------
+    verts : array-like
+        Output vertex buffer of shape (H * W * 8 * 3,) as float32.
+    triangles : array-like
+        Output triangle index buffer of shape (H * W * 12 * 3,) as int32.
+    terrain : array-like
+        2D array of elevation values with shape (H, W). Can be a numpy array,
+        cupy array, or xarray DataArray.
+    scale : float, optional
+        Scale factor applied to elevation values. Default is 1.0.
+    base_elevation : float, optional
+        Z coordinate for the bottom of all columns. Default is 0.0.
+
+    Returns
+    -------
+    int
+        0 on success.
+
+    Notes
+    -----
+    Produces ~15x more geometry than triangulate_terrain (240 bytes/cell vs 16).
+    Adjacent boxes share coincident faces which are not removed; OptiX handles
+    these efficiently. NaN elevations produce degenerate zero-height triangles.
+    """
+    if hasattr(terrain, 'dims') and hasattr(terrain, 'coords'):
+        data = terrain.data
+    else:
+        data = terrain
+    H, W = terrain.shape
+
+    base_z = np.float32(base_elevation)
+
+    if isinstance(data, np.ndarray):
+        _voxelate_terrain_cpu(verts, triangles, data, H, W, scale, base_z)
+    elif has_cupy and isinstance(data, cupy.ndarray):
+        jobSize = H * W
+        blockdim = 256
+        griddim = (jobSize + blockdim - 1) // blockdim
+        d = 100
+        offset = 0
+        while jobSize > 0:
+            batch = min(d, griddim)
+            _voxelate_terrain_gpu[batch, blockdim](
+                verts, triangles, data, H, W, scale, base_z, offset
+            )
+            offset += batch * blockdim
+            jobSize -= batch * blockdim
+    else:
+        raise TypeError(
+            f"Unsupported terrain data type: {type(data)}. "
+            "Expected numpy.ndarray or cupy.ndarray."
+        )
+
+    return 0
+
+
 @nb.jit(nopython=True)
 def _fill_stl_contents(content, verts, triangles, numTris):
     """Fill STL binary content from mesh data."""

@@ -3,120 +3,51 @@
 This example demonstrates real-time terrain exploration using
 GPU-accelerated ray tracing via the xarray accessor's explore mode.
 
+Builds an xr.Dataset with elevation, slope, aspect, and quantile layers.
+Press G to cycle between layers. Satellite tiles are draped on the terrain
+automatically — press U to toggle tile overlay on/off.
+
+GeoJSON landmarks (Wizard Island, Phantom Ship, etc.) and a simplified
+Crater Lake outline + Rim Drive path are placed as 3D geometry. Press G/N
+to cycle and jump between geometry layers.
+
 Requirements:
-    pip install rtxpy[analysis] matplotlib xarray rioxarray requests
+    pip install rtxpy[all] matplotlib xarray rioxarray requests pyproj Pillow osmnx
 """
 
+import warnings
+
 import numpy as np
-import requests
+import xarray as xr
 from pathlib import Path
 
+from xrspatial import slope, aspect, quantile
+
 # Import rtxpy to register the .rtx accessor
+from rtxpy import fetch_dem, fetch_roads, fetch_water
 import rtxpy
 
-
-def download_crater_lake_dem(output_path):
-    """Download SRTM elevation data for Crater Lake National Park.
-
-    Downloads 1-arc-second (~30m) SRTM tiles from the USGS National Map
-    and clips to the Crater Lake area.
-
-    Parameters
-    ----------
-    output_path : Path
-        Path to save the downloaded/processed DEM file.
-
-    Returns
-    -------
-    xarray.DataArray
-        The elevation data as an xarray DataArray.
-    """
-    import rioxarray as rxr
-
-    # Crater Lake National Park bounds (WGS84)
-    # The park is centered around 42.94°N, 122.10°W
-    # Note: north bound limited to 43.0 to match n42 SRTM tile coverage
-    bounds = (-122.3, 42.8, -121.9, 43.0)
-    west, south, east, north = bounds
-
-    # SRTM tiles needed (1x1 degree tiles, named by northern latitude boundary)
-    # For Crater Lake at ~42.94°N: n43 tiles cover lat 42-43
-    tiles_needed = [
-        ("n43", "w123"),
-        ("n43", "w122"),
-    ]
-
-    base_url = "https://prd-tnm.s3.amazonaws.com/StagedProducts/Elevation/1/TIFF/current"
-    tile_paths = []
-
-    print("Downloading Crater Lake elevation data from USGS...")
-
-    for ns, ew in tiles_needed:
-        tile_name = f"{ns}{ew}"
-        url = f"{base_url}/{tile_name}/USGS_1_{tile_name}.tif"
-        tile_path = output_path.parent / f"USGS_1_{tile_name}.tif"
-
-        if not tile_path.exists():
-            print(f"  Downloading {tile_name}...")
-            try:
-                resp = requests.get(url, timeout=120)
-                resp.raise_for_status()
-                tile_path.write_bytes(resp.content)
-            except requests.RequestException as e:
-                print(f"  Warning: Failed to download {tile_name}: {e}")
-                continue
-        else:
-            print(f"  Using cached {tile_name}")
-
-        tile_paths.append(tile_path)
-
-    if not tile_paths:
-        raise RuntimeError("Failed to download any elevation tiles")
-
-    # Open all tiles
-    tiles = [rxr.open_rasterio(str(p), masked=True).squeeze() for p in tile_paths]
-
-    if len(tiles) == 1:
-        merged = tiles[0]
-    else:
-        from rioxarray.merge import merge_arrays
-        merged = merge_arrays(tiles)
-
-    # Clip to Crater Lake bounds
-    merged = merged.rio.clip_box(minx=west, miny=south, maxx=east, maxy=north)
-
-    # Reproject to EPSG:5070 (Conus Albers Equal Area) for proper metric units
-    merged = merged.rio.reproject("EPSG:5070")
-
-    # Save clipped result
-    merged.rio.to_raster(str(output_path))
-    print(f"  Saved clipped DEM to {output_path}")
-
-    # Clean up individual tiles (optional - keep them for caching)
-    # for p in tile_paths:
-    #     if p != output_path and p.exists():
-    #         p.unlink()
-
-    return merged
+# Water feature classification
+_MAJOR_WATER = {'river', 'canal'}
+_MINOR_WATER = {'stream', 'drain', 'ditch'}
 
 
 def load_terrain():
     """Load Crater Lake terrain data, downloading if necessary."""
     dem_path = Path(__file__).parent / "crater_lake_national_park.tif"
 
-    if not dem_path.exists():
-        print(f"DEM file not found at {dem_path}")
-        terrain = download_crater_lake_dem(dem_path)
-    else:
-        print(f"Loading existing DEM: {dem_path}")
-        import rioxarray as rxr
-        terrain = rxr.open_rasterio(str(dem_path), masked=True).squeeze()
+    terrain = fetch_dem(
+        bounds=(-122.3, 42.8, -121.9, 43.0),
+        output_path=dem_path,
+        source='srtm',
+        crs='EPSG:5070',
+    )
 
     # Subsample for faster interactive performance
     terrain = terrain[::2, ::2]
 
     # Scale down elevation for visualization (optional)
-    terrain.data = terrain.data * 0.2
+    terrain.data = terrain.data * 0.1
 
     # Ensure contiguous array before GPU transfer
     terrain.data = np.ascontiguousarray(terrain.data)
@@ -138,25 +69,251 @@ if __name__ == "__main__":
     # Load terrain data (downloads if needed)
     terrain = load_terrain()
 
-    print("\nLaunching explore mode...")
-    print("Controls:")
+    print("\nControls:")
     print("  W/S/A/D or Arrow keys: Move camera")
     print("  Q/E or Page Up/Down: Move up/down")
     print("  I/J/K/L: Look around")
     print("  +/-: Adjust movement speed")
+    print("  G: Cycle overlay layers")
     print("  O: Place observer (for viewshed)")
     print("  V: Toggle viewshed (teal glow)")
     print("  [/]: Adjust observer height")
     print("  T: Toggle shadows")
     print("  C: Cycle colormap")
+    print("  U: Toggle tile overlay")
     print("  F: Screenshot")
     print("  H: Toggle help overlay")
     print("  X: Exit\n")
 
-    # Launch interactive explore mode
-    terrain.rtx.explore(
+    # Build Dataset with derived layers
+    print("Building Dataset with terrain analysis layers...")
+    ds = xr.Dataset({
+        'elevation': terrain.rename(None),
+        'slope': slope(terrain),
+        'aspect': aspect(terrain),
+        'quantile': quantile(terrain),
+    })
+    print(ds)
+
+    # Drape satellite tiles on terrain (reprojected to match DEM CRS)
+    print("Loading satellite tiles...")
+    ds.rtx.place_tiles('satellite', z='elevation')
+
+    # --- GeoJSON landmarks and outlines --------------------------------
+    # Coordinates in WGS84 (lon, lat); pyproj reprojects to the DEM CRS.
+    crater_lake_geojson = {
+        "type": "FeatureCollection",
+        "features": [
+            # Points of interest
+            {
+                "type": "Feature",
+                "geometry": {"type": "Point", "coordinates": [-122.163, 42.947]},
+                "properties": {"name": "Wizard Island"},
+            },
+            {
+                "type": "Feature",
+                "geometry": {"type": "Point", "coordinates": [-122.069, 42.922]},
+                "properties": {"name": "Phantom Ship"},
+            },
+            {
+                "type": "Feature",
+                "geometry": {"type": "Point", "coordinates": [-122.142, 42.912]},
+                "properties": {"name": "Rim Village"},
+            },
+            {
+                "type": "Feature",
+                "geometry": {"type": "Point", "coordinates": [-122.082, 42.972]},
+                "properties": {"name": "Cleetwood Cove"},
+            },
+            {
+                "type": "Feature",
+                "geometry": {"type": "Point", "coordinates": [-122.016, 42.920]},
+                "properties": {"name": "Mount Scott"},
+            },
+            # Simplified lake rim outline
+            {
+                "type": "Feature",
+                "geometry": {
+                    "type": "Polygon",
+                    "coordinates": [[
+                        [-122.110, 42.976],
+                        [-122.073, 42.972],
+                        [-122.048, 42.957],
+                        [-122.040, 42.940],
+                        [-122.050, 42.920],
+                        [-122.064, 42.908],
+                        [-122.090, 42.903],
+                        [-122.120, 42.905],
+                        [-122.148, 42.912],
+                        [-122.168, 42.925],
+                        [-122.172, 42.945],
+                        [-122.162, 42.960],
+                        [-122.140, 42.972],
+                        [-122.110, 42.976],
+                    ]],
+                },
+                "properties": {"name": "Crater Lake"},
+            },
+            # Rim Drive (simplified path)
+            {
+                "type": "Feature",
+                "geometry": {
+                    "type": "LineString",
+                    "coordinates": [
+                        [-122.142, 42.912],
+                        [-122.160, 42.918],
+                        [-122.175, 42.932],
+                        [-122.178, 42.948],
+                        [-122.168, 42.962],
+                        [-122.148, 42.976],
+                        [-122.118, 42.982],
+                        [-122.088, 42.978],
+                        [-122.065, 42.968],
+                        [-122.045, 42.952],
+                        [-122.035, 42.935],
+                        [-122.040, 42.918],
+                        [-122.055, 42.905],
+                        [-122.080, 42.897],
+                        [-122.110, 42.897],
+                        [-122.135, 42.903],
+                        [-122.142, 42.912],
+                    ],
+                },
+                "properties": {"name": "Rim Drive"},
+            },
+        ],
+    }
+
+    # Place GeoJSON on the elevation layer's RTX scene.
+    # Pixel spacing is 1.0 (pixel-coord mode) which matches explore()'s
+    # default, so the warning is expected — suppress it.
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", message="place_geojson called before")
+        info = ds.rtx.place_geojson(
+            crater_lake_geojson,
+            z='elevation',
+            height=15.0,
+            label_field='name',
+            geometry_id='landmark',
+        )
+    print(f"Placed {info['geometries']} GeoJSON geometries: "
+          f"{', '.join(info['geometry_ids'])}")
+
+    # --- OpenStreetMap roads ------------------------------------------------
+    try:
+        roads_cache = Path(__file__).parent / "crater_lake_roads.geojson"
+        roads_data = fetch_roads(
+            bounds=(-122.3, 42.8, -121.9, 43.0),
+            road_type='all',
+            crs='EPSG:5070',
+            cache_path=roads_cache,
+        )
+        roads_mesh = Path(__file__).parent / "crater_lake_roads_mesh.npz"
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", message="place_geojson called before")
+            roads_info = ds.rtx.place_geojson(
+                roads_data,
+                z='elevation',
+                height=5.0,
+                label_field='name',
+                geometry_id='roads',
+                merge=True,
+                mesh_cache=roads_mesh,
+            )
+        print(f"Placed {roads_info['geometries']} road geometries")
+    except ImportError as e:
+        print(f"Skipping roads: {e}")
+
+    # --- OpenStreetMap water features ---------------------------------------
+    # Split into major (rivers, canals → wider tubes) and minor (streams,
+    # drains, ditches → thinner tubes), each in a distinct blue tone.
+    try:
+        water_cache = Path(__file__).parent / "crater_lake_water.geojson"
+        water_data = fetch_water(
+            bounds=(-122.3, 42.8, -121.9, 43.0),
+            water_type='all',
+            crs='EPSG:5070',
+            cache_path=water_cache,
+        )
+
+        major_features = []
+        minor_features = []
+        body_features = []
+        for f in water_data.get('features', []):
+            ww = (f.get('properties') or {}).get('waterway', '')
+            nat = (f.get('properties') or {}).get('natural', '')
+            if ww in _MAJOR_WATER:
+                major_features.append(f)
+            elif ww in _MINOR_WATER:
+                minor_features.append(f)
+            elif nat == 'water':
+                body_features.append(f)
+            else:
+                minor_features.append(f)
+
+        if major_features:
+            major_fc = {"type": "FeatureCollection", "features": major_features}
+            with warnings.catch_warnings():
+                warnings.filterwarnings("ignore", message="place_geojson called before")
+                major_info = ds.rtx.place_geojson(
+                    major_fc, z='elevation', height=10.0,
+                    label_field='name', geometry_id='water_major',
+                    color=(0.40, 0.70, 0.95, 2.25),
+                    merge=True,
+                    mesh_cache=Path(__file__).parent / "crater_lake_water_major_mesh.npz",
+                )
+            print(f"Placed {major_info['geometries']} major water features (rivers, canals)")
+
+        if minor_features:
+            minor_fc = {"type": "FeatureCollection", "features": minor_features}
+            with warnings.catch_warnings():
+                warnings.filterwarnings("ignore", message="place_geojson called before")
+                minor_info = ds.rtx.place_geojson(
+                    minor_fc, z='elevation', height=4.0,
+                    label_field='name', geometry_id='water_minor',
+                    color=(0.50, 0.75, 0.98, 2.25),
+                    merge=True,
+                    mesh_cache=Path(__file__).parent / "crater_lake_water_minor_mesh.npz",
+                )
+            print(f"Placed {minor_info['geometries']} minor water features (streams, drains)")
+
+        if body_features:
+            body_fc = {"type": "FeatureCollection", "features": body_features}
+            with warnings.catch_warnings():
+                warnings.filterwarnings("ignore", message="place_geojson called before")
+                body_info = ds.rtx.place_geojson(
+                    body_fc, z='elevation', height=6.0,
+                    label_field='name', geometry_id='water_body',
+                    color=(0.35, 0.55, 0.88, 2.25),
+                    merge=True,
+                    mesh_cache=Path(__file__).parent / "crater_lake_water_body_mesh.npz",
+                )
+            print(f"Placed {body_info['geometries']} water bodies (lakes, ponds)")
+
+    except ImportError as e:
+        print(f"Skipping water features: {e}")
+
+    # --- Wind data --------------------------------------------------------
+    wind = None
+    try:
+        from rtxpy import fetch_wind
+        wind = fetch_wind((-122.3, 42.8, -121.9, 43.0), grid_size=15)
+        # Crater Lake is smaller — more particles, faster, shorter lives
+        # so they cover the field instead of clumping
+        wind['n_particles'] = 15000
+        wind['max_age'] = 120
+        wind['speed_mult'] = 80.0
+    except Exception as e:
+        print(f"Skipping wind: {e}")
+
+    print("\nLaunching explore (press G to cycle layers, Shift+W for wind)...\n")
+    ds.rtx.explore(
+        z='elevation',
+        mesh_type='voxel',
         width=1024,
         height=768,
-        render_scale=0.5
+        render_scale=0.5,
+        wind_data=wind,
     )
+
     print("Done")

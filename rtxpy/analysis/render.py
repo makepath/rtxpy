@@ -83,23 +83,23 @@ def _compute_camera_basis(camera_position, look_at, up):
     forward = target - camera_pos
     forward = forward / np.linalg.norm(forward)
 
-    right = np.cross(forward, world_up)
+    right = np.cross(world_up, forward)
     right_norm = np.linalg.norm(right)
 
     # Handle case where forward is parallel to up vector
     if right_norm < 1e-6:
         # Use a different up vector to compute right
         alt_up = np.array([1.0, 0.0, 0.0], dtype=np.float32)
-        right = np.cross(forward, alt_up)
+        right = np.cross(alt_up, forward)
         right_norm = np.linalg.norm(right)
         if right_norm < 1e-6:
             alt_up = np.array([0.0, 1.0, 0.0], dtype=np.float32)
-            right = np.cross(forward, alt_up)
+            right = np.cross(alt_up, forward)
             right_norm = np.linalg.norm(right)
 
     right = right / right_norm
 
-    cam_up = np.cross(right, forward)
+    cam_up = np.cross(forward, right)
     cam_up = cam_up / np.linalg.norm(cam_up)
 
     return forward, right, cam_up
@@ -302,7 +302,11 @@ def _shade_terrain_kernel(
     elev_min, elev_range, alpha_channel,
     viewshed_data, viewshed_enabled, viewshed_opacity,
     observer_x, observer_y,
-    pixel_spacing_x, pixel_spacing_y
+    pixel_spacing_x, pixel_spacing_y,
+    color_stretch,
+    rgb_texture,
+    overlay_data, overlay_alpha, overlay_min, overlay_range,
+    instance_ids, geometry_colors
 ):
     """GPU kernel for terrain shading with lighting, shadows, fog, colormapping, and viewshed."""
     idx = cuda.grid(1)
@@ -338,40 +342,121 @@ def _shade_terrain_kernel(
             hit_y = oy + t * ray_dy
             hit_z = oz + t * ray_dz
 
-            # Get elevation at hit point for color lookup
-            # Convert world coords to pixel indices using pixel spacing
+            # Convert world coords to pixel indices (needed for colormap and viewshed)
             elev_y = int(hit_y / pixel_spacing_y + 0.5)
             elev_x = int(hit_x / pixel_spacing_x + 0.5)
 
-            elev_h = elevation_data.shape[0]
-            elev_w = elevation_data.shape[1]
+            # Check for per-geometry solid color override
+            # Alpha encoding: 0 = no override, (0,1] = normal shaded,
+            #                  (1,2) = emissive glow (alpha-1 = min lighting floor),
+            #                  >=2   = water shader  (alpha-2 = specular strength)
+            inst_id = instance_ids[idx]
+            has_color_override = False
+            emissive = 0.0
+            is_water = False
+            water_specular = 0.0
+            if inst_id >= 0 and inst_id < geometry_colors.shape[0]:
+                gc_alpha = geometry_colors[inst_id, 3]
+                if gc_alpha > 0.0:
+                    base_r = geometry_colors[inst_id, 0]
+                    base_g = geometry_colors[inst_id, 1]
+                    base_b = geometry_colors[inst_id, 2]
+                    has_color_override = True
+                    if gc_alpha >= 2.0:
+                        is_water = True
+                        water_specular = gc_alpha - 2.0
+                    elif gc_alpha > 1.0:
+                        emissive = gc_alpha - 1.0
 
-            if elev_y >= 0 and elev_y < elev_h and elev_x >= 0 and elev_x < elev_w:
-                elevation = elevation_data[elev_y, elev_x]
-            else:
-                elevation = hit_z
+            if not has_color_override:
 
-            # Normalize elevation to [0, 1] for colormap lookup
-            if elev_range > 0:
-                elev_norm = (elevation - elev_min) / elev_range
-            else:
-                elev_norm = 0.5
+                elev_h = elevation_data.shape[0]
+                elev_w = elevation_data.shape[1]
 
-            if elev_norm < 0:
-                elev_norm = 0.0
-            elif elev_norm > 1:
-                elev_norm = 1.0
+                # RGB texture mode: real texture has shape > 1, dummy is (1,1,3)
+                tex_h = rgb_texture.shape[0]
+                tex_w = rgb_texture.shape[1]
 
-            # Color lookup
-            lut_idx = int(elev_norm * 255)
-            if lut_idx > 255:
-                lut_idx = 255
-            if lut_idx < 0:
-                lut_idx = 0
+                if tex_h > 1:
+                    # Sample RGB directly from tile texture
+                    if elev_y >= 0 and elev_y < tex_h and elev_x >= 0 and elev_x < tex_w:
+                        base_r = rgb_texture[elev_y, elev_x, 0]
+                        base_g = rgb_texture[elev_y, elev_x, 1]
+                        base_b = rgb_texture[elev_y, elev_x, 2]
+                    else:
+                        base_r = 0.3
+                        base_g = 0.3
+                        base_b = 0.3
+                else:
+                    if elev_y >= 0 and elev_y < elev_h and elev_x >= 0 and elev_x < elev_w:
+                        elevation = elevation_data[elev_y, elev_x]
+                    else:
+                        elevation = hit_z
 
-            base_r = color_lut[lut_idx, 0]
-            base_g = color_lut[lut_idx, 1]
-            base_b = color_lut[lut_idx, 2]
+                    # Normalize elevation to [0, 1] for colormap lookup
+                    if elev_range > 0:
+                        elev_norm = (elevation - elev_min) / elev_range
+                    else:
+                        elev_norm = 0.5
+
+                    if elev_norm < 0:
+                        elev_norm = 0.0
+                    elif elev_norm > 1:
+                        elev_norm = 1.0
+
+                    # Apply nonlinear stretch: 0=linear, 1=cbrt, 2=log, 3=sqrt
+                    if color_stretch == 1:
+                        elev_norm = math.pow(elev_norm, 1.0 / 3.0)
+                    elif color_stretch == 2:
+                        elev_norm = math.log(1.0 + elev_norm * 9.0) / math.log(10.0)
+                    elif color_stretch == 3:
+                        elev_norm = math.sqrt(elev_norm)
+
+                    # Color lookup
+                    lut_idx = int(elev_norm * 255)
+                    if lut_idx > 255:
+                        lut_idx = 255
+                    if lut_idx < 0:
+                        lut_idx = 0
+
+                    base_r = color_lut[lut_idx, 0]
+                    base_g = color_lut[lut_idx, 1]
+                    base_b = color_lut[lut_idx, 2]
+
+                # Overlay blending: transparent scalar layer on top of base
+                ov_h = overlay_data.shape[0]
+                ov_w = overlay_data.shape[1]
+                if ov_h > 1 and overlay_alpha > 0.0:
+                    if elev_y >= 0 and elev_y < ov_h and elev_x >= 0 and elev_x < ov_w:
+                        ov_val = overlay_data[elev_y, elev_x]
+                        if not math.isnan(ov_val):
+                            if overlay_range > 0:
+                                ov_norm = (ov_val - overlay_min) / overlay_range
+                            else:
+                                ov_norm = 0.5
+                            if ov_norm < 0:
+                                ov_norm = 0.0
+                            elif ov_norm > 1:
+                                ov_norm = 1.0
+                            # Apply same color stretch
+                            if color_stretch == 1:
+                                ov_norm = math.pow(ov_norm, 1.0 / 3.0)
+                            elif color_stretch == 2:
+                                ov_norm = math.log(1.0 + ov_norm * 9.0) / math.log(10.0)
+                            elif color_stretch == 3:
+                                ov_norm = math.sqrt(ov_norm)
+                            ov_idx = int(ov_norm * 255)
+                            if ov_idx > 255:
+                                ov_idx = 255
+                            if ov_idx < 0:
+                                ov_idx = 0
+                            ov_r = color_lut[ov_idx, 0]
+                            ov_g = color_lut[ov_idx, 1]
+                            ov_b = color_lut[ov_idx, 2]
+                            a = overlay_alpha
+                            base_r = base_r * (1.0 - a) + ov_r * a
+                            base_g = base_g * (1.0 - a) + ov_g * a
+                            base_b = base_b * (1.0 - a) + ov_b * a
 
             # Lambertian shading
             cos_theta = nx * sun_dir[0] + ny * sun_dir[1] + nz * sun_dir[2]
@@ -388,39 +473,72 @@ def _shade_terrain_kernel(
             # Final lighting
             diffuse = cos_theta * shadow_factor
             lighting = ambient + (1.0 - ambient) * diffuse
+            # Emissive glow: raise the lighting floor
+            if emissive > 0.0:
+                if lighting < emissive:
+                    lighting = emissive
 
             color_r = base_r * lighting
             color_g = base_g * lighting
             color_b = base_b * lighting
 
-            # Apply viewshed overlay (teal glow on VISIBLE areas only)
+            # Water shader: specular highlight + Fresnel rim
+            if is_water:
+                # Blinn-Phong specular: H = normalize(L + V)
+                vx = -ray_dx
+                vy = -ray_dy
+                vz = -ray_dz
+                hx = sun_dir[0] + vx
+                hy = sun_dir[1] + vy
+                hz = sun_dir[2] + vz
+                h_len = math.sqrt(hx * hx + hy * hy + hz * hz)
+                if h_len > 1e-6:
+                    hx /= h_len
+                    hy /= h_len
+                    hz /= h_len
+                n_dot_h = nx * hx + ny * hy + nz * hz
+                if n_dot_h < 0.0:
+                    n_dot_h = 0.0
+                # Sharp specular exponent for water glints
+                spec = n_dot_h * n_dot_h
+                spec = spec * spec     # ^4
+                spec = spec * spec     # ^8
+                spec = spec * spec     # ^16
+                spec = spec * spec     # ^32
+                spec = spec * spec     # ^64
+                spec *= water_specular * shadow_factor
+
+                # Fresnel-like darkening at steep view angles
+                n_dot_v = abs(nx * vx + ny * vy + nz * vz)
+                fresnel = 0.3 + 0.7 * (1.0 - n_dot_v)
+
+                # Darken base color at steep angles, add specular
+                color_r = color_r * (0.7 + 0.3 * fresnel) + spec
+                color_g = color_g * (0.7 + 0.3 * fresnel) + spec
+                color_b = color_b * (0.7 + 0.3 * fresnel) + spec * 0.9
+
+            # Observer marker removed — drone mesh is placed as scene geometry
+
+            # Viewshed overlay:
+            #  - Terrain: teal glow on visible areas
+            #  - Buildings/geometry: light green tint if in visible area
             if viewshed_enabled:
                 vs_h = viewshed_data.shape[0]
                 vs_w = viewshed_data.shape[1]
-
-                # Draw bright magenta orb at observer location (in world coords)
-                dist_to_obs = math.sqrt((hit_x - observer_x) * (hit_x - observer_x) +
-                                        (hit_y - observer_y) * (hit_y - observer_y))
-                # Scale orb radius with pixel spacing for consistent visual size
-                orb_radius = 2.0 * max(pixel_spacing_x, pixel_spacing_y)
-                if dist_to_obs < orb_radius:
-                    # Bright glowing magenta orb at observer
-                    orb_intensity = 1.0 - (dist_to_obs / orb_radius)
-                    orb_intensity = orb_intensity * orb_intensity  # Squared for sharper glow
-                    color_r = color_r * (1.0 - orb_intensity) + 1.0 * orb_intensity
-                    color_g = color_g * (1.0 - orb_intensity) + 0.0 * orb_intensity
-                    color_b = color_b * (1.0 - orb_intensity) + 1.0 * orb_intensity
-                elif elev_y >= 0 and elev_y < vs_h and elev_x >= 0 and elev_x < vs_w:
+                if elev_y >= 0 and elev_y < vs_h and elev_x >= 0 and elev_x < vs_w:
                     vis_val = viewshed_data[elev_y, elev_x]
-
-                    # Apply teal glow only to VISIBLE areas
                     if not math.isnan(vis_val) and vis_val >= 0.0:
-                        # Visible - teal/cyan glow
                         alpha = viewshed_opacity
-                        color_r = color_r * (1.0 - alpha)
-                        color_g = color_g * (1.0 - alpha) + 0.9 * alpha
-                        color_b = color_b * (1.0 - alpha) + 0.85 * alpha
-                    # else: invisible or NaN - keep original terrain color
+                        if has_color_override:
+                            # Light green for buildings in viewshed
+                            color_r = color_r * (1.0 - alpha) + 0.4 * alpha
+                            color_g = color_g * (1.0 - alpha) + 0.95 * alpha
+                            color_b = color_b * (1.0 - alpha) + 0.3 * alpha
+                        else:
+                            # Teal glow for terrain
+                            color_r = color_r * (1.0 - alpha)
+                            color_g = color_g * (1.0 - alpha) + 0.9 * alpha
+                            color_b = color_b * (1.0 - alpha) + 0.85 * alpha
 
             # Clamp
             if color_r > 1.0:
@@ -451,6 +569,12 @@ def _shade_terrain_kernel(
                 output[py, px, 3] = 0.0
 
 
+# Lazy singletons for dummy GPU arrays (avoid per-frame allocations)
+_DUMMY_1x1 = None
+_DUMMY_1x1x3 = None
+_DUMMY_1x4 = None
+
+
 def _shade_terrain(
     output, primary_rays, primary_hits, shadow_hits,
     elevation_data, color_lut, num_rays, width, height,
@@ -458,21 +582,47 @@ def _shade_terrain(
     fog_density, fog_color,
     elev_min, elev_range, alpha,
     viewshed_data=None, viewshed_opacity=0.6,
-    observer_x=0.0, observer_y=0.0,
-    pixel_spacing_x=1.0, pixel_spacing_y=1.0
+    observer_x=-1e30, observer_y=-1e30,
+    pixel_spacing_x=1.0, pixel_spacing_y=1.0,
+    color_stretch=0,
+    sky_color=(0.0, 0.0, 0.0),
+    rgb_texture=None,
+    overlay_data=None, overlay_alpha=0.5,
+    overlay_min=0.0, overlay_range=1.0,
+    instance_ids=None, geometry_colors=None,
 ):
     """Apply terrain shading with all effects."""
     threadsperblock = 256
     blockspergrid = (num_rays + threadsperblock - 1) // threadsperblock
 
-    # Sky color (light blue)
-    sky_color = (0.6, 0.75, 0.9)
+    global _DUMMY_1x1, _DUMMY_1x1x3, _DUMMY_1x4
 
     # Handle viewshed - need a placeholder if not provided
     viewshed_enabled = viewshed_data is not None
     if not viewshed_enabled:
-        # Create dummy 1x1 array (won't be used)
-        viewshed_data = cupy.zeros((1, 1), dtype=np.float32)
+        if _DUMMY_1x1 is None:
+            _DUMMY_1x1 = cupy.zeros((1, 1), dtype=np.float32)
+        viewshed_data = _DUMMY_1x1
+
+    # Handle RGB texture - need a placeholder if not provided
+    # Dummy is (1,1,3); kernel checks shape[0] > 1 to decide whether to use it
+    if rgb_texture is None:
+        if _DUMMY_1x1x3 is None:
+            _DUMMY_1x1x3 = cupy.zeros((1, 1, 3), dtype=np.float32)
+        rgb_texture = _DUMMY_1x1x3
+
+    # Handle overlay data - dummy (1,1) when not provided
+    # Kernel checks shape[0] > 1 to decide whether to blend
+    if overlay_data is None:
+        if _DUMMY_1x1 is None:
+            _DUMMY_1x1 = cupy.zeros((1, 1), dtype=np.float32)
+        overlay_data = _DUMMY_1x1
+
+    # Handle geometry_colors for per-geometry solid coloring
+    if geometry_colors is None:
+        if _DUMMY_1x4 is None:
+            _DUMMY_1x4 = cupy.zeros((1, 4), dtype=np.float32)
+        geometry_colors = _DUMMY_1x4
 
     _shade_terrain_kernel[blockspergrid, threadsperblock](
         output, primary_rays, primary_hits, shadow_hits,
@@ -483,7 +633,11 @@ def _shade_terrain(
         elev_min, elev_range, alpha,
         viewshed_data, viewshed_enabled, viewshed_opacity,
         observer_x, observer_y,
-        pixel_spacing_x, pixel_spacing_y
+        pixel_spacing_x, pixel_spacing_y,
+        color_stretch,
+        rgb_texture,
+        overlay_data, overlay_alpha, overlay_min, overlay_range,
+        instance_ids, geometry_colors
     )
 
 
@@ -508,6 +662,42 @@ def _save_image(output, output_path):
         img = Image.fromarray(img_data, mode='RGB')
 
     img.save(output_path)
+
+
+class _RenderBuffers:
+    """Reusable GPU buffer pool for the render pipeline."""
+
+    def __init__(self):
+        self._key = None
+        self.primary_rays = None
+        self.primary_hits = None
+        self.shadow_rays = None
+        self.shadow_hits = None
+        self.output = None
+        self.instance_ids = None
+
+    def get(self, width, height, shadows, alpha, need_instance_ids):
+        num_rays = width * height
+        num_channels = 4 if alpha else 3
+        key = (width, height, shadows, alpha)
+        if key != self._key:
+            self.primary_rays = cupy.empty((num_rays, 8), dtype=np.float32)
+            self.primary_hits = cupy.empty((num_rays, 4), dtype=np.float32)
+            self.shadow_rays = cupy.empty((num_rays, 8), dtype=np.float32)
+            self.shadow_hits = cupy.empty((num_rays, 4), dtype=np.float32)
+            self.output = cupy.zeros((height, width, num_channels), dtype=np.float32)
+            self.instance_ids = cupy.full(num_rays, -1, dtype=cupy.int32)
+            self._key = key
+        else:
+            self.output.fill(0)
+            if need_instance_ids:
+                self.instance_ids.fill(-1)
+        return self
+
+
+_render_buffers = _RenderBuffers()
+
+_colormap_lut_cache = {}  # {colormap_name: cupy.ndarray on GPU}
 
 
 def render(
@@ -535,6 +725,14 @@ def render(
     observer_position: Optional[Tuple[float, float]] = None,
     pixel_spacing_x: float = 1.0,
     pixel_spacing_y: float = 1.0,
+    mesh_type: str = 'tin',
+    color_data=None,
+    color_stretch: str = 'linear',
+    sky_color: Tuple[float, float, float] = (0.0, 0.0, 0.0),
+    rgb_texture=None,
+    overlay_data=None,
+    overlay_alpha: float = 0.5,
+    geometry_colors=None,
 ) -> np.ndarray:
     """Render terrain with a perspective camera for movie-quality visualization.
 
@@ -658,10 +856,10 @@ def render(
         # Create a temporary raster with scaled elevations
         scaled_raster = raster.copy(data=scaled_elevation)
         # Don't reuse rtx when scaling - need fresh mesh
-        optix = prepare_mesh(scaled_raster, rtx=None)
+        optix = prepare_mesh(scaled_raster, rtx=None, mesh_type=mesh_type)
     else:
         scaled_raster = raster
-        optix = prepare_mesh(raster, rtx)
+        optix = prepare_mesh(raster, rtx, mesh_type=mesh_type)
 
     # Scale camera position and look_at z coordinates
     scaled_camera_position = (
@@ -690,26 +888,38 @@ def render(
     sun_dir = get_sun_dir(sun_altitude, sun_azimuth)
     d_sun_dir = cupy.array(sun_dir, dtype=np.float32)
 
-    # Color lookup table
-    color_lut = _get_colormap_lut(colormap)
-    d_color_lut = cupy.array(color_lut, dtype=np.float32)
+    # Color lookup table (cached on GPU)
+    if colormap not in _colormap_lut_cache:
+        color_lut = _get_colormap_lut(colormap)
+        _colormap_lut_cache[colormap] = cupy.array(color_lut, dtype=np.float32)
+    d_color_lut = _colormap_lut_cache[colormap]
+
+    # Determine which data drives the colormap lookup.
+    # color_data overrides elevation_data for coloring (e.g. landcover on terrain).
+    if color_data is not None:
+        if not isinstance(color_data, cupy.ndarray):
+            colormap_data = cupy.asarray(color_data, dtype=cupy.float32)
+        else:
+            colormap_data = color_data.astype(cupy.float32)
+    else:
+        colormap_data = elevation_data
 
     # Elevation range for colormap
     if color_range is not None:
         elev_min, elev_max = color_range
     else:
-        elev_min = float(cupy.nanmin(elevation_data))
-        elev_max = float(cupy.nanmax(elevation_data))
+        elev_min = float(cupy.nanmin(colormap_data))
+        elev_max = float(cupy.nanmax(colormap_data))
     elev_range = elev_max - elev_min
 
-    # Allocate buffers
-    d_primary_rays = cupy.empty((num_rays, 8), dtype=np.float32)
-    d_primary_hits = cupy.empty((num_rays, 4), dtype=np.float32)
-    d_shadow_rays = cupy.empty((num_rays, 8), dtype=np.float32)
-    d_shadow_hits = cupy.empty((num_rays, 4), dtype=np.float32)
-
-    num_channels = 4 if alpha else 3
-    d_output = cupy.zeros((height, width, num_channels), dtype=np.float32)
+    # Allocate (or reuse) buffers
+    bufs = _render_buffers.get(width, height, shadows, alpha,
+                               geometry_colors is not None)
+    d_primary_rays = bufs.primary_rays
+    d_primary_hits = bufs.primary_hits
+    d_shadow_rays = bufs.shadow_rays
+    d_shadow_hits = bufs.shadow_hits
+    d_output = bufs.output
 
     device = cupy.cuda.Device(0)
 
@@ -720,8 +930,12 @@ def render(
     )
     device.synchronize()
 
-    # Step 2: Trace primary rays
-    optix.trace(d_primary_rays, d_primary_hits, num_rays)
+    # Step 2: Trace primary rays (with instance_ids if geometry_colors provided)
+    d_instance_ids = bufs.instance_ids
+    if geometry_colors is not None:
+        optix.trace(d_primary_rays, d_primary_hits, num_rays, instance_ids=d_instance_ids)
+    else:
+        optix.trace(d_primary_rays, d_primary_hits, num_rays)
 
     # Step 3: Generate and trace shadow rays (if enabled)
     if shadows:
@@ -748,20 +962,43 @@ def render(
             d_viewshed = vs_data.astype(np.float32)
 
 
-    # Get observer position for viewshed marker
-    obs_x = float(observer_position[0]) if observer_position else 0.0
-    obs_y = float(observer_position[1]) if observer_position else 0.0
+    # Get observer position for marker orb (sentinel = no observer placed)
+    obs_x = float(observer_position[0]) if observer_position else -1e30
+    obs_y = float(observer_position[1]) if observer_position else -1e30
+
+    # Color stretch mode: string -> int for CUDA kernel
+    _stretch_modes = {'linear': 0, 'cbrt': 1, 'log': 2, 'sqrt': 3}
+    stretch_int = _stretch_modes.get(color_stretch, 0)
+
+    # Prepare overlay data for transparent blending
+    d_overlay = None
+    ov_min = 0.0
+    ov_range = 1.0
+    if overlay_data is not None:
+        if not isinstance(overlay_data, cupy.ndarray):
+            d_overlay = cupy.asarray(overlay_data, dtype=cupy.float32)
+        else:
+            d_overlay = overlay_data if overlay_data.dtype == cupy.float32 else overlay_data.astype(cupy.float32)
+        ov_min = float(cupy.nanmin(d_overlay))
+        ov_max = float(cupy.nanmax(d_overlay))
+        ov_range = ov_max - ov_min
 
     # Step 4: Shade terrain
     _shade_terrain(
         d_output, d_primary_rays, d_primary_hits, d_shadow_hits,
-        elevation_data, d_color_lut, num_rays, width, height,
+        colormap_data, d_color_lut, num_rays, width, height,
         d_sun_dir, ambient, shadows,
         fog_density, fog_color,
         elev_min, elev_range, alpha,
         d_viewshed, viewshed_opacity,
         obs_x, obs_y,
-        pixel_spacing_x, pixel_spacing_y
+        pixel_spacing_x, pixel_spacing_y,
+        stretch_int,
+        sky_color=sky_color,
+        rgb_texture=rgb_texture,
+        overlay_data=d_overlay, overlay_alpha=overlay_alpha,
+        overlay_min=ov_min, overlay_range=ov_range,
+        instance_ids=d_instance_ids, geometry_colors=geometry_colors,
     )
     device.synchronize()
 
@@ -771,10 +1008,5 @@ def render(
     # Save image if requested
     if output_path is not None:
         _save_image(output, output_path)
-
-    # Clean up
-    del d_primary_rays, d_primary_hits, d_shadow_rays, d_shadow_hits
-    del d_output, d_camera_pos, d_forward, d_right, d_up, d_sun_dir, d_color_lut
-    cupy.get_default_memory_pool().free_all_blocks()
 
     return output

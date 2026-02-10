@@ -117,8 +117,23 @@ def _calc_viewshed(hits, visibility_grid, H, W):
     return 0
 
 
-def _viewshed_rt(raster, optix, x, y, observer_elev, target_elev):
-    """Internal function to perform viewshed ray tracing."""
+def _viewshed_rt(raster, optix, x, y, observer_elev, target_elev,
+                  pixel_spacing_x=1.0, pixel_spacing_y=1.0,
+                  between_traces_cb=None):
+    """Internal function to perform viewshed ray tracing.
+
+    Parameters
+    ----------
+    pixel_spacing_x, pixel_spacing_y : float
+        World-space spacing per pixel.  When the terrain mesh has been built
+        with pixel_spacing applied (as in the interactive viewer), these must
+        match so the orthographic primary rays land on the mesh.
+    between_traces_cb : callable, optional
+        Called after the first trace (terrain surface detection) and before
+        the second trace (occlusion check).  Use this to change geometry
+        visibility so that the first trace hits only terrain while the
+        second trace includes buildings / structures.
+    """
     xr = _lazy_import_xarray()
 
     H, W = raster.shape
@@ -148,9 +163,21 @@ def _viewshed_rt(raster, optix, x, y, observer_elev, target_elev):
     d_vsrays = cupy.empty((H, W, 8), np.float32)
 
     generate_primary_rays(d_rays, x_coords, y_coords, H, W)
+
+    # Scale ray origins from pixel space to world space so they intersect
+    # the terrain mesh when it has been built with pixel_spacing applied.
+    if pixel_spacing_x != 1.0 or pixel_spacing_y != 1.0:
+        d_rays[:, :, 0] *= pixel_spacing_x
+        d_rays[:, :, 1] *= pixel_spacing_y
+
     device = cupy.cuda.Device(0)
     device.synchronize()
     optix.trace(d_rays, d_hits, W * H)
+
+    # Allow caller to change visibility between the two traces so
+    # buildings/structures occlude the viewshed rays.
+    if between_traces_cb is not None:
+        between_traces_cb()
 
     vp = (x_view, y_view, observer_elev, target_elev)
     _generate_viewshed_rays(d_rays, d_hits, d_vsrays, d_visgrid, H, W, vp)
@@ -237,5 +264,11 @@ def viewshed(raster,
     if not isinstance(raster.data, cupy.ndarray):
         raise ValueError("raster.data must be a cupy array")
 
-    optix = prepare_mesh(raster, rtx)
+    # If an RTX with existing geometries is provided (multi-GAS scene),
+    # use it directly so viewshed rays are occluded by all scene geometry.
+    # Only build a terrain-only mesh when no RTX is given.
+    if rtx is not None and rtx.get_geometry_count() > 0:
+        optix = rtx
+    else:
+        optix = prepare_mesh(raster, rtx)
     return _viewshed_rt(raster, optix, x, y, observer_elev, target_elev)
