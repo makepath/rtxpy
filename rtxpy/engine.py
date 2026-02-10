@@ -52,6 +52,7 @@ class InteractiveViewer:
     - Y: Cycle color stretch (linear, sqrt, cbrt, log)
     - T: Toggle shadows
     - C: Cycle colormap
+    - Shift+F: Fetch/toggle FIRMS fire layer (7d LANDSAT 30m)
     - Shift+W: Toggle wind particle animation
     - F: Save screenshot
     - M: Toggle minimap overlay
@@ -274,6 +275,11 @@ class InteractiveViewer:
         self._minimap_background = None
         self._minimap_scale_x = 1.0
         self._minimap_scale_y = 1.0
+
+        # FIRMS fire layer state
+        self._accessor = None         # RTX accessor for place_geojson
+        self._firms_loaded = False    # Whether fire data has been fetched
+        self._firms_visible = False   # Current visibility state
 
         # Wind particle state
         self._wind_data = None        # Raw wind dict from fetch_wind()
@@ -990,6 +996,98 @@ class InteractiveViewer:
         print(f"Wind particles: {'ON' if self._wind_enabled else 'OFF'}")
         self._update_frame()
 
+    def _toggle_firms(self):
+        """Fetch and toggle NASA FIRMS LANDSAT fire footprints (Shift+F)."""
+        if self._accessor is None:
+            print("No accessor available for FIRMS fire layer.")
+            return
+
+        if not self._firms_loaded:
+            # First press: fetch + place
+            print("Fetching FIRMS fire data (7d LANDSAT)...")
+            try:
+                from .remote_data import fetch_firms
+                from .tiles import _build_latlon_grids
+                import warnings
+
+                # Get WGS84 bounds from the raster
+                lats, lons = _build_latlon_grids(self._base_raster)
+                bounds = (
+                    float(lons.min()), float(lats.min()),
+                    float(lons.max()), float(lats.max()),
+                )
+
+                # Detect CRS for reprojection
+                crs = None
+                try:
+                    raster_crs = self._base_raster.rio.crs
+                    if raster_crs is not None and not raster_crs.is_geographic:
+                        crs = str(raster_crs)
+                except (AttributeError, ImportError):
+                    pass
+
+                fire_data = fetch_firms(bounds, date_span='7d', crs=crs)
+
+                n_fires = len(fire_data.get('features', []))
+                if n_fires == 0:
+                    print("No fire detections in the last 7 days.")
+                    self._firms_loaded = True
+                    return
+
+                with warnings.catch_warnings():
+                    warnings.filterwarnings(
+                        "ignore", message="place_geojson called before")
+                    self._accessor.place_geojson(
+                        fire_data,
+                        height=max(self.pixel_spacing_x,
+                                   self.pixel_spacing_y) * 0.5,
+                        geometry_id='fire',
+                        color=(1.0, 0.25, 0.0, 3.0),
+                        extrude=True,
+                        merge=True,
+                    )
+
+                self._firms_loaded = True
+                self._firms_visible = True
+
+                # Ensure geometry color builder is active
+                if (self._geometry_colors_builder is None
+                        and self._accessor._geometry_colors):
+                    self._geometry_colors_builder = (
+                        self._accessor._build_geometry_colors_gpu)
+
+                # Refresh geometry layer tracking
+                if self.rtx is not None:
+                    self._all_geometries = self.rtx.list_geometries()
+                    groups = set()
+                    for g in self._all_geometries:
+                        parts = g.rsplit('_', 1)
+                        if len(parts) == 2 and parts[1].isdigit():
+                            base = parts[0]
+                        else:
+                            base = g
+                        if base != 'terrain':
+                            groups.add(base)
+                    self._geometry_layer_order = (
+                        ['none', 'all'] + sorted(groups))
+
+                print(f"FIRMS fire: ON  ({n_fires} detections)")
+                self._update_frame()
+
+            except Exception as e:
+                print(f"FIRMS fire fetch failed: {e}")
+            return
+
+        # Subsequent presses: toggle visibility
+        self._firms_visible = not self._firms_visible
+        if self.rtx is not None:
+            for geom_id in self.rtx.list_geometries():
+                if geom_id.startswith('fire'):
+                    self.rtx.set_geometry_visible(
+                        geom_id, self._firms_visible)
+        print(f"FIRMS fire: {'ON' if self._firms_visible else 'OFF'}")
+        self._update_frame()
+
     def _init_wind(self, wind_data):
         """Interpolate wind U/V from lat/lon grid onto the terrain pixel grid.
 
@@ -1328,6 +1426,11 @@ class InteractiveViewer:
         # Snap camera to drone: Shift+V
         if raw_key == 'V':
             self._snap_to_drone()
+            return
+
+        # FIRMS fire layer: Shift+F (before 'f' screenshot)
+        if raw_key == 'F':
+            self._toggle_firms()
             return
 
         # Wind toggle: Shift+W (before movement keys capture 'w')
@@ -2696,8 +2799,11 @@ class InteractiveViewer:
             "  V        Toggle viewshed\n"
             "  [ / ]    Observer height down / up\n"
             "\n"
-            "OTHER\n"
+            "DATA LAYERS\n"
+            "  Shift+F  FIRMS fire (7d)\n"
             "  Shift+W  Toggle wind\n"
+            "\n"
+            "OTHER\n"
             "  F        Screenshot\n"
             "  M        Toggle minimap\n"
             "  H        Toggle this help\n"
@@ -2773,7 +2879,8 @@ def explore(raster, width: int = 800, height: int = 600,
             geometry_colors_builder=None,
             baked_meshes=None,
             subsample: int = 1,
-            wind_data=None):
+            wind_data=None,
+            accessor=None):
     """
     Launch an interactive terrain viewer.
 
@@ -2809,6 +2916,9 @@ def explore(raster, width: int = 800, height: int = 600,
         Y spacing between pixels in world units. Default 1.0.
     mesh_type : str, optional
         Mesh generation method: 'tin' or 'voxel'. Default is 'tin'.
+    accessor : RTXAccessor, optional
+        RTX accessor instance for on-demand data fetching (e.g. FIRMS fire
+        layer via Shift+F).
     wind_data : dict, optional
         Wind data from ``fetch_wind()``. If provided, Shift+W toggles
         wind particle animation.
@@ -2843,8 +2953,9 @@ def explore(raster, width: int = 800, height: int = 600,
     - Y: Cycle color stretch (linear, sqrt, cbrt, log)
     - T: Toggle shadows
     - C: Cycle colormap
-    - F: Save screenshot
+    - Shift+F: Fetch/toggle FIRMS fire layer (7d LANDSAT 30m)
     - Shift+W: Toggle wind particle animation
+    - F: Save screenshot
     - M: Toggle minimap overlay
     - H: Toggle help overlay
     - X: Exit
@@ -2875,6 +2986,7 @@ def explore(raster, width: int = 800, height: int = 600,
     )
     viewer._geometry_colors_builder = geometry_colors_builder
     viewer._baked_meshes = baked_meshes or {}
+    viewer._accessor = accessor
     viewer.color_stretch = color_stretch
     if color_stretch in viewer._color_stretches:
         viewer._color_stretch_idx = viewer._color_stretches.index(color_stretch)

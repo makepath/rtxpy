@@ -1578,6 +1578,7 @@ class RTXAccessor:
             baked_meshes=self._baked_meshes if self._baked_meshes else None,
             subsample=subsample,
             wind_data=wind_data,
+            accessor=self,
         )
 
     def memory_usage(self):
@@ -1924,6 +1925,7 @@ class RTXDatasetAccessor:
             baked_meshes=terrain_da.rtx._baked_meshes if terrain_da.rtx._baked_meshes else None,
             subsample=subsample,
             wind_data=wind_data,
+            accessor=terrain_da.rtx,
         )
 
     def place_tiles(self, url='osm', z=None, zoom=None):

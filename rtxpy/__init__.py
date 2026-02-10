@@ -22,7 +22,7 @@ __version__ = "0.0.5"
 
 # Optional convenience — network helpers with lazy dependency checks
 try:
-    from .remote_data import fetch_dem, fetch_osm, fetch_buildings, fetch_roads, fetch_water, fetch_wind
+    from .remote_data import fetch_dem, fetch_osm, fetch_buildings, fetch_roads, fetch_water, fetch_wind, fetch_firms
 except ImportError:
     pass
 

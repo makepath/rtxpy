@@ -1,9 +1,9 @@
-"""Download remote geospatial data: DEM tiles, OSM features, buildings, roads, and water.
+"""Download remote geospatial data: DEM tiles, OSM features, buildings, roads, water, and fire.
 
 Supports Copernicus GLO-30, USGS SRTM 1-arc-second, and USGS 3DEP
 1-meter DEM sources, OpenStreetMap vector features via osmnx,
-Microsoft Global ML Building Footprints, and convenience wrappers
-for roads and water features.
+Microsoft Global ML Building Footprints, convenience wrappers
+for roads and water features, and NASA FIRMS fire detection footprints.
 
 All network dependencies (``requests``, ``rioxarray``, ``osmnx``,
 ``pandas``, ``geopandas``, ``shapely``) are optional and imported
@@ -821,3 +821,249 @@ def fetch_wind(bounds, grid_size=20):
         "lats": lats,
         "lons": lons,
     }
+
+
+# ---------------------------------------------------------------------------
+# NASA FIRMS fire detection footprints
+# ---------------------------------------------------------------------------
+
+_FIRMS_BASE_URL = "https://firms.modaps.eosdis.nasa.gov/api/kml_fire_footprints"
+
+# Approximate WGS84 bounding boxes for each FIRMS region
+_FIRMS_REGION_BOUNDS = {
+    "canada":                     (-141, 41, -52, 84),
+    "alaska":                     (-180, 51, -130, 72),
+    "usa_contiguous_and_hawaii":  (-180, 18, -66, 50),
+    "central_america":            (-118, 7, -60, 33),
+    "south_america":              (-82, -56, -34, 13),
+    "europe":                     (-25, 35, 45, 72),
+    "northern_and_central_africa":(-18, -5, 52, 38),
+    "southern_africa":            (8, -35, 52, 5),
+    "russia_asia":                (26, 35, 180, 82),
+    "south_asia":                 (60, 5, 100, 40),
+    "southeast_asia":             (92, -11, 162, 28),
+    "australia_newzealand":       (112, -48, 180, -10),
+}
+
+
+def _firms_regions_for_bounds(bounds):
+    """Return FIRMS region names whose bounding box overlaps *bounds*."""
+    west, south, east, north = bounds
+    regions = []
+    for name, (rw, rs, re, rn) in _FIRMS_REGION_BOUNDS.items():
+        if west <= re and east >= rw and south <= rn and north >= rs:
+            regions.append(name)
+    return regions
+
+
+def _parse_kml_fire_footprints(kml_bytes, bounds=None):
+    """Parse fire footprint Placemarks from KML bytes into GeoJSON features.
+
+    Each Placemark may contain a Polygon (footprint) or Point (centroid).
+    Only Polygon placemarks are returned.  If *bounds* is given, features
+    are filtered to the bounding box.
+    """
+    import xml.etree.ElementTree as ET
+
+    root = ET.fromstring(kml_bytes)
+    # KML namespace
+    ns = ""
+    if root.tag.startswith("{"):
+        ns = root.tag.split("}")[0] + "}"
+
+    features = []
+    for pm in root.iter(f"{ns}Placemark"):
+        # Look for Polygon geometry
+        poly_el = pm.find(f".//{ns}Polygon")
+        if poly_el is None:
+            continue
+
+        coords_el = poly_el.find(
+            f".//{ns}outerBoundaryIs/{ns}LinearRing/{ns}coordinates"
+        )
+        if coords_el is None or not coords_el.text:
+            continue
+
+        # Parse "lon,lat,alt lon,lat,alt ..." into coordinate ring
+        ring = []
+        for triplet in coords_el.text.strip().split():
+            parts = triplet.split(",")
+            lon, lat = float(parts[0]), float(parts[1])
+            ring.append([lon, lat])
+
+        if not ring:
+            continue
+
+        # Filter by bounding box if provided
+        if bounds is not None:
+            west, south, east, north = bounds
+            if not any(west <= c[0] <= east and south <= c[1] <= north
+                       for c in ring):
+                continue
+
+        # Extract name / description as properties
+        props = {}
+        name_el = pm.find(f"{ns}name")
+        if name_el is not None and name_el.text:
+            props["name"] = name_el.text.strip()
+        desc_el = pm.find(f"{ns}description")
+        if desc_el is not None and desc_el.text:
+            desc = desc_el.text.strip()
+            props["description"] = desc
+            # Parse structured HTML fields like "<b>Key: </b> Value<br/>"
+            for m in re.finditer(
+                r"<b>\s*([^<:]+?)\s*:\s*</b>\s*([^<]+)", desc
+            ):
+                key = m.group(1).strip().lower().replace(" ", "_")
+                val = m.group(2).strip()
+                props[key] = val
+
+        features.append({
+            "type": "Feature",
+            "geometry": {
+                "type": "Polygon",
+                "coordinates": [ring],
+            },
+            "properties": props,
+        })
+
+    return features
+
+
+def fetch_firms(bounds, date_span="24h", region=None, cache_path=None,
+                crs=None):
+    """Download NASA FIRMS LANDSAT 30 m fire detection footprints.
+
+    Fetches fire footprint polygons from the `FIRMS KML fire footprints
+    API <https://firms.modaps.eosdis.nasa.gov/api/kml_fire_footprints/>`_
+    using the LANDSAT sensor (30 m resolution).
+
+    Parameters
+    ----------
+    bounds : tuple of float
+        (west, south, east, north) in WGS84 degrees.
+    date_span : str
+        Time window: ``'24h'``, ``'48h'``, ``'72h'``, or ``'7d'``.
+        Default ``'24h'``.
+    region : str, optional
+        FIRMS region name (e.g. ``'usa_contiguous_and_hawaii'``).
+        If ``None``, the region is auto-detected from *bounds*.
+        When bounds span multiple regions, all matching regions are
+        queried.
+    cache_path : str or Path, optional
+        Path to cache the final GeoJSON result.  If the file already
+        exists, loads and returns it directly.
+    crs : str, optional
+        Target CRS for reprojection (e.g. ``'EPSG:32611'``).
+        ``None`` keeps WGS84.
+
+    Returns
+    -------
+    dict
+        GeoJSON FeatureCollection.  Each feature is a 30 m fire
+        detection polygon with ``name`` and ``description`` properties
+        from the FIRMS KML.
+
+    Examples
+    --------
+    >>> from rtxpy import fetch_firms
+    >>> fires = fetch_firms((-118.6, 34.0, -118.1, 34.3), date_span='7d')
+    >>> dem.rtx.place_geojson(fires, height=50.0, color='red')
+    """
+    import json
+    import zipfile
+    import io
+
+    try:
+        import requests
+    except ImportError:
+        raise ImportError(
+            "requests is required for fetch_firms(). "
+            "Install it with: pip install requests"
+        )
+
+    if cache_path is not None:
+        cache_path = Path(cache_path)
+        if cache_path.exists():
+            print(f"Using cached FIRMS data: {cache_path.name}")
+            with open(cache_path) as f:
+                return json.load(f)
+
+    valid_spans = ("24h", "48h", "72h", "7d")
+    if date_span not in valid_spans:
+        raise ValueError(
+            f"Unknown date_span {date_span!r}; use one of {valid_spans}"
+        )
+
+    # Determine which FIRMS region(s) to query
+    if region is not None:
+        if region not in _FIRMS_REGION_BOUNDS:
+            raise ValueError(
+                f"Unknown FIRMS region {region!r}; choose from: "
+                + ", ".join(sorted(_FIRMS_REGION_BOUNDS))
+            )
+        regions = [region]
+    else:
+        regions = _firms_regions_for_bounds(bounds)
+        if not regions:
+            print("No FIRMS region covers the given bounding box")
+            return {"type": "FeatureCollection", "features": []}
+
+    print(f"Fetching FIRMS LANDSAT fire footprints ({date_span}) "
+          f"for {len(regions)} region(s)...")
+
+    all_features = []
+    for rgn in regions:
+        url = (f"{_FIRMS_BASE_URL}/?region={rgn}"
+               f"&date_span={date_span}&sensor=landsat")
+        print(f"  Downloading {rgn}...")
+        try:
+            resp = requests.get(url, timeout=120)
+            resp.raise_for_status()
+        except Exception as e:
+            print(f"  Warning: Failed to download {rgn}: {e}")
+            continue
+
+        # KMZ is a zip archive containing a .kml file
+        try:
+            with zipfile.ZipFile(io.BytesIO(resp.content)) as zf:
+                kml_names = [n for n in zf.namelist()
+                             if n.lower().endswith(".kml")]
+                if not kml_names:
+                    print(f"  Warning: No KML found in {rgn} KMZ")
+                    continue
+                kml_bytes = zf.read(kml_names[0])
+        except zipfile.BadZipFile:
+            # Response might be raw KML (not zipped)
+            kml_bytes = resp.content
+
+        features = _parse_kml_fire_footprints(kml_bytes, bounds=bounds)
+        all_features.extend(features)
+        print(f"    {len(features)} fire footprints in bounding box")
+
+    print(f"  Total: {len(all_features)} fire footprints")
+
+    # Reproject if requested
+    if crs is not None and all_features:
+        try:
+            import geopandas as gpd
+        except ImportError:
+            raise ImportError(
+                "geopandas is required for CRS reprojection. "
+                "Install with: pip install geopandas"
+            )
+        gdf = gpd.GeoDataFrame.from_features(all_features, crs="EPSG:4326")
+        gdf = gdf.to_crs(crs)
+        print(f"  Reprojected to {crs}")
+        geojson = json.loads(gdf.to_json())
+    else:
+        geojson = {"type": "FeatureCollection", "features": all_features}
+
+    # Cache result
+    if cache_path is not None:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(cache_path, "w") as f:
+            json.dump(geojson, f)
+        print(f"  Cached to {cache_path}")
+
+    return geojson

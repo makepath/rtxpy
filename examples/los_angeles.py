@@ -1,11 +1,10 @@
 """Interactive playground for Los Angeles, California.
 
 Explore the terrain of Los Angeles using GPU-accelerated ray tracing.
-The area covers from Santa Monica and the Pacific coast east through
-Hollywood Hills, Griffith Park, and downtown LA to the San Gabriel
-foothills and Pasadena.
+The area covers downtown LA, Echo Park, Silver Lake, Elysian Park,
+Griffith Park, the Hollywood Hills, and the Hollywood Sign.
 
-Elevation data is sourced from the Copernicus GLO-30 DEM (30 m).
+Elevation data is sourced from USGS 3DEP 1-meter lidar DEM.
 
 Builds an xr.Dataset with elevation, slope, aspect, and quantile layers.
 Press G to cycle between layers. Satellite tiles are draped on the terrain
@@ -23,7 +22,7 @@ import xarray as xr
 from xrspatial import slope, aspect, quantile
 from pathlib import Path
 
-from rtxpy import fetch_dem, fetch_buildings, fetch_roads, fetch_water
+from rtxpy import fetch_dem, fetch_buildings, fetch_roads, fetch_water, fetch_firms
 import rtxpy
 
 # Water feature classification
@@ -31,9 +30,9 @@ _MAJOR_WATER = {'river', 'canal'}
 _MINOR_WATER = {'stream', 'drain', 'ditch'}
 
 # Los Angeles bounding box (WGS84)
-# Covers Santa Monica / Pacific Palisades in the west to Pasadena / San Gabriel
-# foothills in the east, including Hollywood Hills, Griffith Park, and DTLA.
-BOUNDS = (-118.55, 33.90, -118.15, 34.20)
+# Focused area covering DTLA, Echo Park, Silver Lake, Griffith Park,
+# Hollywood Hills, and the Hollywood Sign (~8 km × 8 km at 1 m resolution).
+BOUNDS = (-118.32, 34.04, -118.23, 34.12)
 CRS = 'EPSG:32611'  # UTM zone 11N
 
 
@@ -44,12 +43,13 @@ def load_terrain():
     terrain = fetch_dem(
         bounds=BOUNDS,
         output_path=dem_path,
-        source='copernicus',
+        source='usgs_1m',
         crs=CRS,
     )
 
-    # Scale down elevation for visualization
-    terrain.data = terrain.data * 0.025
+    # Scale elevation for visualization (1 m pixels need less reduction
+    # than 30 m Copernicus data to keep a similar visual slope ratio)
+    terrain.data = terrain.data * 0.5
 
     # Ensure contiguous array before GPU transfer
     terrain.data = np.ascontiguousarray(terrain.data)
@@ -99,7 +99,7 @@ if __name__ == "__main__":
 
     # Drape satellite tiles on terrain (reprojected to match DEM CRS)
     print("Loading satellite tiles...")
-    ds.rtx.place_tiles('satellite', z='elevation')
+    ds.rtx.place_tiles('satellite', z='elevation', zoom=15)
 
     # --- Microsoft Global Building Footprints --------------------------------
     try:
@@ -109,10 +109,10 @@ if __name__ == "__main__":
             cache_path=bldg_cache,
         )
 
-        # Scale building heights to match the 0.025× terrain elevation.
+        # Scale building heights to match the 0.5× terrain elevation.
         # MS data has height in metres (-1 = unknown); replace unknowns
         # with a reasonable default and apply the same scale factor.
-        elev_scale = 0.025
+        elev_scale = 0.5
         default_height_m = 8.0
         for feat in bldg_data.get("features", []):
             props = feat.get("properties", {})
@@ -252,6 +252,32 @@ if __name__ == "__main__":
 
     except ImportError as e:
         print(f"Skipping water features: {e}")
+
+    # --- NASA FIRMS fire detections (LANDSAT 30 m, last 7 days) -----------
+    try:
+        fire_cache = Path(__file__).parent / "los_angeles_fires.geojson"
+        fire_data = fetch_firms(
+            bounds=BOUNDS,
+            date_span='7d',
+            cache_path=fire_cache,
+            crs=CRS,
+        )
+        if fire_data.get('features'):
+            elev_scale = 0.5
+            with warnings.catch_warnings():
+                warnings.filterwarnings("ignore", message="place_geojson called before")
+                fire_info = ds.rtx.place_geojson(
+                    fire_data, z='elevation', height=20 * elev_scale,
+                    geometry_id='fire',
+                    color=(1.0, 0.25, 0.0, 3.0),
+                    extrude=True,
+                    merge=True,
+                )
+            print(f"Placed {fire_info['geometries']} fire detection footprints")
+        else:
+            print("No fire detections in the last 7 days")
+    except Exception as e:
+        print(f"Skipping fire layer: {e}")
 
     # --- Wind data --------------------------------------------------------
     wind = None

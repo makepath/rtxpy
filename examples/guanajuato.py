@@ -24,7 +24,7 @@ from xrspatial import slope, aspect, quantile
 from pathlib import Path
 
 # Import rtxpy to register the .rtx accessor
-from rtxpy import fetch_dem, fetch_buildings, fetch_roads, fetch_water
+from rtxpy import fetch_dem, fetch_buildings, fetch_roads, fetch_water, fetch_firms
 import rtxpy
 
 # Water feature classification
@@ -250,6 +250,32 @@ if __name__ == "__main__":
 
     except ImportError as e:
         print(f"Skipping water features: {e}")
+
+    # --- NASA FIRMS fire detections (LANDSAT 30 m, last 7 days) -----------
+    try:
+        fire_cache = Path(__file__).parent / "guanajuato_fires.geojson"
+        fire_data = fetch_firms(
+            bounds=(-101.50, 20.70, -100.50, 21.30),
+            date_span='7d',
+            cache_path=fire_cache,
+            crs='EPSG:32614',
+        )
+        if fire_data.get('features'):
+            elev_scale = 0.025
+            with warnings.catch_warnings():
+                warnings.filterwarnings("ignore", message="place_geojson called before")
+                fire_info = ds.rtx.place_geojson(
+                    fire_data, z='elevation', height=20 * elev_scale,
+                    geometry_id='fire',
+                    color=(1.0, 0.25, 0.0, 3.0),
+                    extrude=True,
+                    merge=True,
+                )
+            print(f"Placed {fire_info['geometries']} fire detection footprints")
+        else:
+            print("No fire detections in the last 7 days")
+    except Exception as e:
+        print(f"Skipping fire layer: {e}")
 
     # --- Wind data --------------------------------------------------------
     wind = None
