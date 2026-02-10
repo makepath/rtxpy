@@ -1475,8 +1475,21 @@ class InteractiveViewer:
         right = np.cross(world_up, front)
         return right / (np.linalg.norm(right) + 1e-8)
 
+    def _clamp_drone_pos(self, pos):
+        """Clamp drone position to stay within terrain extent and above surface."""
+        H, W = self.terrain_shape
+        x_max = (W - 1) * self.pixel_spacing_x
+        y_max = (H - 1) * self.pixel_spacing_y
+        pos[0] = np.clip(pos[0], 0, x_max)
+        pos[1] = np.clip(pos[1], 0, y_max)
+        terrain_z = self._get_terrain_z(pos[0], pos[1])
+        if pos[2] < terrain_z:
+            pos[2] = terrain_z
+        return pos
+
     def _sync_drone_from_pos(self, pos):
         """Update observer position and drone mesh from a 3D position."""
+        pos = self._clamp_drone_pos(pos)
         self._observer_position = (float(pos[0]), float(pos[1]))
         self.viewshed_observer_elev = float(pos[2]) - self._get_terrain_z(
             pos[0], pos[1])

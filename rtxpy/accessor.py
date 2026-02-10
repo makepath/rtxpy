@@ -1422,7 +1422,7 @@ class RTXAccessor:
             rtx=rtx,  # User can override, but default None creates fresh instance
         )
 
-    def place_tiles(self, url='osm'):
+    def place_tiles(self, url='osm', zoom=None):
         """Drape XYZ map tiles on terrain. Call before explore().
 
         Downloads map tiles in the background and composites them into an
@@ -1436,6 +1436,8 @@ class RTXAccessor:
             Provider name or custom URL template with {z}/{x}/{y} placeholders.
             Built-in providers: 'osm', 'satellite', 'topo'.
             Default is 'osm' (OpenStreetMap).
+        zoom : int, optional
+            Tile zoom level (0–19). If ``None``, defaults to 13.
 
         Returns
         -------
@@ -1444,7 +1446,7 @@ class RTXAccessor:
         """
         from .tiles import XYZTileService
         self._tile_service = XYZTileService(
-            url_template=url, raster=self._obj,
+            url_template=url, raster=self._obj, zoom=zoom,
         )
         self._tile_service.fetch_visible_tiles()
         return self._tile_service
@@ -1924,7 +1926,7 @@ class RTXDatasetAccessor:
             wind_data=wind_data,
         )
 
-    def place_tiles(self, url='osm', z=None):
+    def place_tiles(self, url='osm', z=None, zoom=None):
         """Drape XYZ map tiles on terrain. Call before explore().
 
         Downloads map tiles in the background and composites them into an
@@ -1942,6 +1944,8 @@ class RTXDatasetAccessor:
             Name of the Dataset variable to use as the spatial reference
             for tile reprojection (CRS, bounds, shape). If None, uses the
             first data variable.
+        zoom : int, optional
+            Tile zoom level (0–19). If ``None``, defaults to 13.
 
         Returns
         -------
@@ -1953,7 +1957,7 @@ class RTXDatasetAccessor:
             z = list(self._obj.data_vars)[0]
         raster = self._obj[z]
         self._tile_service = XYZTileService(
-            url_template=url, raster=raster,
+            url_template=url, raster=raster, zoom=zoom,
         )
         self._tile_service.fetch_visible_tiles()
         return self._tile_service

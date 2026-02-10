@@ -214,9 +214,11 @@ class XYZTileService:
         template containing ``{z}``, ``{x}``, ``{y}`` placeholders.
     raster : xarray.DataArray
         Terrain raster — used to determine bounds, shape, and CRS.
+    zoom : int, optional
+        Tile zoom level (0–19). If ``None``, defaults to 13.
     """
 
-    def __init__(self, url_template, raster):
+    def __init__(self, url_template, raster, zoom=None):
         # Resolve provider name -> URL template
         if url_template in TILE_PROVIDERS:
             self.provider_name = url_template
@@ -243,8 +245,7 @@ class XYZTileService:
         self._lon_min = float(np.nanmin(self._lons))
         self._lon_max = float(np.nanmax(self._lons))
 
-        # Fixed zoom level — always use level 12
-        self._zoom = 13
+        self._zoom = zoom if zoom is not None else 13
 
         print(f"  Tile service: zoom {self._zoom}, "
               f"bounds ({self._lat_min:.4f}, {self._lon_min:.4f}) - "
@@ -318,8 +319,6 @@ class XYZTileService:
         self._lat_max = float(np.nanmax(self._lats))
         self._lon_min = float(np.nanmin(self._lons))
         self._lon_max = float(np.nanmax(self._lons))
-
-        self._zoom = 13
 
         with self._lock:
             self._rgb_texture = np.zeros((H, W, 3), dtype=np.float32)
