@@ -27,9 +27,9 @@ class RTXAccessor:
     def __init__(self, xarray_obj):
         self._obj = xarray_obj
         self._rtx_instance = None
-        # Track pixel spacing for coordinate conversion (set by triangulate/place_mesh)
-        self._pixel_spacing_x = 1.0
-        self._pixel_spacing_y = 1.0
+        # Auto-compute pixel spacing from DataArray coordinates
+        from .analysis._common import _compute_pixel_spacing
+        self._pixel_spacing_x, self._pixel_spacing_y = _compute_pixel_spacing(xarray_obj)
         # Per-geometry solid color overrides: {geometry_id: (r, g, b)}
         self._geometry_colors = {}
         self._geometry_colors_dirty = True
@@ -73,7 +73,13 @@ class RTXAccessor:
         import cupy
         if isinstance(self._obj.data, cupy.ndarray):
             return self._obj
-        return self._obj.copy(data=cupy.asarray(self._obj.data))
+        from numba import cuda as numba_cuda
+        data = np.ascontiguousarray(self._obj.data)
+        pinned = numba_cuda.pinned_array(data.shape, dtype=data.dtype)
+        pinned[:] = data
+        gpu_data = cupy.asarray(pinned)
+        del pinned
+        return self._obj.copy(data=gpu_data)
 
     def viewshed(self, x, y, observer_elev=0, target_elev=0, rtx=None):
         """Compute viewshed from observer point.
@@ -117,7 +123,7 @@ class RTXAccessor:
             self._obj, x=x, y=y,
             observer_elev=observer_elev,
             target_elev=target_elev,
-            rtx=rtx
+            rtx=rtx,
         )
 
     def hillshade(self, shadows=False, azimuth=225, angle_altitude=25,
@@ -371,6 +377,139 @@ class RTXAccessor:
         self._geometry_colors_dirty = False
         return self._geometry_colors_gpu
 
+    def save_meshes(self, zarr_path):
+        """Save all baked mesh geometries to a zarr store.
+
+        Writes mesh data into a ``meshes/`` group inside the zarr store,
+        spatially partitioned to match the DEM elevation chunks.
+        Requires that geometries have been placed via ``place_geojson()``,
+        ``place_buildings()``, ``place_roads()``, or ``place_water()``
+        with ``merge=True`` first.
+
+        Parameters
+        ----------
+        zarr_path : str or Path
+            Path to an existing zarr store (the same one used for DEM data).
+
+        See Also
+        --------
+        load_meshes : Load meshes back from a zarr store.
+        """
+        from .mesh_store import save_meshes_to_zarr
+        import zarr as _zarr
+
+        if not self._baked_meshes:
+            raise ValueError("No baked meshes to save. Place features first "
+                             "(place_buildings, place_roads, etc.).")
+
+        # Determine elevation chunks from the zarr store
+        store = _zarr.open(str(zarr_path), mode='r', use_consolidated=False)
+        elev = store['elevation']
+        elev_shape = elev.shape
+        # zarr 3: chunk shape from metadata
+        if hasattr(elev, 'chunks'):
+            elev_chunks = elev.chunks
+        else:
+            elev_chunks = elev.metadata.chunk_grid.chunk_shape
+        store = None
+
+        # Separate triangle meshes (3-tuple) from curves (4-tuple)
+        meshes = {}
+        curves = {}
+        for gid, baked in self._baked_meshes.items():
+            if len(baked) == 4:
+                # curve geometry: (verts, widths, indices, base_z)
+                curves[gid] = (baked[0], baked[1], baked[2])
+            else:
+                meshes[gid] = (baked[0], baked[1])  # (vertices, indices)
+
+        save_meshes_to_zarr(
+            zarr_path,
+            meshes=meshes,
+            colors=self._geometry_colors,
+            pixel_spacing=(self._pixel_spacing_x, self._pixel_spacing_y),
+            elevation_shape=elev_shape,
+            elevation_chunks=elev_chunks,
+            curves=curves,
+        )
+
+    def load_meshes(self, zarr_path, chunks=None):
+        """Load mesh geometries from a zarr store and add them to the scene.
+
+        Parameters
+        ----------
+        zarr_path : str or Path
+            Path to a zarr store containing a ``meshes/`` group.
+        chunks : list of (int, int) or None
+            Specific chunk indices ``[(row, col), ...]`` to load.
+            ``None`` loads all chunks (full scene).
+
+        See Also
+        --------
+        save_meshes : Save meshes to a zarr store.
+        """
+        from .mesh_store import load_meshes_from_zarr
+
+        meshes, colors, meta, curves = load_meshes_from_zarr(
+            zarr_path, chunks=chunks)
+
+        psx, psy = meta['pixel_spacing']
+        self._pixel_spacing_x = psx
+        self._pixel_spacing_y = psy
+
+        # Get terrain data for base_z computation
+        terrain_data_np = self._obj.data
+        if hasattr(terrain_data_np, 'get'):
+            terrain_data_np = terrain_data_np.get()
+        else:
+            terrain_data_np = np.asarray(terrain_data_np)
+        H, W = terrain_data_np.shape
+
+        loaded = []
+        for gid, (verts, indices) in meshes.items():
+            if len(indices) == 0:
+                continue
+            self._rtx.add_geometry(gid, verts, indices)
+            self._geometry_colors[gid] = colors.get(gid, (0.6, 0.6, 0.6))
+
+            # Compute base_z for VE rescaling using bilinear interpolation
+            # to match the terrain triangle mesh surface
+            vx = verts[0::3]
+            vy = verts[1::3]
+            base_z = self._bilinear_terrain_z(
+                terrain_data_np, vx, vy, psx, psy)
+            self._baked_meshes[gid] = (verts.copy(), indices.copy(), base_z)
+            loaded.append(gid)
+
+        # Load curve geometries (roads, water)
+        loaded_curves = []
+        for gid, (verts, widths, indices) in curves.items():
+            if len(indices) == 0:
+                continue
+            self._rtx.add_curve_geometry(gid, verts, widths, indices)
+            self._geometry_colors[gid] = colors.get(gid, (0.6, 0.6, 0.6))
+
+            vx = verts[0::3]
+            vy = verts[1::3]
+            base_z = self._bilinear_terrain_z(
+                terrain_data_np, vx, vy, psx, psy)
+            # 4-tuple signals curve geometry to the re-snap logic
+            self._baked_meshes[gid] = (verts.copy(), widths.copy(),
+                                       indices.copy(), base_z)
+            loaded_curves.append(gid)
+
+        self._geometry_colors_dirty = True
+        n_tris = sum(len(meshes[g][1]) // 3 for g in loaded)
+        n_segs = sum(len(curves[g][2]) for g in loaded_curves)
+        parts = []
+        if loaded:
+            parts.append(f"{n_tris:,} triangles")
+        if loaded_curves:
+            parts.append(f"{n_segs:,} curve segments")
+        total = len(loaded) + len(loaded_curves)
+        print(f"Loaded {total} mesh geometries ({', '.join(parts)}) "
+              f"from {zarr_path}")
+
     def trace(self, rays, hits, num_rays, primitive_ids=None, instance_ids=None):
         """Trace rays against the current acceleration structure.
 
@@ -413,7 +552,9 @@ class RTXAccessor:
                shadows=True, ambient=0.15, fog_density=0.0,
                fog_color=(0.7, 0.8, 0.9), colormap='terrain',
                color_range=None, output_path=None, alpha=False,
-               vertical_exaggeration=None, rtx=None):
+               vertical_exaggeration=None, rtx=None,
+               ao_samples=0, ao_radius=None, gi_bounces=1, sun_angle=0.0,
+               aperture=0.0, focal_distance=0.0):
         """Render terrain with a perspective camera for movie-quality visualization.
 
         Uses OptiX ray tracing to render terrain with realistic lighting, shadows,
@@ -466,6 +607,25 @@ class RTXAccessor:
         rtx : RTX, optional
             Existing RTX instance to reuse. If None, uses the accessor's
             cached RTX instance.
+        ao_samples : int, optional
+            Number of ambient occlusion rays per pixel. 0 disables AO.
+            Higher values produce smoother results. Default is 0.
+        ao_radius : float, optional
+            Maximum AO ray distance. If None, auto-computes from scene extent
+            (~5% of diagonal). Default is None.
+        sun_angle : float, optional
+            Sun cone half-angle in degrees for soft shadows. 0 gives hard
+            shadows. Typical values: 0.25 (realistic), 1.5 (artistic).
+            Only effective when used with progressive accumulation
+            (frame_seed > 0). Default is 0.0.
+        aperture : float, optional
+            Lens aperture radius for depth of field. 0 disables DOF.
+            Requires frame_seed > 0 for progressive accumulation.
+            Default is 0.0.
+        focal_distance : float, optional
+            Distance to the focal plane. Objects at this distance are sharp.
+            If 0, auto-computes from camera-to-lookat distance.
+            Default is 0.0.
 
         Returns
         -------
@@ -503,6 +663,14 @@ class RTXAccessor:
             alpha=alpha,
             vertical_exaggeration=vertical_exaggeration,
             rtx=rtx,  # User can override, but default None creates fresh instance
+            pixel_spacing_x=self._pixel_spacing_x,
+            pixel_spacing_y=self._pixel_spacing_y,
+            ao_samples=ao_samples,
+            ao_radius=ao_radius,
+            gi_bounces=gi_bounces,
+            sun_angle=sun_angle,
+            aperture=aperture,
+            focal_distance=focal_distance,
         )
 
     def place_mesh(self, mesh_source, positions, geometry_id=None, scale=1.0,
@@ -655,6 +823,44 @@ class RTXAccessor:
         (1.00, 0.40, 0.60),  # pink
     ]
 
+    @staticmethod
+    def _bilinear_terrain_z(terrain, vx, vy, psx, psy):
+        """Sample terrain Z at world positions using bilinear interpolation.
+
+        Supports both numpy and cupy arrays — the array module is chosen
+        automatically based on the type of ``terrain``.
+        """
+        if has_cupy:
+            import cupy as _cp
+            if isinstance(terrain, _cp.ndarray):
+                xp = _cp
+            else:
+                xp = np
+        else:
+            xp = np
+        H, W = terrain.shape
+        cols = vx / psx
+        rows = vy / psy
+        cols = xp.clip(cols, 0, W - 1)
+        rows = xp.clip(rows, 0, H - 1)
+        x0 = xp.clip(xp.floor(cols).astype(xp.int32), 0, max(W - 2, 0))
+        y0 = xp.clip(xp.floor(rows).astype(xp.int32), 0, max(H - 2, 0))
+        fx = cols - x0
+        fy = rows - y0
+        z00 = terrain[y0, x0].astype(xp.float32)
+        z10 = terrain[y0, xp.minimum(x0 + 1, W - 1)].astype(xp.float32)
+        z01 = terrain[xp.minimum(y0 + 1, H - 1), x0].astype(xp.float32)
+        z11 = terrain[xp.minimum(y0 + 1, H - 1),
+                      xp.minimum(x0 + 1, W - 1)].astype(xp.float32)
+        z00 = xp.where(xp.isnan(z00), 0.0, z00)
+        z10 = xp.where(xp.isnan(z10), 0.0, z10)
+        z01 = xp.where(xp.isnan(z01), 0.0, z01)
+        z11 = xp.where(xp.isnan(z11), 0.0, z11)
+        return (z00 * (1 - fx) * (1 - fy) +
+                z10 * fx * (1 - fy) +
+                z01 * (1 - fx) * fy +
+                z11 * fx * fy)
+
     def place_geojson(self, geojson, height=10.0,
                       label_field=None, height_field=None,
                       fill_mesh=None, fill_spacing=None, fill_scale=1.0,
@@ -751,6 +957,7 @@ class RTXAccessor:
             _geojson_to_world_coords, _build_transformer,
             _make_marker_cube, _make_marker_orb, _densify_on_terrain,
             _linestring_to_tube_mesh, _linestring_to_ribbon_mesh,
+            _linestring_to_curve_data, _polygon_to_curve_data,
             _polygon_to_tube_mesh, _polygon_to_ribbon_mesh,
             _extrude_polygon, _scatter_in_polygon,
         )
@@ -785,15 +992,12 @@ class RTXAccessor:
                     terrain_data_np = terrain_data_np.get()
                 else:
                     terrain_data_np = np.asarray(terrain_data_np)
-                _H, _W = terrain_data_np.shape
                 _psx = self._pixel_spacing_x
                 _psy = self._pixel_spacing_y
                 _vx = merged_v[0::3]
                 _vy = merged_v[1::3]
-                _ix = np.clip(np.round(_vx / _psx).astype(int), 0, _W - 1)
-                _iy = np.clip(np.round(_vy / _psy).astype(int), 0, _H - 1)
-                _base_z = terrain_data_np[_iy, _ix].astype(np.float32)
-                _base_z = np.where(np.isnan(_base_z), 0.0, _base_z)
+                _base_z = self._bilinear_terrain_z(
+                    terrain_data_np, _vx, _vy, _psx, _psy)
                 self._baked_meshes[geometry_id] = (merged_v.copy(),
                                                    merged_idx.copy(),
                                                    _base_z)
@@ -870,6 +1074,12 @@ class RTXAccessor:
         _merge_indices = []
         _merge_vert_offset = 0
         _merge_color = None
+
+        # Curve merge accumulators (for round curve tubes)
+        _curve_verts = []
+        _curve_widths = []
+        _curve_indices = []
+        _curve_vert_offset = 0
 
         for feat_i, (geom, props) in enumerate(features):
             if geom is None or not geom.get("coordinates"):
@@ -964,27 +1174,43 @@ class RTXAccessor:
                         wc = _densify_on_terrain(
                             wc, terrain_data, psx, psy, step=step)
                     if use_ribbon:
-                        v, idx = _linestring_to_ribbon_mesh(
+                        curve_result = _linestring_to_curve_data(
                             wc, width=width, hover=ribbon_hover,
                         )
+                        if curve_result is None:
+                            continue
+                        cv, cw, ci = curve_result
+                        use_color = color if color is not None else feat_color
+                        if merge:
+                            _curve_indices.append(ci + _curve_vert_offset)
+                            _curve_verts.append(cv)
+                            _curve_widths.append(cw)
+                            _curve_vert_offset += len(cv) // 3
+                            if _merge_color is None:
+                                _merge_color = use_color
+                        else:
+                            self._rtx.add_curve_geometry(
+                                gid, cv, cw, ci)
+                            geometry_ids.append(gid)
+                            self._geometry_colors[gid] = use_color
                     else:
                         v, idx = _linestring_to_tube_mesh(
                             wc, radius=feat_height * 0.1,
                             hover=feat_height * 0.15,
                         )
-                    if len(v) == 0:
-                        continue
-                    use_color = color if color is not None else feat_color
-                    if merge:
-                        _merge_indices.append(idx + _merge_vert_offset)
-                        _merge_verts.append(v)
-                        _merge_vert_offset += len(v) // 3
-                        if _merge_color is None:
-                            _merge_color = use_color
-                    else:
-                        self._rtx.add_geometry(gid, v, idx)
-                        geometry_ids.append(gid)
-                        self._geometry_colors[gid] = use_color
+                        if len(v) == 0:
+                            continue
+                        use_color = color if color is not None else feat_color
+                        if merge:
+                            _merge_indices.append(idx + _merge_vert_offset)
+                            _merge_verts.append(v)
+                            _merge_vert_offset += len(v) // 3
+                            if _merge_color is None:
+                                _merge_color = use_color
+                        else:
+                            self._rtx.add_geometry(gid, v, idx)
+                            geometry_ids.append(gid)
+                            self._geometry_colors[gid] = use_color
                     geom_counter += 1
 
                 elif ptype == "Polygon":
@@ -1017,6 +1243,19 @@ class RTXAccessor:
                         if extrude:
                             v, idx = _extrude_polygon(
                                 rings_world, feat_height)
+                            if len(v) > 0:
+                                use_color = color if color is not None else feat_color
+                                if merge:
+                                    _merge_indices.append(idx + _merge_vert_offset)
+                                    _merge_verts.append(v)
+                                    _merge_vert_offset += len(v) // 3
+                                    if _merge_color is None:
+                                        _merge_color = use_color
+                                else:
+                                    self._rtx.add_geometry(gid, v, idx)
+                                    geometry_ids.append(gid)
+                                    self._geometry_colors[gid] = use_color
+                                geom_counter += 1
                         else:
                             if densify is not False:
                                 step = 1.0 if densify is True else float(densify)
@@ -1028,28 +1267,44 @@ class RTXAccessor:
                             else:
                                 dense_rings = rings_world
                             if use_ribbon:
-                                v, idx = _polygon_to_ribbon_mesh(
+                                curve_result = _polygon_to_curve_data(
                                     dense_rings, width=width,
                                     hover=ribbon_hover,
                                 )
+                                if curve_result is not None:
+                                    cv, cw, ci = curve_result
+                                    use_color = color if color is not None else feat_color
+                                    if merge:
+                                        _curve_indices.append(ci + _curve_vert_offset)
+                                        _curve_verts.append(cv)
+                                        _curve_widths.append(cw)
+                                        _curve_vert_offset += len(cv) // 3
+                                        if _merge_color is None:
+                                            _merge_color = use_color
+                                    else:
+                                        self._rtx.add_curve_geometry(
+                                            gid, cv, cw, ci)
+                                        geometry_ids.append(gid)
+                                        self._geometry_colors[gid] = use_color
+                                    geom_counter += 1
                             else:
                                 v, idx = _polygon_to_tube_mesh(
                                     dense_rings, radius=feat_height * 0.1,
                                     hover=feat_height * 0.15,
                                 )
-                        if len(v) > 0:
-                            use_color = color if color is not None else feat_color
-                            if merge:
-                                _merge_indices.append(idx + _merge_vert_offset)
-                                _merge_verts.append(v)
-                                _merge_vert_offset += len(v) // 3
-                                if _merge_color is None:
-                                    _merge_color = use_color
-                            else:
-                                self._rtx.add_geometry(gid, v, idx)
-                                geometry_ids.append(gid)
-                                self._geometry_colors[gid] = use_color
-                            geom_counter += 1
+                                if len(v) > 0:
+                                    use_color = color if color is not None else feat_color
+                                    if merge:
+                                        _merge_indices.append(idx + _merge_vert_offset)
+                                        _merge_verts.append(v)
+                                        _merge_vert_offset += len(v) // 3
+                                        if _merge_color is None:
+                                            _merge_color = use_color
+                                    else:
+                                        self._rtx.add_geometry(gid, v, idx)
+                                        geometry_ids.append(gid)
+                                        self._geometry_colors[gid] = use_color
+                                    geom_counter += 1
 
                     # Scatter mesh inside polygon
                     if scatter_verts is not None and ring_pixel_coords is not None:
@@ -1075,7 +1330,7 @@ class RTXAccessor:
                             self._geometry_colors[fill_gid] = feat_color
                             geom_counter += 1
 
-        # Flush merged geometry as a single GAS
+        # Flush merged triangle geometry as a single GAS
         if merge and _merge_verts:
             merged_v = np.concatenate(_merge_verts)
             merged_idx = np.concatenate(_merge_indices).astype(np.int32)
@@ -1108,6 +1363,32 @@ class RTXAccessor:
                       f"({len(merged_v)//3} verts, "
                       f"{len(merged_idx)//3} tris)")
 
+        # Flush merged curve geometry as a single curve GAS
+        if merge and _curve_verts:
+            merged_cv = np.concatenate(_curve_verts)
+            merged_cw = np.concatenate(_curve_widths)
+            merged_ci = np.concatenate(_curve_indices).astype(np.int32)
+            curve_gid = geometry_id if not _merge_verts else f"{geometry_id}_curves"
+            self._rtx.add_curve_geometry(
+                curve_gid, merged_cv, merged_cw, merged_ci)
+            geometry_ids.append(curve_gid)
+            if color is not None:
+                self._geometry_colors[curve_gid] = color
+            elif _merge_color is not None:
+                self._geometry_colors[curve_gid] = _merge_color
+            # Store for VE rescaling / resolution re-snapping
+            _vx = merged_cv[0::3]
+            _vy = merged_cv[1::3]
+            _ix = np.clip(np.round(_vx / psx).astype(int), 0, W - 1)
+            _iy = np.clip(np.round(_vy / psy).astype(int), 0, H - 1)
+            _base_z = terrain_data[_iy, _ix].astype(np.float32)
+            _base_z = np.where(np.isnan(_base_z), 0.0, _base_z)
+            # 4-tuple signals curve geometry to the re-snap logic
+            self._baked_meshes[curve_gid] = (merged_cv.copy(),
+                                              merged_cw.copy(),
+                                              merged_ci.copy(),
+                                              _base_z)
+
         if oob_counter[0] > 0:
             warnings.warn(
                 f"{oob_counter[0]} GeoJSON coordinate(s) outside raster "
@@ -1124,7 +1405,7 @@ class RTXAccessor:
             'geometry_ids': geometry_ids,
         }
 
-    def place_buildings(self, geojson, elev_scale=0.025, default_height_m=8.0,
+    def place_buildings(self, geojson, elev_scale=None, default_height_m=8.0,
                         mesh_cache=None):
         """Place building footprints as extruded 3D geometry on terrain.
 
@@ -1139,12 +1420,17 @@ class RTXAccessor:
             (e.g. from :func:`rtxpy.fetch_buildings`).
         elev_scale : float, optional
             Factor applied to real-world heights so they match the scaled
-            terrain.  Default is 0.025.
+            terrain.  When *None* (default), auto-computed so that
+            ``default_height_m`` buildings are roughly 2× the pixel
+            spacing — ensuring they are always visible at the terrain's
+            native resolution.
         default_height_m : float, optional
             Height in metres used when a feature has no ``height`` property.
             Default is 8.0.
         mesh_cache : str or Path, optional
             Path to an ``.npz`` file for caching the merged mesh.
+            The cache is automatically invalidated when ``elev_scale``
+            or ``default_height_m`` change.
 
         Returns
         -------
@@ -1152,6 +1438,39 @@ class RTXAccessor:
             ``{'features': int, 'geometries': int, 'geometry_ids': list}``
         """
         import warnings
+        import json
+        from pathlib import Path as _CachePath
+
+        if elev_scale is None:
+            avg_spacing = (self._pixel_spacing_x + self._pixel_spacing_y) / 2
+            # Buildings should be ~2× pixel spacing for visibility
+            target_height = avg_spacing * 1
+            elev_scale = max(1.0, target_height / default_height_m)
+
+        # Invalidate mesh cache if height parameters changed
+        if mesh_cache is not None:
+            cache_p = _CachePath(mesh_cache)
+            meta_p = cache_p.with_suffix('.meta.json')
+            current_meta = {
+                'elev_scale': elev_scale,
+                'default_height_m': default_height_m,
+            }
+            if cache_p.exists():
+                stale = True
+                if meta_p.exists():
+                    try:
+                        old_meta = json.loads(meta_p.read_text())
+                        if old_meta == current_meta:
+                            stale = False
+                    except (json.JSONDecodeError, KeyError):
+                        pass
+                if stale:
+                    cache_p.unlink()
+                    print(f"Invalidated stale mesh cache: {cache_p.name}")
+            # Write/update meta alongside cache
+            meta_p.parent.mkdir(parents=True, exist_ok=True)
+            meta_p.write_text(json.dumps(current_meta))
+
         for feat in geojson.get("features", []):
             props = feat.get("properties", {})
             h = props.get("height", -1)
@@ -1172,7 +1491,7 @@ class RTXAccessor:
             )
 
     def place_roads(self, geojson, geometry_id='road', color=None,
-                    height=1, mesh_cache=None):
+                    height=3, mesh_cache=None):
         """Place road LineStrings as flat merged ribbon geometry on terrain.
 
         Parameters
@@ -1206,7 +1525,7 @@ class RTXAccessor:
                 label_field='name',
                 geometry_id=geometry_id,
                 color=color or (0.30, 0.30, 0.30),
-                densify=False,
+                densify=True,
                 merge=True,
                 mesh_cache=mesh_cache,
             )
@@ -1217,9 +1536,13 @@ class RTXAccessor:
         Splits the GeoJSON into three categories based on the ``waterway``
         and ``natural`` properties:
 
-        * **major** — rivers, canals (bright blue ribbons)
-        * **minor** — streams, drains, ditches (pale blue ribbons)
-        * **body**  — natural water polygons (extruded blue-grey)
+        * **major** — rivers, canals (bright blue curves)
+        * **minor** — streams, drains, ditches (pale blue curves)
+        * **body**  — natural water polygons (densified extruded fill)
+
+        All categories are densified at pixel resolution so geometry
+        follows the terrain surface smoothly.  Water body polygons use
+        extruded geometry (walls + cap) for visible fill.
 
         Parameters
         ----------
@@ -1227,7 +1550,7 @@ class RTXAccessor:
             GeoJSON FeatureCollection of water features (e.g. from
             :func:`rtxpy.fetch_water` with ``water_type='all'``).
         body_height : float, optional
-            Extrusion height for water body polygons.  Default is 0.5.
+            Height offset for water body outline curves.  Default is 0.5.
         mesh_cache_prefix : str or Path, optional
             Base path for mesh cache files.  Three files are created:
             ``{prefix}_major_mesh.npz``, ``{prefix}_minor_mesh.npz``,
@@ -1264,7 +1587,7 @@ class RTXAccessor:
                     {"type": "FeatureCollection", "features": major},
                     height=0, label_field='name', geometry_id='water_major',
                     color=(0.40, 0.70, 0.95, 2.25),
-                    densify=False, merge=True, mesh_cache=mc,
+                    densify=True, merge=True, mesh_cache=mc,
                 )
             if minor:
                 mc = f"{mesh_cache_prefix}_minor_mesh.npz" if mesh_cache_prefix else None
@@ -1272,20 +1595,201 @@ class RTXAccessor:
                     {"type": "FeatureCollection", "features": minor},
                     height=0, label_field='name', geometry_id='water_minor',
                     color=(0.50, 0.75, 0.98, 2.25),
-                    densify=False, merge=True, mesh_cache=mc,
+                    densify=True, merge=True, mesh_cache=mc,
                 )
             if body:
                 mc = f"{mesh_cache_prefix}_body_mesh.npz" if mesh_cache_prefix else None
                 results['body'] = self.place_geojson(
                     {"type": "FeatureCollection", "features": body},
-                    height=body_height, label_field='name', geometry_id='water_body',
+                    height=body_height, label_field='name',
+                    geometry_id='water_body',
                     color=(0.35, 0.55, 0.88, 2.25),
-                    extrude=True, merge=True, mesh_cache=mc,
+                    densify=True, extrude=True, merge=True, mesh_cache=mc,
                 )
         return results
 
+    def place_gtfs(self, gtfs_data, stop_height=8.0, route_width=None,
+                   show_routes=True, show_stops=True,
+                   mesh_cache_prefix=None):
+        """Classify and place GTFS transit features as coloured geometry.
+
+        Routes are sub-grouped by their GTFS ``route_color`` so that
+        each trunk line renders in its official colour (e.g. the NYC
+        subway 1/2/3 in red, A/C/E in blue).  When ``route_color`` is
+        absent, a default colour per mode category is used.
+
+        Mode categories (from ``route_type``):
+
+        * **tram** (0, 5)
+        * **subway** (1)
+        * **rail** (2)
+        * **bus** (3)
+        * **ferry** (4)
+        * **other** (6, 7, …)
+
+        Parameters
+        ----------
+        gtfs_data : dict
+            Result from :func:`rtxpy.fetch_gtfs` with ``'routes'``,
+            ``'stops'``, and ``'metadata'`` keys.
+        stop_height : float, optional
+            Height of stop marker geometry.  Default 8.0.
+        route_width : float, optional
+            Base width for route curves.  Default is ``pixel_spacing * 0.15``.
+        show_routes : bool
+            Whether to place route curves.  Default ``True``.
+        show_stops : bool
+            Whether to place stop points.  Default ``True``.
+        mesh_cache_prefix : str or Path, optional
+            Base path for mesh cache files.
+
+        Returns
+        -------
+        dict
+            Nested dict keyed by category, then by colour group label.
+        """
+        import re as _re
+        import warnings
+        from .remote_data import _gtfs_route_type_name
+
+        _CATEGORIES = {
+            'tram':   {'route_types': {0, 5},    'color': (0.85, 0.20, 0.20), 'width_mult': 1.0},
+            'subway': {'route_types': {1},       'color': (0.20, 0.45, 0.90), 'width_mult': 1.2},
+            'rail':   {'route_types': {2},       'color': (0.55, 0.25, 0.70), 'width_mult': 1.5},
+            'bus':    {'route_types': {3},       'color': (0.95, 0.65, 0.10), 'width_mult': 0.7},
+            'ferry':  {'route_types': {4},       'color': (0.20, 0.75, 0.85), 'width_mult': 1.3},
+            'other':  {'route_types': {6, 7},    'color': (0.70, 0.70, 0.70), 'width_mult': 0.8},
+        }
+
+        def _hex_to_rgb(hex_str):
+            """Convert '0088FF' or '#0088FF' to (r, g, b) floats."""
+            h = hex_str.lstrip('#').strip()
+            if len(h) != 6:
+                return None
+            try:
+                return (int(h[0:2], 16) / 255.0,
+                        int(h[2:4], 16) / 255.0,
+                        int(h[4:6], 16) / 255.0)
+            except ValueError:
+                return None
+
+        def _safe_id(s):
+            """Sanitise a string for use as a geometry_id component."""
+            return _re.sub(r'[^a-zA-Z0-9]', '_', s).strip('_').lower()
+
+        if route_width is None:
+            route_width = abs(self._pixel_spacing_x) * 0.15
+
+        # ----- classify routes by (category, route_color) --------------------
+        # Key: (cat, hex_color_upper) -> list of features
+        color_groups = {}  # {(cat, hex): [features]}
+        color_names = {}   # {(cat, hex): set of route_short_name}
+
+        if show_routes:
+            for f in gtfs_data.get('routes', {}).get('features', []):
+                props = f.get('properties') or {}
+                rt = props.get('route_type', 3)
+                try:
+                    rt = int(rt)
+                except (ValueError, TypeError):
+                    rt = 3
+                cat = _gtfs_route_type_name(rt)
+                if cat not in _CATEGORIES:
+                    cat = 'other'
+
+                # Use route_color from feed if available
+                rc = (props.get('route_color') or '').strip().lstrip('#')
+                if len(rc) != 6:
+                    rc = ''
+                key = (cat, rc.upper() if rc else '')
+                color_groups.setdefault(key, []).append(f)
+                sn = (props.get('route_short_name') or '').strip()
+                if sn:
+                    color_names.setdefault(key, set()).add(sn)
+
+        # ----- classify stops by (category, route_color) ---------------------
+        stop_groups = {}  # {(cat, hex): [stop features]}
+        if show_stops:
+            for f in gtfs_data.get('stops', {}).get('features', []):
+                props = f.get('properties') or {}
+                rts = props.get('route_types', [])
+                if rts:
+                    try:
+                        rt = int(rts[0])
+                    except (ValueError, TypeError):
+                        rt = 3
+                    cat = _gtfs_route_type_name(rt)
+                else:
+                    cat = 'bus'
+                if cat not in _CATEGORIES:
+                    cat = 'other'
+                # Use first route_color from stop's served routes
+                rcs = props.get('route_colors', [])
+                hex_c = rcs[0].upper() if rcs else ''
+                stop_groups.setdefault((cat, hex_c), []).append(f)
+
+        # ----- place geometry per colour group -------------------------------
+        results = {}
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", message="place_geojson called before")
+
+            # Collect all (cat, hex) keys across routes and stops
+            all_keys = set(color_groups.keys()) | set(stop_groups.keys())
+
+            for cat, hex_c in sorted(all_keys):
+                info = _CATEGORIES.get(cat)
+                if info is None:
+                    info = _CATEGORIES['other']
+
+                routes = color_groups.get((cat, hex_c), [])
+                stops = stop_groups.get((cat, hex_c), [])
+                if not routes and not stops:
+                    continue
+
+                # Determine colour: prefer feed's route_color, else default
+                rgb = _hex_to_rgb(hex_c) if hex_c else None
+                if rgb is None:
+                    rgb = info['color']
+
+                # Build a human-readable label for this colour group
+                names = color_names.get((cat, hex_c), set())
+                if names:
+                    label = '/'.join(sorted(names))
+                elif hex_c:
+                    label = hex_c.lower()
+                else:
+                    label = 'default'
+
+                gid_suffix = _safe_id(label) if label != 'default' else cat
+                cat_result = {}
+
+                if routes:
+                    gid = f'gtfs_{cat}_{gid_suffix}_route'
+                    mc = f"{mesh_cache_prefix}_{gid}_mesh.npz" if mesh_cache_prefix else None
+                    w = route_width * info['width_mult']
+                    cat_result['routes'] = self.place_geojson(
+                        {"type": "FeatureCollection", "features": routes},
+                        height=0, geometry_id=gid,
+                        width=w, color=(rgb[0], rgb[1], rgb[2], 1.4),
+                        densify=True, merge=True, mesh_cache=mc,
+                    )
+
+                if stops:
+                    gid = f'gtfs_{cat}_{gid_suffix}_stop'
+                    mc = f"{mesh_cache_prefix}_{gid}_mesh.npz" if mesh_cache_prefix else None
+                    cat_result['stops'] = self.place_geojson(
+                        {"type": "FeatureCollection", "features": stops},
+                        height=stop_height, geometry_id=gid,
+                        color=(rgb[0], rgb[1], rgb[2], 1.6),
+                        merge=True, mesh_cache=mc,
+                    )
+
+                results.setdefault(cat, {})[label] = cat_result
+
+        return results
+
     def triangulate(self, geometry_id='terrain', scale=1.0,
-                     pixel_spacing_x=1.0, pixel_spacing_y=1.0):
+                     pixel_spacing_x=None, pixel_spacing_y=None):
         """Triangulate the terrain and add it to the scene.
 
         Creates a triangle mesh from the raster elevation data and adds it
@@ -1298,9 +1802,11 @@ class RTXAccessor:
         scale : float, optional
             Scale factor for elevation values. Default is 1.0.
         pixel_spacing_x : float, optional
-            X spacing between pixels in world units. Default is 1.0 (pixel coords).
+            X spacing between pixels in world units. If None, uses the
+            auto-computed value from the DataArray coordinates.
         pixel_spacing_y : float, optional
-            Y spacing between pixels in world units. Default is 1.0 (pixel coords).
+            Y spacing between pixels in world units. If None, uses the
+            auto-computed value from the DataArray coordinates.
 
         Returns
         -------
@@ -1318,6 +1824,12 @@ class RTXAccessor:
         """
         from .mesh import triangulate_terrain
         import numpy as np
+
+        # Fall back to auto-computed spacing from __init__
+        if pixel_spacing_x is None:
+            pixel_spacing_x = self._pixel_spacing_x
+        if pixel_spacing_y is None:
+            pixel_spacing_y = self._pixel_spacing_y
 
         H, W = self._obj.shape
 
@@ -1347,7 +1859,7 @@ class RTXAccessor:
         return vertices, indices
 
     def voxelate(self, geometry_id='terrain', scale=1.0, base_elevation=None,
-                 pixel_spacing_x=1.0, pixel_spacing_y=1.0):
+                 pixel_spacing_x=None, pixel_spacing_y=None):
         """Voxelate the terrain into box-columns and add to the scene.
 
         Creates a voxelized mesh where each raster cell becomes a rectangular
@@ -1363,9 +1875,11 @@ class RTXAccessor:
             Z coordinate for the bottom of all columns. If None, uses
             min(terrain) * scale so all columns have visible height.
         pixel_spacing_x : float, optional
-            X spacing between pixels in world units. Default is 1.0.
+            X spacing between pixels in world units. If None, uses the
+            auto-computed value from the DataArray coordinates.
         pixel_spacing_y : float, optional
-            Y spacing between pixels in world units. Default is 1.0.
+            Y spacing between pixels in world units. If None, uses the
+            auto-computed value from the DataArray coordinates.
 
         Returns
         -------
@@ -1374,6 +1888,12 @@ class RTXAccessor:
         """
         from .mesh import voxelate_terrain
         import numpy as np
+
+        # Fall back to auto-computed spacing from __init__
+        if pixel_spacing_x is None:
+            pixel_spacing_x = self._pixel_spacing_x
+        if pixel_spacing_y is None:
+            pixel_spacing_y = self._pixel_spacing_y
 
         H, W = self._obj.shape
 
@@ -1413,6 +1933,75 @@ class RTXAccessor:
         self._rtx.add_geometry(geometry_id, vertices, indices)
 
         return vertices, indices
+
+    def heightfield(self, geometry_id='terrain', scale=1.0,
+                    pixel_spacing_x=None, pixel_spacing_y=None,
+                    tile_size=32):
+        """Add the terrain as a heightfield using custom intersection.
+
+        Instead of materializing an explicit triangle mesh, this uploads
+        the raw elevation grid and uses an OptiX custom intersection
+        program that ray-marches through the heightfield at trace time.
+        This dramatically reduces GPU memory and provides smooth bilinear
+        normals (no triangle faceting).
+
+        Parameters
+        ----------
+        geometry_id : str, optional
+            ID for the terrain geometry. Default is 'terrain'.
+        scale : float, optional
+            Scale factor for elevation values. Default is 1.0.
+        pixel_spacing_x : float, optional
+            X spacing between pixels in world units. If None, uses the
+            auto-computed value from the DataArray coordinates.
+        pixel_spacing_y : float, optional
+            Y spacing between pixels in world units. If None, uses the
+            auto-computed value from the DataArray coordinates.
+        tile_size : int, optional
+            Number of cells per tile dimension for AABB grouping.
+            Smaller tiles = tighter BVH but more AABBs. Default is 32.
+
+        Returns
+        -------
+        numpy.ndarray
+            The 2-D elevation array that was uploaded to the GPU.
+        """
+        import numpy as np
+
+        if pixel_spacing_x is None:
+            pixel_spacing_x = self._pixel_spacing_x
+        if pixel_spacing_y is None:
+            pixel_spacing_y = self._pixel_spacing_y
+
+        H, W = self._obj.shape
+
+        # Get elevation data
+        terrain_data = self._obj.data if hasattr(self._obj, 'data') else self._obj
+        if has_cupy:
+            import cupy
+            if isinstance(terrain_data, cupy.ndarray):
+                elev = terrain_data.get().astype(np.float32)
+            else:
+                elev = np.asarray(terrain_data, dtype=np.float32)
+        else:
+            elev = np.asarray(terrain_data, dtype=np.float32)
+
+        if scale != 1.0:
+            elev = elev * scale
+
+        self._rtx.add_heightfield_geometry(
+            geometry_id, elev, H, W,
+            spacing_x=pixel_spacing_x,
+            spacing_y=pixel_spacing_y,
+            ve=1.0,
+            tile_size=tile_size,
+        )
+
+        self._pixel_spacing_x = pixel_spacing_x
+        self._pixel_spacing_y = pixel_spacing_y
+        self._terrain_mesh_type = 'heightfield'
+
+        return elev
 
     def flyover(self, output_path, duration=30.0, fps=10.0, orbit_scale=0.6,
                 altitude_offset=500.0, fov=60.0, fov_range=None,
@@ -1594,7 +2183,7 @@ class RTXAccessor:
         ----------
         url : str, optional
             Provider name or custom URL template with {z}/{x}/{y} placeholders.
-            Built-in providers: 'osm', 'satellite', 'topo'.
+            Built-in providers: 'osm', 'satellite'.
             Default is 'osm' (OpenStreetMap).
         zoom : int, optional
             Tile zoom level (0–19). If ``None``, defaults to 13.
@@ -1614,12 +2203,15 @@ class RTXAccessor:
     def explore(self, width=800, height=600, render_scale=0.5,
                 start_position=None, look_at=None, key_repeat_interval=0.05,
                 pixel_spacing_x=None, pixel_spacing_y=None,
-                mesh_type='tin', color_stretch='linear', title=None,
-                subsample=1, wind_data=None, terrain_loader=None):
+                mesh_type='heightfield', color_stretch='linear', title=None,
+                subsample=1, wind_data=None, gtfs_data=None,
+                terrain_loader=None,
+                scene_zarr=None, ao_samples=0, gi_bounces=1, denoise=False,
+                repl=False, tour=None):
         """Launch an interactive terrain viewer with keyboard controls.
 
-        Opens a matplotlib window for terrain exploration with keyboard
-        controls. Uses matplotlib's event system - no additional dependencies.
+        Opens a GLFW window for terrain exploration with keyboard
+        controls. Uses GLFW for input and ModernGL for display.
 
         Any meshes placed with place_mesh() will be visible in the scene.
         Use the G key to cycle through geometry layer information.
@@ -1654,6 +2246,15 @@ class RTXAccessor:
             Initial terrain subsample factor (1, 2, 4, 8).  Full-resolution
             data is preserved; press Shift+R / R to change at runtime.
             Default is 1 (full resolution).
+        ao_samples : int, optional
+            If > 0, enable ambient occlusion on launch with progressive
+            accumulation (1 sample per frame). Press 0 to toggle at runtime.
+            Default is 0 (disabled).
+        repl : bool, optional
+            If True, start an interactive Python REPL in a background
+            thread.  The REPL exposes a ``v`` (ViewerProxy) object for
+            running analysis and updating the display while the viewer
+            is running.  Default is False.
 
         Controls
         --------
@@ -1702,10 +2303,14 @@ class RTXAccessor:
         spacing_y = pixel_spacing_y if pixel_spacing_y is not None else self._pixel_spacing_y
 
         # Rebuild terrain geometry if mesh_type doesn't match current state
-        current_mesh_type = getattr(self, '_terrain_mesh_type', 'tin')
+        current_mesh_type = getattr(self, '_terrain_mesh_type', 'heightfield')
         if mesh_type != current_mesh_type and 'terrain' in (self._rtx.list_geometries() or []):
             self._rtx.remove_geometry('terrain')
-            if mesh_type == 'voxel':
+            if mesh_type == 'heightfield':
+                self.heightfield(geometry_id='terrain',
+                                 pixel_spacing_x=spacing_x,
+                                 pixel_spacing_y=spacing_y)
+            elif mesh_type == 'voxel':
                 self.voxelate(geometry_id='terrain',
                               pixel_spacing_x=spacing_x,
                               pixel_spacing_y=spacing_y)
@@ -1719,7 +2324,7 @@ class RTXAccessor:
         if self._geometry_colors:
             geometry_colors_builder = self._build_geometry_colors_gpu
 
-        _explore(
+        return _explore(
             self._obj,
             width=width,
             height=height,
@@ -1738,8 +2343,15 @@ class RTXAccessor:
             baked_meshes=self._baked_meshes if self._baked_meshes else None,
             subsample=subsample,
             wind_data=wind_data,
+            gtfs_data=gtfs_data,
             accessor=self,
             terrain_loader=terrain_loader,
+            scene_zarr=scene_zarr,
+            ao_samples=ao_samples,
+            gi_bounces=gi_bounces,
+            denoise=denoise,
+            repl=repl,
+            tour=tour,
         )
 
     def memory_usage(self):
@@ -2020,11 +2632,40 @@ class RTXDatasetAccessor:
         terrain_da = self._get_terrain_da(z)
         return terrain_da.rtx.place_water(geojson, **kwargs)
 
+    def place_gtfs(self, gtfs_data, z=None, **kwargs):
+        """Classify and place GTFS transit features.  Delegates to DataArray accessor."""
+        if z is None:
+            z = self._z_var
+        if z is None:
+            raise ValueError("z must be specified (no prior terrain variable set)")
+        terrain_da = self._get_terrain_da(z)
+        return terrain_da.rtx.place_gtfs(gtfs_data, **kwargs)
+
+    def save_meshes(self, zarr_path, z=None):
+        """Save baked meshes to zarr.  Delegates to DataArray accessor."""
+        if z is None:
+            z = self._z_var
+        if z is None:
+            z = list(self._obj.data_vars)[0]
+        terrain_da = self._get_terrain_da(z)
+        return terrain_da.rtx.save_meshes(zarr_path)
+
+    def load_meshes(self, zarr_path, chunks=None, z=None):
+        """Load meshes from zarr.  Delegates to DataArray accessor."""
+        if z is None:
+            z = self._z_var
+        if z is None:
+            z = list(self._obj.data_vars)[0]
+        terrain_da = self._get_terrain_da(z)
+        return terrain_da.rtx.load_meshes(zarr_path, chunks=chunks)
+
     def explore(self, z, width=800, height=600, render_scale=0.5,
                 start_position=None, look_at=None, key_repeat_interval=0.05,
                 pixel_spacing_x=None, pixel_spacing_y=None,
-                mesh_type='tin', color_stretch='linear', title=None,
-                subsample=1, wind_data=None):
+                mesh_type='heightfield', color_stretch='linear', title=None,
+                subsample=1, wind_data=None, gtfs_data=None,
+                scene_zarr=None,
+                ao_samples=0, gi_bounces=1, denoise=False, repl=False, tour=None):
         """Launch an interactive terrain viewer with Dataset variables as
         overlay layers cycled with the G key.
 
@@ -2057,17 +2698,27 @@ class RTXDatasetAccessor:
             Y spacing between pixels in world units. Default is 1.0.
         mesh_type : str, optional
             Mesh generation method: 'tin' or 'voxel'. Default is 'tin'.
+        repl : bool, optional
+            If True, start an interactive Python REPL alongside the
+            viewer.  Default is False.
+        tour : list of dict or str, optional
+            If provided, automatically play a camera tour after the
+            viewer launches.  Can be a list of keyframe dicts or a
+            path to a ``.py`` file defining a ``tour`` variable.
+            Implies ``repl=True``.
 
         Examples
         --------
         >>> ds.rtx.explore(z='elevation')
+        >>> ds.rtx.explore(z='elevation', repl=True)
         """
         from .engine import explore as _explore
 
         terrain_da = self._get_terrain_da(z)
 
-        spacing_x = pixel_spacing_x if pixel_spacing_x is not None else self._pixel_spacing_x
-        spacing_y = pixel_spacing_y if pixel_spacing_y is not None else self._pixel_spacing_y
+        # Use explicit values, else fall back to the terrain DataArray's auto-computed spacing
+        spacing_x = pixel_spacing_x if pixel_spacing_x is not None else terrain_da.rtx._pixel_spacing_x
+        spacing_y = pixel_spacing_y if pixel_spacing_y is not None else terrain_da.rtx._pixel_spacing_y
 
         # NOTE: terrain mesh is built by the engine at the correct
         # (possibly subsampled) resolution — not here at full res.
@@ -2093,7 +2744,7 @@ class RTXDatasetAccessor:
         if terrain_da.rtx._geometry_colors:
             geometry_colors_builder = terrain_da.rtx._build_geometry_colors_gpu
 
-        _explore(
+        return _explore(
             terrain_da,
             width=width,
             height=height,
@@ -2113,7 +2764,14 @@ class RTXDatasetAccessor:
             baked_meshes=terrain_da.rtx._baked_meshes if terrain_da.rtx._baked_meshes else None,
             subsample=subsample,
             wind_data=wind_data,
+            gtfs_data=gtfs_data,
             accessor=terrain_da.rtx,
+            scene_zarr=scene_zarr,
+            ao_samples=ao_samples,
+            gi_bounces=gi_bounces,
+            denoise=denoise,
+            repl=repl,
+            tour=tour,
         )
 
     def place_tiles(self, url='osm', z=None, zoom=None):
@@ -2128,7 +2786,7 @@ class RTXDatasetAccessor:
         ----------
         url : str, optional
             Provider name or custom URL template with {z}/{x}/{y} placeholders.
-            Built-in providers: 'osm', 'satellite', 'topo'.
+            Built-in providers: 'osm', 'satellite'.
             Default is 'osm' (OpenStreetMap).
         z : str, optional
             Name of the Dataset variable to use as the spatial reference

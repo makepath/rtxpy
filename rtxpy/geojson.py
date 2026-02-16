@@ -204,7 +204,10 @@ def _geojson_to_world_coords(coords_lonlat, raster, terrain_data, psx, psy,
     cols = (x_crs - x_coords[0]) / dx
     rows = (y_crs - y_coords[0]) / dy
 
-    # Clip to raster extent
+    # Track out-of-bounds coords (for warning) but keep true positions.
+    # Only clamp the sampling indices used for terrain-Z lookup so roads
+    # and other line features extend naturally past the DEM edge instead
+    # of being warped toward the boundary.
     out_of_bounds = (
         (cols < -0.5) | (cols > W - 0.5) |
         (rows < -0.5) | (rows > H - 0.5)
@@ -212,14 +215,16 @@ def _geojson_to_world_coords(coords_lonlat, raster, terrain_data, psx, psy,
     n_oob = int(np.sum(out_of_bounds)) if np.any(out_of_bounds) else 0
     if n_oob > 0 and oob_counter is not None:
         oob_counter[0] += n_oob
-    cols = np.clip(cols, 0, W - 1)
-    rows = np.clip(rows, 0, H - 1)
+
+    # Clamp only for Z sampling — keep original cols/rows for world XY
+    cols_z = np.clip(cols, 0, W - 1)
+    rows_z = np.clip(rows, 0, H - 1)
 
     # --- Sample terrain Z (bilinear to match triangle mesh surface) ------
-    x0 = np.clip(np.floor(cols).astype(int), 0, W - 2)
-    y0 = np.clip(np.floor(rows).astype(int), 0, H - 2)
-    fx = cols - x0
-    fy = rows - y0
+    x0 = np.clip(np.floor(cols_z).astype(int), 0, W - 2)
+    y0 = np.clip(np.floor(rows_z).astype(int), 0, H - 2)
+    fx = cols_z - x0
+    fy = rows_z - y0
     z00 = terrain_data[y0, x0].astype(np.float64)
     z10 = terrain_data[y0, x0 + 1].astype(np.float64)
     z01 = terrain_data[y0 + 1, x0].astype(np.float64)
@@ -467,6 +472,9 @@ def _densify_on_terrain(world_coords, terrain_data, psx, psy, step=1.0):
         dy_px = (p1[1] - p0[1]) / psy
         dist_px = np.sqrt(dx_px ** 2 + dy_px ** 2)
 
+        if not np.isfinite(dist_px):
+            result.append(p1)
+            continue
         n_sub = max(1, int(np.ceil(dist_px / step)))
 
         for j in range(1, n_sub + 1):
@@ -654,6 +662,114 @@ def _linestring_to_ribbon_mesh(world_coords, width=1.0, hover=0.2,
         tris[qi + 1] = [l0, r0, r1]
 
     return verts.ravel(), tris.ravel()
+
+
+def _linestring_to_curve_data(world_coords, width=1.0, hover=0.2,
+                               closed=False):
+    """Convert a polyline to round quadratic B-spline curve tube data.
+
+    Produces control points, per-vertex widths (radii), and segment
+    indices for OptiX ``ROUND_QUADRATIC_BSPLINE`` curve primitives.
+
+    Parameters
+    ----------
+    world_coords : np.ndarray
+        (N, 3) array of world-space positions along the line.
+    width : float
+        Curve tube radius.
+    hover : float
+        Small Z offset above terrain to avoid z-fighting.
+    closed : bool
+        If True, connect last point back to first.
+
+    Returns
+    -------
+    tuple or None
+        ``(vertices, widths, indices)`` where vertices is flat float32,
+        widths is flat float32, and indices is flat int32.
+        Returns None if the input has fewer than 2 points.
+    """
+    pts = np.asarray(world_coords, dtype=np.float32).copy()
+    N = len(pts)
+    if N < 2:
+        return None
+
+    if closed and N > 2:
+        if not np.allclose(pts[0], pts[-1], atol=1e-3):
+            pts = np.vstack([pts, pts[0:1]])
+            N = len(pts)
+
+    # Pad 2-point lines to 3 points (minimum for 1 segment)
+    if N == 2:
+        mid = (pts[0] + pts[1]) / 2.0
+        pts = np.array([pts[0], mid, pts[1]], dtype=np.float32)
+        N = 3
+
+    pts[:, 2] += hover
+
+    # Phantom endpoints: quadratic B-splines don't interpolate their
+    # first/last control points — the curve starts at midpoint(cp0, cp1)
+    # and ends at midpoint(cpN-2, cpN-1).  Duplicating the endpoints
+    # makes the curve reach the actual road positions, closing gaps at
+    # intersections where multiple roads meet.
+    if closed and N > 3:
+        # Wrap around: add the penultimate point before start and the
+        # second point after end so the B-spline loops seamlessly
+        pts = np.vstack([pts[-2:-1], pts, pts[1:2]])
+    else:
+        # Open curve: duplicate first and last control points
+        pts = np.vstack([pts[0:1], pts, pts[-1:]])
+    N = len(pts)
+
+    num_segments = N - 2
+
+    vertices = pts.ravel()                          # N*3 floats
+    widths = np.full(N, width, dtype=np.float32)    # constant radius
+    indices = np.arange(num_segments, dtype=np.int32)
+
+    return vertices, widths, indices
+
+
+def _polygon_to_curve_data(rings_world_coords, width=1.0, hover=0.2):
+    """Build curve tube data for a polygon's exterior and interior rings.
+
+    Parameters
+    ----------
+    rings_world_coords : list of np.ndarray
+        Each element is an (N, 3) array for one ring.
+    width : float
+        Curve tube radius.
+    hover : float
+        Small Z offset above terrain.
+
+    Returns
+    -------
+    tuple or None
+        ``(vertices, widths, indices)`` concatenated across all rings,
+        or None if no valid rings.
+    """
+    all_verts = []
+    all_widths = []
+    all_indices = []
+    vert_offset = 0
+
+    for ring_coords in rings_world_coords:
+        result = _linestring_to_curve_data(
+            ring_coords, width=width, hover=hover, closed=True,
+        )
+        if result is None:
+            continue
+        v, w, idx = result
+        all_verts.append(v)
+        all_widths.append(w)
+        all_indices.append(idx + vert_offset)
+        vert_offset += len(v) // 3
+
+    if not all_verts:
+        return None
+
+    return (np.concatenate(all_verts), np.concatenate(all_widths),
+            np.concatenate(all_indices))
 
 
 def _polygon_to_ribbon_mesh(rings_world_coords, width=1.0, hover=0.2):
@@ -890,9 +1006,14 @@ def _extrude_polygon(rings_world_coords, height):
     if N < 3:
         return np.empty(0, dtype=np.float32), np.empty(0, dtype=np.int32)
 
+    # Flatten base to a single elevation so rooftops aren't jagged.
+    # Use the minimum Z so no part of the building floats above terrain.
+    base_z = ring[:, 2].min()
+    ring[:, 2] = base_z
+
     # Vertices: bottom ring (0..N-1), top ring (N..2N-1)
     top = ring.copy()
-    top[:, 2] += height
+    top[:, 2] = base_z + height
 
     verts = np.empty(2 * N * 3, dtype=np.float32)
     verts[: N * 3] = ring.ravel()
