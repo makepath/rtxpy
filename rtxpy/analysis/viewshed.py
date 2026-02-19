@@ -11,7 +11,7 @@ import math
 from typing import Union
 
 from .._cuda_utils import calc_dims, add, diff, mul, dot, float3, make_float3, invert
-from ._common import generate_primary_rays, prepare_mesh
+from ._common import generate_primary_rays, prepare_mesh, _compute_pixel_spacing
 from ..rtx import RTX, has_cupy
 
 if has_cupy:
@@ -264,11 +264,14 @@ def viewshed(raster,
     if not isinstance(raster.data, cupy.ndarray):
         raise ValueError("raster.data must be a cupy array")
 
+    psx, psy = _compute_pixel_spacing(raster)
+
     # If an RTX with existing geometries is provided (multi-GAS scene),
     # use it directly so viewshed rays are occluded by all scene geometry.
     # Only build a terrain-only mesh when no RTX is given.
     if rtx is not None and rtx.get_geometry_count() > 0:
         optix = rtx
     else:
-        optix = prepare_mesh(raster, rtx)
-    return _viewshed_rt(raster, optix, x, y, observer_elev, target_elev)
+        optix = prepare_mesh(raster, rtx, pixel_spacing_x=psx, pixel_spacing_y=psy)
+    return _viewshed_rt(raster, optix, x, y, observer_elev, target_elev,
+                        pixel_spacing_x=psx, pixel_spacing_y=psy)

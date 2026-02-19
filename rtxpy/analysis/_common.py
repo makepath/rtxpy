@@ -14,6 +14,48 @@ if has_cupy:
     import cupy
 
 
+def _compute_pixel_spacing(da):
+    """Derive real-world pixel spacing from a DataArray's x/y coordinates.
+
+    Parameters
+    ----------
+    da : xarray.DataArray
+        Raster with 'x' and 'y' coordinate arrays.
+
+    Returns
+    -------
+    tuple of float
+        (pixel_spacing_x, pixel_spacing_y) in the CRS's linear units.
+        Falls back to (1.0, 1.0) when coordinates are missing, too short,
+        or the CRS uses geographic (degree) units.
+    """
+    try:
+        x = da.coords['x'].values
+        y = da.coords['y'].values
+    except (KeyError, AttributeError):
+        return (1.0, 1.0)
+
+    if len(x) < 2 or len(y) < 2:
+        return (1.0, 1.0)
+
+    # Guard against geographic CRS (degrees) — spacing in degrees is not
+    # meaningful as a metric distance, so fall back to pixel coords.
+    try:
+        crs = da.rio.crs
+        if crs is not None and crs.is_geographic:
+            return (1.0, 1.0)
+    except Exception:
+        pass  # rioxarray not available or no CRS set — proceed with diffs
+
+    psx = float(abs(x[1] - x[0]))
+    psy = float(abs(y[1] - y[0]))
+
+    if psx == 0 or psy == 0:
+        return (1.0, 1.0)
+
+    return (psx, psy)
+
+
 @cuda.jit
 def _generate_primary_rays_kernel(data, x_coords, y_coords, H, W):
     """GPU kernel for generating orthographic camera rays looking straight down.
@@ -42,7 +84,8 @@ def _generate_primary_rays_kernel(data, x_coords, y_coords, H, W):
         data[i, j, 7] = np.inf  # t_max
 
 
-def generate_primary_rays(rays, x_coords, y_coords, H, W):
+def generate_primary_rays(rays, x_coords, y_coords, H, W,
+                          pixel_spacing_x=1.0, pixel_spacing_y=1.0):
     """Generate orthographic camera rays for terrain intersection.
 
     Parameters
@@ -57,6 +100,10 @@ def generate_primary_rays(rays, x_coords, y_coords, H, W):
         Height of the raster.
     W : int
         Width of the raster.
+    pixel_spacing_x : float, optional
+        World-space spacing per pixel in X. Default 1.0.
+    pixel_spacing_y : float, optional
+        World-space spacing per pixel in Y. Default 1.0.
 
     Returns
     -------
@@ -80,17 +127,25 @@ def generate_primary_rays(rays, x_coords, y_coords, H, W):
         if not y_coords.flags.writeable:
             y_coords = y_coords.copy()
     _generate_primary_rays_kernel[griddim, blockdim](rays, x_coords, y_coords, H, W)
+
+    # Scale ray origins from pixel space to world space
+    if pixel_spacing_x != 1.0 or pixel_spacing_y != 1.0:
+        rays[:, :, 0] *= pixel_spacing_x
+        rays[:, :, 1] *= pixel_spacing_y
+
     return 0
 
 
-def prepare_mesh(raster, rtx=None, mesh_type='tin'):
+def prepare_mesh(raster, rtx=None, mesh_type='heightfield',
+                 pixel_spacing_x=1.0, pixel_spacing_y=1.0):
     """Prepare a triangle mesh from raster data and build the RTX acceleration structure.
 
     This function handles the common pattern of:
     1. Creating or reusing an RTX instance
     2. Checking if the mesh needs rebuilding (via hash comparison)
     3. Triangulating or voxelating the terrain
-    4. Building the GAS (Geometry Acceleration Structure)
+    4. Scaling X/Y to world coordinates using pixel_spacing
+    5. Building the GAS (Geometry Acceleration Structure)
 
     Parameters
     ----------
@@ -100,6 +155,10 @@ def prepare_mesh(raster, rtx=None, mesh_type='tin'):
         Existing RTX instance to reuse. If None, a new instance is created.
     mesh_type : str, optional
         Mesh generation method: 'tin' or 'voxel'. Default is 'tin'.
+    pixel_spacing_x : float, optional
+        World-space spacing per pixel in X. Default 1.0.
+    pixel_spacing_y : float, optional
+        World-space spacing per pixel in Y. Default 1.0.
 
     Returns
     -------
@@ -111,7 +170,7 @@ def prepare_mesh(raster, rtx=None, mesh_type='tin'):
     ValueError
         If mesh generation or GAS building fails.
     """
-    valid_types = ('tin', 'voxel')
+    valid_types = ('tin', 'voxel', 'heightfield')
     if mesh_type not in valid_types:
         raise ValueError(
             f"Invalid mesh_type '{mesh_type}'. Must be one of: {valid_types}"
@@ -122,8 +181,26 @@ def prepare_mesh(raster, rtx=None, mesh_type='tin'):
 
     H, W = raster.shape
 
-    # Include mesh_type in hash so switching types triggers rebuild
-    datahash = np.uint64(hash(str(raster.data.get()) + mesh_type) % (1 << 64))
+    if mesh_type == 'heightfield':
+        # Heightfield path: upload raw elevation grid, no triangle mesh
+        terrain_data = raster.data
+        if hasattr(terrain_data, 'get'):
+            elev_np = terrain_data.get().astype(np.float32)
+        else:
+            elev_np = np.asarray(terrain_data, dtype=np.float32)
+
+        res = rtx.add_heightfield_geometry(
+            'terrain', elev_np, H, W,
+            spacing_x=pixel_spacing_x,
+            spacing_y=pixel_spacing_y,
+        )
+        if res:
+            raise ValueError(f"Failed to build heightfield GAS. Error code: {res}")
+        return rtx
+
+    # Include mesh_type and pixel_spacing in hash so changes trigger rebuild
+    hash_str = str(raster.data.get()) + mesh_type + f'{pixel_spacing_x},{pixel_spacing_y}'
+    datahash = np.uint64(hash(hash_str) % (1 << 64))
     optixhash = np.uint64(rtx.getHash())
 
     if optixhash != datahash:
@@ -145,6 +222,11 @@ def prepare_mesh(raster, rtx=None, mesh_type='tin'):
 
         if res:
             raise ValueError(f"Failed to generate mesh from terrain. Error code: {res}")
+
+        # Scale vertex X/Y from pixel indices to world coordinates
+        if pixel_spacing_x != 1.0 or pixel_spacing_y != 1.0:
+            verts[0::3] *= pixel_spacing_x
+            verts[1::3] *= pixel_spacing_y
 
         res = rtx.build(datahash, verts, triangles)
         if res:

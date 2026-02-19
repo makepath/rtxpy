@@ -10,7 +10,7 @@ import math
 import numpy as np
 
 from .._cuda_utils import calc_dims
-from ._common import generate_primary_rays, prepare_mesh
+from ._common import generate_primary_rays, prepare_mesh, _compute_pixel_spacing
 from ..rtx import RTX, has_cupy
 
 if has_cupy:
@@ -92,7 +92,7 @@ def _calc_aspect_kernel(hits, output, H, W):
                 output[i, j] = np.float32(angle)
 
 
-def _slope_rt(raster, optix):
+def _slope_rt(raster, optix, pixel_spacing_x=1.0, pixel_spacing_y=1.0):
     """Internal: trace primary rays and compute slope."""
     xr = _lazy_import_xarray()
 
@@ -105,7 +105,9 @@ def _slope_rt(raster, optix):
     y_coords = cupy.array(raster.indexes.get('y').values)
     x_coords = cupy.array(raster.indexes.get('x').values)
 
-    generate_primary_rays(d_rays, x_coords, y_coords, H, W)
+    generate_primary_rays(d_rays, x_coords, y_coords, H, W,
+                          pixel_spacing_x=pixel_spacing_x,
+                          pixel_spacing_y=pixel_spacing_y)
     cupy.cuda.Device(0).synchronize()
     optix.trace(d_rays, d_hits, W * H)
 
@@ -134,7 +136,7 @@ def _slope_rt(raster, optix):
     )
 
 
-def _aspect_rt(raster, optix):
+def _aspect_rt(raster, optix, pixel_spacing_x=1.0, pixel_spacing_y=1.0):
     """Internal: trace primary rays and compute aspect."""
     xr = _lazy_import_xarray()
 
@@ -147,7 +149,9 @@ def _aspect_rt(raster, optix):
     y_coords = cupy.array(raster.indexes.get('y').values)
     x_coords = cupy.array(raster.indexes.get('x').values)
 
-    generate_primary_rays(d_rays, x_coords, y_coords, H, W)
+    generate_primary_rays(d_rays, x_coords, y_coords, H, W,
+                          pixel_spacing_x=pixel_spacing_x,
+                          pixel_spacing_y=pixel_spacing_y)
     cupy.cuda.Device(0).synchronize()
     optix.trace(d_rays, d_hits, W * H)
 
@@ -204,8 +208,9 @@ def slope(raster, rtx: RTX = None):
             "Additional overhead will be incurred from CPU-GPU transfers."
         )
 
-    optix = prepare_mesh(raster, rtx)
-    return _slope_rt(raster, optix)
+    psx, psy = _compute_pixel_spacing(raster)
+    optix = prepare_mesh(raster, rtx, pixel_spacing_x=psx, pixel_spacing_y=psy)
+    return _slope_rt(raster, optix, pixel_spacing_x=psx, pixel_spacing_y=psy)
 
 
 def aspect(raster, rtx: RTX = None):
@@ -240,5 +245,6 @@ def aspect(raster, rtx: RTX = None):
             "Additional overhead will be incurred from CPU-GPU transfers."
         )
 
-    optix = prepare_mesh(raster, rtx)
-    return _aspect_rt(raster, optix)
+    psx, psy = _compute_pixel_spacing(raster)
+    optix = prepare_mesh(raster, rtx, pixel_spacing_x=psx, pixel_spacing_y=psy)
+    return _aspect_rt(raster, optix, pixel_spacing_x=psx, pixel_spacing_y=psy)

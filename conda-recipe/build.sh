@@ -52,16 +52,10 @@ echo "PTX compiled successfully:"
 head -15 "${SRC_DIR}/rtxpy/kernel.ptx"
 
 # ---------------------------------------------------------------------------
-# Step 3: Install otk-pyoptix from source
+# Step 3: Install pyoptix-contrib
 # ---------------------------------------------------------------------------
-echo "=== Installing otk-pyoptix ==="
-OTK_PYOPTIX_DIR="${SRC_DIR}/otk-pyoptix"
-
-git clone --depth 1 https://github.com/NVIDIA/otk-pyoptix.git "${OTK_PYOPTIX_DIR}"
-cd "${OTK_PYOPTIX_DIR}/optix"
-
-# Install otk-pyoptix
-${PYTHON} -m pip install . --no-deps --no-build-isolation -vv
+echo "=== Installing pyoptix-contrib ==="
+${PYTHON} -m pip install pyoptix-contrib --no-deps --no-build-isolation -vv
 
 # ---------------------------------------------------------------------------
 # Step 4: Install rtxpy

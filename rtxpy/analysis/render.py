@@ -152,24 +152,128 @@ def _normalize(v):
     return v
 
 
+@cuda.jit(device=True)
+def _compute_physical_sky(ray_dx, ray_dy, ray_dz, sun_dir):
+    """Compute physical sky color from a ray direction and sun position.
+
+    Returns (r, g, b) tuple in linear HDR space (may exceed 1.0 near sun).
+    """
+    # Elevation angle of ray (0 = horizon, 1 = zenith, negative = below)
+    ray_elev = ray_dz  # z component of unit direction = sin(elevation)
+    if ray_elev < 0.0:
+        ray_elev = 0.0
+
+    # Zenith -> horizon interpolation with quadratic falloff
+    horizon_blend = 1.0 - ray_elev
+    horizon_blend = horizon_blend * horizon_blend
+
+    # Sun glow near the sun direction
+    sun_dot = ray_dx * sun_dir[0] + ray_dy * sun_dir[1] + ray_dz * sun_dir[2]
+    if sun_dot < 0.0:
+        sun_dot = 0.0
+
+    # Broad halo around sun
+    sun_glow = sun_dot * sun_dot
+    sun_glow = sun_glow * sun_glow  # ^4
+    sun_glow = sun_glow * 0.4
+
+    # Sun altitude affects brightness and warmth
+    sun_elev = sun_dir[2]
+    if sun_elev < 0.0:
+        sun_elev = 0.0
+    brightness = 0.5 + 0.5 * sun_elev
+
+    # Zenith: deep blue
+    zen_r = 0.15 * brightness
+    zen_g = 0.25 * brightness
+    zen_b = 0.55 * brightness
+
+    # Horizon: pale warm white (warmer at low sun angles)
+    warmth = 1.0 - sun_elev
+    hor_r = (0.70 + 0.20 * warmth) * brightness
+    hor_g = (0.75 + 0.05 * warmth) * brightness
+    hor_b = (0.85 - 0.15 * warmth) * brightness
+
+    # Blend zenith -> horizon + sun glow
+    sr = zen_r * (1.0 - horizon_blend) + hor_r * horizon_blend + sun_glow * 1.0
+    sg = zen_g * (1.0 - horizon_blend) + hor_g * horizon_blend + sun_glow * 0.9
+    sb = zen_b * (1.0 - horizon_blend) + hor_b * horizon_blend + sun_glow * 0.6
+
+    return sr, sg, sb
+
+
 @cuda.jit
-def _generate_perspective_rays_kernel(rays, width, height, camera_pos, forward, right, up, fov_scale):
+def _generate_perspective_rays_kernel(rays, width, height, camera_pos, forward, right, up,
+                                       fov_scale, jitter_seed, aperture, focal_distance):
     """GPU kernel to generate perspective camera rays.
 
     Uses pinhole camera model: ray_dir = forward + u*right + v*up
     where u and v are in normalized device coordinates scaled by FOV.
+    When jitter_seed > 0, adds sub-pixel random offset for anti-aliasing.
+    When aperture > 0, applies thin-lens depth-of-field (requires jitter_seed > 0).
     """
     px, py = cuda.grid(2)
     if px < width and py < height:
-        # Convert pixel to normalized device coordinates (-1 to 1)
+        idx = py * width + px
         aspect = width / height
-        u = (2.0 * (px + 0.5) / width - 1.0) * aspect * fov_scale
-        v = (1.0 - 2.0 * (py + 0.5) / height) * fov_scale
 
-        # Compute ray direction
+        if jitter_seed > 0:
+            # Hash-based RNG (same pattern as AO kernel)
+            h = np.uint32(idx * np.uint32(1337) + jitter_seed)
+            h = (h ^ (h >> np.uint32(16))) * np.uint32(2654435761)
+            h = (h ^ (h >> np.uint32(16))) * np.uint32(2246822519)
+            h = h ^ (h >> np.uint32(16))
+            jx = float(h & np.uint32(0xFFFF)) / 65535.0 - 0.5  # [-0.5, 0.5]
+            h = (h * np.uint32(1103515245) + np.uint32(12345))
+            h = h ^ (h >> np.uint32(16))
+            jy = float(h & np.uint32(0xFFFF)) / 65535.0 - 0.5
+        else:
+            jx = 0.0
+            jy = 0.0
+
+        u = (2.0 * (px + 0.5 + jx) / width - 1.0) * aspect * fov_scale
+        v = (1.0 - 2.0 * (py + 0.5 + jy) / height) * fov_scale
+
+        # Compute ray direction (unnormalized)
         dir_x = forward[0] + u * right[0] + v * up[0]
         dir_y = forward[1] + u * right[1] + v * up[1]
         dir_z = forward[2] + u * right[2] + v * up[2]
+
+        # Origin defaults to camera position
+        ox = camera_pos[0]
+        oy = camera_pos[1]
+        oz = camera_pos[2]
+
+        # Thin-lens depth of field
+        if aperture > 0.0 and jitter_seed > 0:
+            # Focal point on the focal plane (perpendicular to forward)
+            fp_x = camera_pos[0] + focal_distance * dir_x
+            fp_y = camera_pos[1] + focal_distance * dir_y
+            fp_z = camera_pos[2] + focal_distance * dir_z
+
+            # Two more random numbers for lens disk sampling
+            h = (h * np.uint32(1103515245) + np.uint32(12345))
+            h = h ^ (h >> np.uint32(16))
+            lr1 = float(h & np.uint32(0xFFFF)) / 65535.0
+            h = (h * np.uint32(1103515245) + np.uint32(12345))
+            h = h ^ (h >> np.uint32(16))
+            lr2 = float(h & np.uint32(0xFFFF)) / 65535.0
+
+            # Uniform disk sampling
+            lens_r = aperture * math.sqrt(lr1)
+            lens_phi = 2.0 * math.pi * lr2
+            lens_dx = lens_r * math.cos(lens_phi)
+            lens_dy = lens_r * math.sin(lens_phi)
+
+            # Offset origin on lens disk (in camera right/up plane)
+            ox += lens_dx * right[0] + lens_dy * up[0]
+            oy += lens_dx * right[1] + lens_dy * up[1]
+            oz += lens_dx * right[2] + lens_dy * up[2]
+
+            # New direction: from offset origin to focal point
+            dir_x = fp_x - ox
+            dir_y = fp_y - oy
+            dir_z = fp_z - oz
 
         # Normalize direction
         length = math.sqrt(dir_x * dir_x + dir_y * dir_y + dir_z * dir_z)
@@ -178,10 +282,9 @@ def _generate_perspective_rays_kernel(rays, width, height, camera_pos, forward, 
         dir_z /= length
 
         # Store ray (origin + direction)
-        idx = py * width + px
-        rays[idx, 0] = camera_pos[0]
-        rays[idx, 1] = camera_pos[1]
-        rays[idx, 2] = camera_pos[2]
+        rays[idx, 0] = ox
+        rays[idx, 1] = oy
+        rays[idx, 2] = oz
         rays[idx, 3] = 1e-3  # t_min
         rays[idx, 4] = dir_x
         rays[idx, 5] = dir_y
@@ -189,7 +292,8 @@ def _generate_perspective_rays_kernel(rays, width, height, camera_pos, forward, 
         rays[idx, 7] = np.inf  # t_max
 
 
-def _generate_perspective_rays(rays, width, height, camera_pos, forward, right, up, fov):
+def _generate_perspective_rays(rays, width, height, camera_pos, forward, right, up, fov,
+                               jitter_seed=np.uint32(0), aperture=0.0, focal_distance=0.0):
     """Generate perspective camera rays.
 
     Parameters
@@ -210,6 +314,13 @@ def _generate_perspective_rays(rays, width, height, camera_pos, forward, right, 
         Camera up vector (3,).
     fov : float
         Vertical field of view in degrees.
+    jitter_seed : np.uint32, optional
+        When > 0, adds sub-pixel jitter for anti-aliasing. Default is 0 (no jitter).
+    aperture : float, optional
+        Lens aperture radius for depth of field. 0 disables DOF. Default is 0.0.
+    focal_distance : float, optional
+        Distance to the focal plane. Objects at this distance are sharp.
+        Default is 0.0 (no DOF).
     """
     fov_scale = math.tan(math.radians(fov) / 2.0)
 
@@ -219,13 +330,19 @@ def _generate_perspective_rays(rays, width, height, camera_pos, forward, right, 
     blockspergrid = (blockspergrid_x, blockspergrid_y)
 
     _generate_perspective_rays_kernel[blockspergrid, threadsperblock](
-        rays, width, height, camera_pos, forward, right, up, fov_scale
+        rays, width, height, camera_pos, forward, right, up, fov_scale,
+        jitter_seed, np.float32(aperture), np.float32(focal_distance)
     )
 
 
 @cuda.jit
-def _generate_shadow_rays_from_hits_kernel(shadow_rays, primary_rays, hits, num_rays, sun_dir):
-    """GPU kernel to generate shadow rays from primary hit points toward the sun."""
+def _generate_shadow_rays_from_hits_kernel(shadow_rays, primary_rays, hits, num_rays, sun_dir,
+                                            sun_angle_rad, shadow_seed):
+    """GPU kernel to generate shadow rays from primary hit points toward the sun.
+
+    When shadow_seed > 0 and sun_angle_rad > 0, jitters the shadow ray direction
+    within a cone around sun_dir for soft shadows (finite-size light source).
+    """
     idx = cuda.grid(1)
     if idx < num_rays:
         t = hits[idx, 0]
@@ -262,13 +379,65 @@ def _generate_shadow_rays_from_hits_kernel(shadow_rays, primary_rays, hits, num_
             origin_y = hit_y + ny * offset
             origin_z = hit_z + nz * offset
 
+            # Compute shadow direction (possibly jittered for soft shadows)
+            if shadow_seed > 0 and sun_angle_rad > 0.0:
+                # Hash-based RNG (same pattern as AO kernel)
+                h = np.uint32(idx * np.uint32(2719) + shadow_seed)
+                h = (h ^ (h >> np.uint32(16))) * np.uint32(2654435761)
+                h = (h ^ (h >> np.uint32(16))) * np.uint32(2246822519)
+                h = h ^ (h >> np.uint32(16))
+                r1 = float(h & np.uint32(0xFFFF)) / 65535.0
+                h = (h * np.uint32(1103515245) + np.uint32(12345))
+                h = h ^ (h >> np.uint32(16))
+                r2 = float(h & np.uint32(0xFFFF)) / 65535.0
+
+                # Uniform disk -> cone deflection
+                cone_r = sun_angle_rad * math.sqrt(r1)
+                cone_phi = 2.0 * math.pi * r2
+                dx_local = cone_r * math.cos(cone_phi)
+                dy_local = cone_r * math.sin(cone_phi)
+
+                # Build tangent frame from sun_dir
+                sx = sun_dir[0]
+                sy = sun_dir[1]
+                sz = sun_dir[2]
+                if abs(sx) < 0.9:
+                    tx = 0.0
+                    ty = -sz
+                    tz = sy
+                else:
+                    tx = sz
+                    ty = 0.0
+                    tz = -sx
+                t_len = math.sqrt(tx * tx + ty * ty + tz * tz)
+                if t_len > 1e-8:
+                    tx /= t_len
+                    ty /= t_len
+                    tz /= t_len
+                bx = sy * tz - sz * ty
+                by = sz * tx - sx * tz
+                bz = sx * ty - sy * tx
+
+                # Perturbed direction
+                sdx = sx + dx_local * tx + dy_local * bx
+                sdy = sy + dx_local * ty + dy_local * by
+                sdz = sz + dx_local * tz + dy_local * bz
+                s_len = math.sqrt(sdx * sdx + sdy * sdy + sdz * sdz)
+                sdx /= s_len
+                sdy /= s_len
+                sdz /= s_len
+            else:
+                sdx = sun_dir[0]
+                sdy = sun_dir[1]
+                sdz = sun_dir[2]
+
             shadow_rays[idx, 0] = origin_x
             shadow_rays[idx, 1] = origin_y
             shadow_rays[idx, 2] = origin_z
             shadow_rays[idx, 3] = 1e-3  # t_min
-            shadow_rays[idx, 4] = sun_dir[0]
-            shadow_rays[idx, 5] = sun_dir[1]
-            shadow_rays[idx, 6] = sun_dir[2]
+            shadow_rays[idx, 4] = sdx
+            shadow_rays[idx, 5] = sdy
+            shadow_rays[idx, 6] = sdz
             shadow_rays[idx, 7] = np.inf  # t_max
         else:
             # No hit - shadow ray should not trace
@@ -282,19 +451,367 @@ def _generate_shadow_rays_from_hits_kernel(shadow_rays, primary_rays, hits, num_
             shadow_rays[idx, 7] = 0  # t_max = 0 means no trace
 
 
-def _generate_shadow_rays_from_hits(shadow_rays, primary_rays, hits, num_rays, sun_dir):
+def _generate_shadow_rays_from_hits(shadow_rays, primary_rays, hits, num_rays, sun_dir,
+                                     sun_angle_rad=0.0, shadow_seed=np.uint32(0)):
     """Generate shadow rays from primary ray hit points toward the sun."""
     threadsperblock = 256
     blockspergrid = (num_rays + threadsperblock - 1) // threadsperblock
 
     _generate_shadow_rays_from_hits_kernel[blockspergrid, threadsperblock](
-        shadow_rays, primary_rays, hits, num_rays, sun_dir
+        shadow_rays, primary_rays, hits, num_rays, sun_dir, sun_angle_rad, shadow_seed
+    )
+
+
+@cuda.jit
+def _generate_ao_rays_kernel(ao_rays, primary_rays, hits, num_rays, ao_radius, seed):
+    """GPU kernel to generate ambient occlusion rays from primary hit points.
+
+    For each pixel with a hit, generates a cosine-weighted random direction
+    on the hemisphere around the surface normal, with tmax limited to ao_radius.
+    Uses a simple hash-based RNG seeded per pixel.
+    """
+    idx = cuda.grid(1)
+    if idx < num_rays:
+        t = hits[idx, 0]
+
+        if t > 0:
+            # Get normal at hit point
+            nx = hits[idx, 1]
+            ny = hits[idx, 2]
+            nz = hits[idx, 3]
+
+            # Flip normal if facing away from ray
+            ray_dx = primary_rays[idx, 4]
+            ray_dy = primary_rays[idx, 5]
+            ray_dz = primary_rays[idx, 6]
+
+            dot_nd = nx * ray_dx + ny * ray_dy + nz * ray_dz
+            if dot_nd > 0:
+                nx = -nx
+                ny = -ny
+                nz = -nz
+
+            # Compute hit point
+            ox = primary_rays[idx, 0]
+            oy = primary_rays[idx, 1]
+            oz = primary_rays[idx, 2]
+
+            hit_x = ox + t * ray_dx
+            hit_y = oy + t * ray_dy
+            hit_z = oz + t * ray_dz
+
+            # Offset along normal to avoid self-intersection
+            offset = 1e-3
+            origin_x = hit_x + nx * offset
+            origin_y = hit_y + ny * offset
+            origin_z = hit_z + nz * offset
+
+            # Hash-based RNG: two uniform randoms from pixel index + seed
+            h = np.uint32(idx * np.uint32(1337) + seed)
+            h = (h ^ (h >> np.uint32(16))) * np.uint32(2654435761)
+            h = (h ^ (h >> np.uint32(16))) * np.uint32(2246822519)
+            h = h ^ (h >> np.uint32(16))
+            r1 = float(h & np.uint32(0xFFFF)) / 65535.0
+
+            h = (h * np.uint32(1103515245) + np.uint32(12345))
+            h = h ^ (h >> np.uint32(16))
+            r2 = float(h & np.uint32(0xFFFF)) / 65535.0
+
+            # Cosine-weighted hemisphere sample in local coords
+            # r1 = cos^2(theta), so cos_theta = sqrt(r1)
+            cos_theta = math.sqrt(r1)
+            sin_theta = math.sqrt(1.0 - r1)
+            phi = 2.0 * math.pi * r2
+            local_x = sin_theta * math.cos(phi)
+            local_y = sin_theta * math.sin(phi)
+            local_z = cos_theta
+
+            # Build tangent frame from normal
+            # Choose a vector not parallel to normal
+            if abs(nx) < 0.9:
+                tx = 0.0
+                ty = -nz
+                tz = ny
+            else:
+                tx = nz
+                ty = 0.0
+                tz = -nx
+            # Normalize tangent
+            t_len = math.sqrt(tx * tx + ty * ty + tz * tz)
+            if t_len > 1e-8:
+                tx /= t_len
+                ty /= t_len
+                tz /= t_len
+
+            # Bitangent = normal x tangent
+            bx = ny * tz - nz * ty
+            by = nz * tx - nx * tz
+            bz = nx * ty - ny * tx
+
+            # Transform local -> world
+            dir_x = local_x * tx + local_y * bx + local_z * nx
+            dir_y = local_x * ty + local_y * by + local_z * ny
+            dir_z = local_x * tz + local_y * bz + local_z * nz
+
+            # Normalize direction (should be unit already but be safe)
+            d_len = math.sqrt(dir_x * dir_x + dir_y * dir_y + dir_z * dir_z)
+            if d_len > 1e-8:
+                dir_x /= d_len
+                dir_y /= d_len
+                dir_z /= d_len
+
+            ao_rays[idx, 0] = origin_x
+            ao_rays[idx, 1] = origin_y
+            ao_rays[idx, 2] = origin_z
+            ao_rays[idx, 3] = 1e-3  # t_min
+            ao_rays[idx, 4] = dir_x
+            ao_rays[idx, 5] = dir_y
+            ao_rays[idx, 6] = dir_z
+            ao_rays[idx, 7] = ao_radius  # t_max
+        else:
+            # No hit - AO ray should not trace
+            ao_rays[idx, 0] = 0
+            ao_rays[idx, 1] = 0
+            ao_rays[idx, 2] = 0
+            ao_rays[idx, 3] = 0
+            ao_rays[idx, 4] = 0
+            ao_rays[idx, 5] = 0
+            ao_rays[idx, 6] = 1
+            ao_rays[idx, 7] = 0  # t_max = 0 means no trace
+
+
+def _generate_ao_rays(ao_rays, primary_rays, hits, num_rays, ao_radius, seed):
+    """Generate ambient occlusion rays from primary ray hit points."""
+    threadsperblock = 256
+    blockspergrid = (num_rays + threadsperblock - 1) // threadsperblock
+
+    _generate_ao_rays_kernel[blockspergrid, threadsperblock](
+        ao_rays, primary_rays, hits, num_rays, ao_radius, np.uint32(seed)
+    )
+
+
+@cuda.jit
+def _accumulate_ao_kernel(ao_factor, ao_hits, num_rays, ao_samples):
+    """GPU kernel to accumulate AO results: subtract 1/ao_samples for each hit."""
+    idx = cuda.grid(1)
+    if idx < num_rays:
+        t = ao_hits[idx, 0]
+        if t > 0:
+            ao_factor[idx] -= 1.0 / ao_samples
+
+
+def _accumulate_ao(ao_factor, ao_hits, num_rays, ao_samples):
+    """Accumulate AO hit results into the ao_factor buffer."""
+    threadsperblock = 256
+    blockspergrid = (num_rays + threadsperblock - 1) // threadsperblock
+
+    _accumulate_ao_kernel[blockspergrid, threadsperblock](
+        ao_factor, ao_hits, num_rays, ao_samples
+    )
+
+
+@cuda.jit
+def _accumulate_gi_kernel(gi_color, ao_rays, ao_hits, num_rays, ao_samples,
+                          vertical_exaggeration, elev_min, elev_range,
+                          color_lut, color_stretch, gi_throughput):
+    """GPU kernel to accumulate multi-bounce diffuse GI from AO hit points.
+
+    For each AO ray that hit a surface, looks up the surface color at the hit
+    point (via elevation -> colormap LUT) and accumulates it into gi_color,
+    weighted by the current path throughput. Then updates throughput by
+    multiplying with the hit surface albedo (Lambertian BRDF).
+
+    Bounce 0 with throughput=(1,1,1) is identical to single-bounce GI.
+    Subsequent bounces are naturally attenuated by accumulated albedo product.
+    """
+    idx = cuda.grid(1)
+    if idx < num_rays:
+        t = ao_hits[idx, 0]
+        if t > 0:
+            # Hit position Z -> elevation
+            hit_z = ao_rays[idx, 2] + t * ao_rays[idx, 6]
+            elevation = hit_z / vertical_exaggeration
+
+            # Normalize elevation to [0, 1] for colormap lookup
+            if elev_range > 0:
+                elev_norm = (elevation - elev_min) / elev_range
+            else:
+                elev_norm = 0.5
+
+            if elev_norm < 0.0:
+                elev_norm = 0.0
+            elif elev_norm > 1.0:
+                elev_norm = 1.0
+
+            # Apply nonlinear stretch: 0=linear, 1=cbrt, 2=log, 3=sqrt
+            if color_stretch == 1:
+                elev_norm = math.pow(elev_norm, 1.0 / 3.0)
+            elif color_stretch == 2:
+                elev_norm = math.log(1.0 + elev_norm * 9.0) / math.log(10.0)
+            elif color_stretch == 3:
+                elev_norm = math.sqrt(elev_norm)
+
+            # Color lookup
+            lut_idx = int(elev_norm * 255)
+            if lut_idx > 255:
+                lut_idx = 255
+            if lut_idx < 0:
+                lut_idx = 0
+
+            hit_r = color_lut[lut_idx, 0]
+            hit_g = color_lut[lut_idx, 1]
+            hit_b = color_lut[lut_idx, 2]
+
+            # Accumulate weighted by path throughput
+            gi_color[idx, 0] += gi_throughput[idx, 0] * hit_r / ao_samples
+            gi_color[idx, 1] += gi_throughput[idx, 1] * hit_g / ao_samples
+            gi_color[idx, 2] += gi_throughput[idx, 2] * hit_b / ao_samples
+
+            # Update throughput: Lambertian BRDF = albedo/pi,
+            # cosine-weighted pdf = cos/pi -> cancel to albedo
+            gi_throughput[idx, 0] *= hit_r
+            gi_throughput[idx, 1] *= hit_g
+            gi_throughput[idx, 2] *= hit_b
+
+
+def _accumulate_gi(gi_color, ao_rays, ao_hits, num_rays, ao_samples,
+                   vertical_exaggeration, elev_min, elev_range,
+                   color_lut, color_stretch, gi_throughput):
+    """Accumulate multi-bounce diffuse GI from AO hit points."""
+    threadsperblock = 256
+    blockspergrid = (num_rays + threadsperblock - 1) // threadsperblock
+
+    _accumulate_gi_kernel[blockspergrid, threadsperblock](
+        gi_color, ao_rays, ao_hits, num_rays, ao_samples,
+        np.float32(vertical_exaggeration), np.float32(elev_min),
+        np.float32(elev_range), color_lut, np.int32(color_stretch),
+        gi_throughput
+    )
+
+
+@cuda.jit
+def _generate_reflection_rays_kernel(reflection_rays, primary_rays, primary_hits,
+                                      instance_ids, geometry_colors, num_rays,
+                                      elevation_data, pixel_spacing_x, pixel_spacing_y):
+    """GPU kernel to generate reflection rays for water surfaces.
+
+    For water pixels (geometry_colors alpha >= 2.0) and NaN ocean terrain,
+    computes mirror reflection direction R = D - 2(D·N)N from the primary hit
+    point. Non-water pixels get t_max = 0 (no trace).
+    """
+    idx = cuda.grid(1)
+    if idx < num_rays:
+        t = primary_hits[idx, 0]
+
+        # Default: no trace
+        is_water = False
+        is_ocean = False
+        if t > 0:
+            inst_id = instance_ids[idx]
+            if inst_id >= 0 and inst_id < geometry_colors.shape[0]:
+                gc_alpha = geometry_colors[inst_id, 3]
+                if gc_alpha >= 2.0:
+                    is_water = True
+
+            # Check if terrain hit is NaN ocean
+            if not is_water:
+                ray_dx = primary_rays[idx, 4]
+                ray_dy = primary_rays[idx, 5]
+                ray_dz = primary_rays[idx, 6]
+                ox = primary_rays[idx, 0]
+                oy = primary_rays[idx, 1]
+                hit_x = ox + t * ray_dx
+                hit_y = oy + t * ray_dy
+                ey = int(hit_y / pixel_spacing_y + 0.5)
+                ex = int(hit_x / pixel_spacing_x + 0.5)
+                if 0 <= ey < elevation_data.shape[0] and 0 <= ex < elevation_data.shape[1]:
+                    if math.isnan(elevation_data[ey, ex]):
+                        is_water = True
+                        is_ocean = True
+
+        if is_water:
+            # Get normal at hit point
+            nx = primary_hits[idx, 1]
+            ny = primary_hits[idx, 2]
+            nz = primary_hits[idx, 3]
+
+            # Ocean: force flat water normal
+            if is_ocean:
+                nx = 0.0
+                ny = 0.0
+                nz = 1.0
+
+            # Flip normal if facing away from ray
+            ray_dx = primary_rays[idx, 4]
+            ray_dy = primary_rays[idx, 5]
+            ray_dz = primary_rays[idx, 6]
+
+            dot_nd = nx * ray_dx + ny * ray_dy + nz * ray_dz
+            if dot_nd > 0:
+                nx = -nx
+                ny = -ny
+                nz = -nz
+                dot_nd = -dot_nd
+
+            # Compute hit point
+            ox = primary_rays[idx, 0]
+            oy = primary_rays[idx, 1]
+            oz = primary_rays[idx, 2]
+
+            hit_x = ox + t * ray_dx
+            hit_y = oy + t * ray_dy
+            hit_z = oz + t * ray_dz
+
+            # Reflection direction: R = D - 2(D·N)N
+            ref_dx = ray_dx - 2.0 * dot_nd * nx
+            ref_dy = ray_dy - 2.0 * dot_nd * ny
+            ref_dz = ray_dz - 2.0 * dot_nd * nz
+
+            # Normalize
+            r_len = math.sqrt(ref_dx * ref_dx + ref_dy * ref_dy + ref_dz * ref_dz)
+            if r_len > 1e-8:
+                ref_dx /= r_len
+                ref_dy /= r_len
+                ref_dz /= r_len
+
+            # Offset origin along normal to avoid self-intersection
+            offset = 1e-2
+            reflection_rays[idx, 0] = hit_x + nx * offset
+            reflection_rays[idx, 1] = hit_y + ny * offset
+            reflection_rays[idx, 2] = hit_z + nz * offset
+            reflection_rays[idx, 3] = 1e-3  # t_min
+            reflection_rays[idx, 4] = ref_dx
+            reflection_rays[idx, 5] = ref_dy
+            reflection_rays[idx, 6] = ref_dz
+            reflection_rays[idx, 7] = np.inf  # t_max
+        else:
+            # Not water — no trace needed
+            reflection_rays[idx, 0] = 0.0
+            reflection_rays[idx, 1] = 0.0
+            reflection_rays[idx, 2] = 0.0
+            reflection_rays[idx, 3] = 0.0
+            reflection_rays[idx, 4] = 0.0
+            reflection_rays[idx, 5] = 0.0
+            reflection_rays[idx, 6] = 1.0
+            reflection_rays[idx, 7] = 0.0  # t_max = 0 -> no trace
+
+
+def _generate_reflection_rays(reflection_rays, primary_rays, primary_hits,
+                               instance_ids, geometry_colors, num_rays,
+                               elevation_data, pixel_spacing_x, pixel_spacing_y):
+    """Generate reflection rays for water surfaces and NaN ocean terrain."""
+    threadsperblock = 256
+    blockspergrid = (num_rays + threadsperblock - 1) // threadsperblock
+    _generate_reflection_rays_kernel[blockspergrid, threadsperblock](
+        reflection_rays, primary_rays, primary_hits,
+        instance_ids, geometry_colors, num_rays,
+        elevation_data, np.float32(pixel_spacing_x), np.float32(pixel_spacing_y)
     )
 
 
 @cuda.jit
 def _shade_terrain_kernel(
-    output, primary_rays, primary_hits, shadow_hits,
+    output, albedo_out, primary_rays, primary_hits, shadow_hits,
     elevation_data, color_lut, num_rays, width, height,
     sun_dir, ambient, cast_shadows,
     fog_density, fog_color_r, fog_color_g, fog_color_b,
@@ -306,7 +823,9 @@ def _shade_terrain_kernel(
     color_stretch,
     rgb_texture,
     overlay_data, overlay_alpha, overlay_min, overlay_range,
-    instance_ids, geometry_colors
+    instance_ids, geometry_colors,
+    ao_factor, gi_color, gi_intensity,
+    reflection_hits, reflection_rays
 ):
     """GPU kernel for terrain shading with lighting, shadows, fog, colormapping, and viewshed."""
     idx = cuda.grid(1)
@@ -373,90 +892,113 @@ def _shade_terrain_kernel(
                 elev_h = elevation_data.shape[0]
                 elev_w = elevation_data.shape[1]
 
-                # RGB texture mode: real texture has shape > 1, dummy is (1,1,3)
-                tex_h = rgb_texture.shape[0]
-                tex_w = rgb_texture.shape[1]
+                # Check for NaN ocean terrain
+                is_nan_ocean = False
+                if 0 <= elev_y < elev_h and 0 <= elev_x < elev_w:
+                    if math.isnan(elevation_data[elev_y, elev_x]):
+                        is_nan_ocean = True
 
-                if tex_h > 1:
-                    # Sample RGB directly from tile texture
-                    if elev_y >= 0 and elev_y < tex_h and elev_x >= 0 and elev_x < tex_w:
-                        base_r = rgb_texture[elev_y, elev_x, 0]
-                        base_g = rgb_texture[elev_y, elev_x, 1]
-                        base_b = rgb_texture[elev_y, elev_x, 2]
-                    else:
-                        base_r = 0.3
-                        base_g = 0.3
-                        base_b = 0.3
+                if is_nan_ocean:
+                    # Ocean water — deep blue base, flat normal, water shader
+                    is_water = True
+                    water_specular = 0.12
+                    base_r = 0.06
+                    base_g = 0.12
+                    base_b = 0.22
+                    nx = 0.0
+                    ny = 0.0
+                    nz = 1.0
                 else:
-                    if elev_y >= 0 and elev_y < elev_h and elev_x >= 0 and elev_x < elev_w:
-                        elevation = elevation_data[elev_y, elev_x]
+                    # RGB texture mode: real texture has shape > 1, dummy is (1,1,3)
+                    tex_h = rgb_texture.shape[0]
+                    tex_w = rgb_texture.shape[1]
+
+                    if tex_h > 1:
+                        # Sample RGB directly from tile texture
+                        if elev_y >= 0 and elev_y < tex_h and elev_x >= 0 and elev_x < tex_w:
+                            base_r = rgb_texture[elev_y, elev_x, 0]
+                            base_g = rgb_texture[elev_y, elev_x, 1]
+                            base_b = rgb_texture[elev_y, elev_x, 2]
+                        else:
+                            base_r = 0.3
+                            base_g = 0.3
+                            base_b = 0.3
                     else:
-                        elevation = hit_z
+                        if elev_y >= 0 and elev_y < elev_h and elev_x >= 0 and elev_x < elev_w:
+                            elevation = elevation_data[elev_y, elev_x]
+                        else:
+                            elevation = hit_z
 
-                    # Normalize elevation to [0, 1] for colormap lookup
-                    if elev_range > 0:
-                        elev_norm = (elevation - elev_min) / elev_range
-                    else:
-                        elev_norm = 0.5
+                        # Normalize elevation to [0, 1] for colormap lookup
+                        if elev_range > 0:
+                            elev_norm = (elevation - elev_min) / elev_range
+                        else:
+                            elev_norm = 0.5
 
-                    if elev_norm < 0:
-                        elev_norm = 0.0
-                    elif elev_norm > 1:
-                        elev_norm = 1.0
+                        if elev_norm < 0:
+                            elev_norm = 0.0
+                        elif elev_norm > 1:
+                            elev_norm = 1.0
 
-                    # Apply nonlinear stretch: 0=linear, 1=cbrt, 2=log, 3=sqrt
-                    if color_stretch == 1:
-                        elev_norm = math.pow(elev_norm, 1.0 / 3.0)
-                    elif color_stretch == 2:
-                        elev_norm = math.log(1.0 + elev_norm * 9.0) / math.log(10.0)
-                    elif color_stretch == 3:
-                        elev_norm = math.sqrt(elev_norm)
+                        # Apply nonlinear stretch: 0=linear, 1=cbrt, 2=log, 3=sqrt
+                        if color_stretch == 1:
+                            elev_norm = math.pow(elev_norm, 1.0 / 3.0)
+                        elif color_stretch == 2:
+                            elev_norm = math.log(1.0 + elev_norm * 9.0) / math.log(10.0)
+                        elif color_stretch == 3:
+                            elev_norm = math.sqrt(elev_norm)
 
-                    # Color lookup
-                    lut_idx = int(elev_norm * 255)
-                    if lut_idx > 255:
-                        lut_idx = 255
-                    if lut_idx < 0:
-                        lut_idx = 0
+                        # Color lookup
+                        lut_idx = int(elev_norm * 255)
+                        if lut_idx > 255:
+                            lut_idx = 255
+                        if lut_idx < 0:
+                            lut_idx = 0
 
-                    base_r = color_lut[lut_idx, 0]
-                    base_g = color_lut[lut_idx, 1]
-                    base_b = color_lut[lut_idx, 2]
+                        base_r = color_lut[lut_idx, 0]
+                        base_g = color_lut[lut_idx, 1]
+                        base_b = color_lut[lut_idx, 2]
 
-                # Overlay blending: transparent scalar layer on top of base
-                ov_h = overlay_data.shape[0]
-                ov_w = overlay_data.shape[1]
-                if ov_h > 1 and overlay_alpha > 0.0:
-                    if elev_y >= 0 and elev_y < ov_h and elev_x >= 0 and elev_x < ov_w:
-                        ov_val = overlay_data[elev_y, elev_x]
-                        if not math.isnan(ov_val):
-                            if overlay_range > 0:
-                                ov_norm = (ov_val - overlay_min) / overlay_range
-                            else:
-                                ov_norm = 0.5
-                            if ov_norm < 0:
-                                ov_norm = 0.0
-                            elif ov_norm > 1:
-                                ov_norm = 1.0
-                            # Apply same color stretch
-                            if color_stretch == 1:
-                                ov_norm = math.pow(ov_norm, 1.0 / 3.0)
-                            elif color_stretch == 2:
-                                ov_norm = math.log(1.0 + ov_norm * 9.0) / math.log(10.0)
-                            elif color_stretch == 3:
-                                ov_norm = math.sqrt(ov_norm)
-                            ov_idx = int(ov_norm * 255)
-                            if ov_idx > 255:
-                                ov_idx = 255
-                            if ov_idx < 0:
-                                ov_idx = 0
-                            ov_r = color_lut[ov_idx, 0]
-                            ov_g = color_lut[ov_idx, 1]
-                            ov_b = color_lut[ov_idx, 2]
-                            a = overlay_alpha
-                            base_r = base_r * (1.0 - a) + ov_r * a
-                            base_g = base_g * (1.0 - a) + ov_g * a
-                            base_b = base_b * (1.0 - a) + ov_b * a
+                    # Overlay blending: transparent scalar layer on top of base
+                    ov_h = overlay_data.shape[0]
+                    ov_w = overlay_data.shape[1]
+                    if ov_h > 1 and overlay_alpha > 0.0:
+                        if elev_y >= 0 and elev_y < ov_h and elev_x >= 0 and elev_x < ov_w:
+                            ov_val = overlay_data[elev_y, elev_x]
+                            if not math.isnan(ov_val):
+                                if overlay_range > 0:
+                                    ov_norm = (ov_val - overlay_min) / overlay_range
+                                else:
+                                    ov_norm = 0.5
+                                if ov_norm < 0:
+                                    ov_norm = 0.0
+                                elif ov_norm > 1:
+                                    ov_norm = 1.0
+                                # Apply same color stretch
+                                if color_stretch == 1:
+                                    ov_norm = math.pow(ov_norm, 1.0 / 3.0)
+                                elif color_stretch == 2:
+                                    ov_norm = math.log(1.0 + ov_norm * 9.0) / math.log(10.0)
+                                elif color_stretch == 3:
+                                    ov_norm = math.sqrt(ov_norm)
+                                ov_idx = int(ov_norm * 255)
+                                if ov_idx > 255:
+                                    ov_idx = 255
+                                if ov_idx < 0:
+                                    ov_idx = 0
+                                ov_r = color_lut[ov_idx, 0]
+                                ov_g = color_lut[ov_idx, 1]
+                                ov_b = color_lut[ov_idx, 2]
+                                a = overlay_alpha
+                                base_r = base_r * (1.0 - a) + ov_r * a
+                                base_g = base_g * (1.0 - a) + ov_g * a
+                                base_b = base_b * (1.0 - a) + ov_b * a
+
+            # Write albedo (material color before lighting) for denoiser guide
+            if albedo_out.shape[0] > 1:
+                albedo_out[py, px, 0] = base_r
+                albedo_out[py, px, 1] = base_g
+                albedo_out[py, px, 2] = base_b
 
             # Lambertian shading
             cos_theta = nx * sun_dir[0] + ny * sun_dir[1] + nz * sun_dir[2]
@@ -473,21 +1015,117 @@ def _shade_terrain_kernel(
             # Final lighting
             diffuse = cos_theta * shadow_factor
             lighting = ambient + (1.0 - ambient) * diffuse
+            # Apply ambient occlusion
+            lighting *= ao_factor[idx]
             # Emissive glow: raise the lighting floor
             if emissive > 0.0:
                 if lighting < emissive:
                     lighting = emissive
 
-            color_r = base_r * lighting
-            color_g = base_g * lighting
-            color_b = base_b * lighting
+            color_r = base_r * lighting + base_r * gi_color[idx, 0] * gi_intensity
+            color_g = base_g * lighting + base_g * gi_color[idx, 1] * gi_intensity
+            color_b = base_b * lighting + base_b * gi_color[idx, 2] * gi_intensity
 
-            # Water shader: specular highlight + Fresnel rim
+            # Water shader: reflections + specular highlight + Fresnel
             if is_water:
-                # Blinn-Phong specular: H = normalize(L + V)
+                # Procedural wave normals for shimmer
+                wx = hit_x * 0.5
+                wy = hit_y * 0.5
+                h1 = (math.sin(wx * 1.1 + wy * 0.7) * 0.4
+                      + math.sin(wx * 2.3 - wy * 1.9) * 0.3)
+                h2 = (math.sin(wx * 0.8 - wy * 1.3) * 0.4
+                      + math.sin(wx * 1.7 + wy * 2.1) * 0.3)
+                wave_strength = 0.015
+                nx += h1 * wave_strength
+                ny += h2 * wave_strength
+                n_len = math.sqrt(nx * nx + ny * ny + nz * nz)
+                nx /= n_len
+                ny /= n_len
+                nz /= n_len
+
+                # View direction
                 vx = -ray_dx
                 vy = -ray_dy
                 vz = -ray_dz
+
+                # Fresnel: more reflective at grazing angles
+                n_dot_v = abs(nx * vx + ny * vy + nz * vz)
+                fresnel = 0.3 + 0.7 * (1.0 - n_dot_v)
+
+                # Compute reflection color from traced reflection rays
+                refl_t = reflection_hits[idx, 0]
+                if refl_t > 0:
+                    # Reflection hit terrain — shade with simple colormap + diffuse
+                    refl_hx = reflection_rays[idx, 0] + refl_t * reflection_rays[idx, 4]
+                    refl_hy = reflection_rays[idx, 1] + refl_t * reflection_rays[idx, 5]
+                    refl_hz = reflection_rays[idx, 2] + refl_t * reflection_rays[idx, 6]
+
+                    # Look up elevation at reflected hit point
+                    refl_ey = int(refl_hy / pixel_spacing_y + 0.5)
+                    refl_ex = int(refl_hx / pixel_spacing_x + 0.5)
+                    elev_h = elevation_data.shape[0]
+                    elev_w = elevation_data.shape[1]
+
+                    # Check for RGB texture first
+                    tex_h = rgb_texture.shape[0]
+                    tex_w = rgb_texture.shape[1]
+
+                    if tex_h > 1 and refl_ey >= 0 and refl_ey < tex_h and refl_ex >= 0 and refl_ex < tex_w:
+                        refl_r = rgb_texture[refl_ey, refl_ex, 0]
+                        refl_g = rgb_texture[refl_ey, refl_ex, 1]
+                        refl_b = rgb_texture[refl_ey, refl_ex, 2]
+                    elif refl_ey >= 0 and refl_ey < elev_h and refl_ex >= 0 and refl_ex < elev_w:
+                        refl_elev = elevation_data[refl_ey, refl_ex]
+                        if elev_range > 0:
+                            refl_norm = (refl_elev - elev_min) / elev_range
+                        else:
+                            refl_norm = 0.5
+                        if refl_norm < 0.0:
+                            refl_norm = 0.0
+                        elif refl_norm > 1.0:
+                            refl_norm = 1.0
+                        refl_lut = int(refl_norm * 255)
+                        if refl_lut > 255:
+                            refl_lut = 255
+                        if refl_lut < 0:
+                            refl_lut = 0
+                        refl_r = color_lut[refl_lut, 0]
+                        refl_g = color_lut[refl_lut, 1]
+                        refl_b = color_lut[refl_lut, 2]
+                    else:
+                        refl_r = 0.3
+                        refl_g = 0.3
+                        refl_b = 0.3
+
+                    # Simple diffuse lighting on reflected surface
+                    refl_nx = reflection_hits[idx, 1]
+                    refl_ny = reflection_hits[idx, 2]
+                    refl_nz = reflection_hits[idx, 3]
+                    refl_cos = refl_nx * sun_dir[0] + refl_ny * sun_dir[1] + refl_nz * sun_dir[2]
+                    if refl_cos < 0.0:
+                        refl_cos = -refl_cos
+                    refl_light = ambient + (1.0 - ambient) * refl_cos
+                    refl_r *= refl_light
+                    refl_g *= refl_light
+                    refl_b *= refl_light
+                else:
+                    # Reflection miss -> sky
+                    ref_dx = reflection_rays[idx, 4]
+                    ref_dy = reflection_rays[idx, 5]
+                    ref_dz = reflection_rays[idx, 6]
+                    if sky_color_r < 0:
+                        refl_r, refl_g, refl_b = _compute_physical_sky(ref_dx, ref_dy, ref_dz, sun_dir)
+                    else:
+                        refl_r = sky_color_r
+                        refl_g = sky_color_g
+                        refl_b = sky_color_b
+
+                # Blend base water color with reflection using Fresnel
+                color_r = color_r * (1.0 - fresnel) + refl_r * fresnel
+                color_g = color_g * (1.0 - fresnel) + refl_g * fresnel
+                color_b = color_b * (1.0 - fresnel) + refl_b * fresnel
+
+                # Blinn-Phong specular: H = normalize(L + V)
                 hx = sun_dir[0] + vx
                 hy = sun_dir[1] + vy
                 hz = sun_dir[2] + vz
@@ -508,14 +1146,10 @@ def _shade_terrain_kernel(
                 spec = spec * spec     # ^64
                 spec *= water_specular * shadow_factor
 
-                # Fresnel-like darkening at steep view angles
-                n_dot_v = abs(nx * vx + ny * vy + nz * vz)
-                fresnel = 0.3 + 0.7 * (1.0 - n_dot_v)
-
-                # Darken base color at steep angles, add specular
-                color_r = color_r * (0.7 + 0.3 * fresnel) + spec
-                color_g = color_g * (0.7 + 0.3 * fresnel) + spec
-                color_b = color_b * (0.7 + 0.3 * fresnel) + spec * 0.9
+                # Add specular on top
+                color_r += spec
+                color_g += spec
+                color_b += spec * 0.9
 
             # Observer marker removed — drone mesh is placed as scene geometry
 
@@ -540,14 +1174,6 @@ def _shade_terrain_kernel(
                             color_g = color_g * (1.0 - alpha) + 0.9 * alpha
                             color_b = color_b * (1.0 - alpha) + 0.85 * alpha
 
-            # Clamp
-            if color_r > 1.0:
-                color_r = 1.0
-            if color_g > 1.0:
-                color_g = 1.0
-            if color_b > 1.0:
-                color_b = 1.0
-
             # Fog
             if fog_density > 0:
                 fog_amount = 1.0 - math.exp(-fog_density * t)
@@ -561,18 +1187,276 @@ def _shade_terrain_kernel(
             if alpha_channel:
                 output[py, px, 3] = 1.0
         else:
+            # Miss - black albedo (sky has no material)
+            if albedo_out.shape[0] > 1:
+                albedo_out[py, px, 0] = 0.0
+                albedo_out[py, px, 1] = 0.0
+                albedo_out[py, px, 2] = 0.0
             # Miss - sky color
-            output[py, px, 0] = sky_color_r
-            output[py, px, 1] = sky_color_g
-            output[py, px, 2] = sky_color_b
+            if sky_color_r < 0:
+                # Physical sky via shared device function
+                ray_dx = primary_rays[idx, 4]
+                ray_dy = primary_rays[idx, 5]
+                ray_dz = primary_rays[idx, 6]
+
+                sr, sg, sb = _compute_physical_sky(ray_dx, ray_dy, ray_dz, sun_dir)
+                if sr > 1.0:
+                    sr = 1.0
+                if sg > 1.0:
+                    sg = 1.0
+                if sb > 1.0:
+                    sb = 1.0
+
+                output[py, px, 0] = sr
+                output[py, px, 1] = sg
+                output[py, px, 2] = sb
+            else:
+                output[py, px, 0] = sky_color_r
+                output[py, px, 1] = sky_color_g
+                output[py, px, 2] = sky_color_b
             if alpha_channel:
                 output[py, px, 3] = 0.0
+
+
+@cuda.jit
+def _tone_map_aces_kernel(output, height, width, num_channels):
+    """Apply ACES filmic tone mapping in-place (Stephen Hill approximation)."""
+    idx = cuda.grid(1)
+    if idx < height * width:
+        py = idx // width
+        px = idx % width
+        for c in range(num_channels):
+            x = output[py, px, c]
+            # ACES filmic: (x*(2.51*x+0.03)) / (x*(2.43*x+0.59)+0.14)
+            output[py, px, c] = (x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14)
+
+
+def _tone_map_aces(output):
+    """Apply ACES filmic tone mapping to GPU output buffer in-place."""
+    height, width, num_channels = output.shape
+    num_pixels = height * width
+    threadsperblock = 256
+    blockspergrid = (num_pixels + threadsperblock - 1) // threadsperblock
+    _tone_map_aces_kernel[blockspergrid, threadsperblock](output, height, width, num_channels)
+
+
+@cuda.jit
+def _edge_outline_kernel(output, instance_ids, height, width,
+                         edge_strength, edge_r, edge_g, edge_b):
+    """Darken pixels at boundaries between different instance_ids."""
+    idx = cuda.grid(1)
+    if idx >= height * width:
+        return
+    my_id = instance_ids[idx]
+    if my_id < 0:
+        return
+    py = idx // width
+    px = idx % width
+    is_edge = False
+    # Check 4 cardinal neighbors
+    if py > 0 and instance_ids[idx - width] != my_id:
+        is_edge = True
+    elif py < height - 1 and instance_ids[idx + width] != my_id:
+        is_edge = True
+    elif px > 0 and instance_ids[idx - 1] != my_id:
+        is_edge = True
+    elif px < width - 1 and instance_ids[idx + 1] != my_id:
+        is_edge = True
+    if is_edge:
+        inv = 1.0 - edge_strength
+        output[py, px, 0] = output[py, px, 0] * inv + edge_r * edge_strength
+        output[py, px, 1] = output[py, px, 1] * inv + edge_g * edge_strength
+        output[py, px, 2] = output[py, px, 2] * inv + edge_b * edge_strength
+
+
+def _edge_outline(output, instance_ids, edge_strength=0.6,
+                  edge_color=(0.05, 0.05, 0.05)):
+    """Apply screen-space edge detection on instance_id boundaries."""
+    height, width, _ = output.shape
+    num_pixels = height * width
+    threadsperblock = 256
+    blockspergrid = (num_pixels + threadsperblock - 1) // threadsperblock
+    _edge_outline_kernel[blockspergrid, threadsperblock](
+        output, instance_ids, height, width,
+        edge_strength, *edge_color)
+
+
+@cuda.jit
+def _compute_flow_kernel(flow_out, primary_rays, primary_hits,
+                         width, height,
+                         prev_pos, prev_forward, prev_right, prev_up,
+                         aspect, fov_scale):
+    """Compute per-pixel screen-space motion vectors by reprojecting hits
+    through the previous frame's camera."""
+    idx = cuda.grid(1)
+    if idx >= width * height:
+        return
+    py = idx // width
+    px = idx % width
+    t = primary_hits[idx, 0]
+    if t <= 0:
+        flow_out[py, px, 0] = 0.0
+        flow_out[py, px, 1] = 0.0
+        return
+    # 3D hit point from current ray
+    hx = primary_rays[idx, 0] + t * primary_rays[idx, 4]
+    hy = primary_rays[idx, 1] + t * primary_rays[idx, 5]
+    hz = primary_rays[idx, 2] + t * primary_rays[idx, 6]
+    # Reproject through previous camera
+    ox = hx - prev_pos[0]
+    oy = hy - prev_pos[1]
+    oz = hz - prev_pos[2]
+    depth = ox * prev_forward[0] + oy * prev_forward[1] + oz * prev_forward[2]
+    if depth <= 1e-6:
+        flow_out[py, px, 0] = 0.0
+        flow_out[py, px, 1] = 0.0
+        return
+    u = (ox * prev_right[0] + oy * prev_right[1] + oz * prev_right[2]) / (depth * aspect * fov_scale)
+    v = (ox * prev_up[0] + oy * prev_up[1] + oz * prev_up[2]) / (depth * fov_scale)
+    prev_px = (u + 1.0) * width / 2.0 - 0.5
+    prev_py = (1.0 - v) * height / 2.0 - 0.5
+    flow_out[py, px, 0] = prev_px - px
+    flow_out[py, px, 1] = prev_py - py
+
+
+def compute_flow(flow_out, primary_rays, primary_hits, width, height,
+                 prev_pos, prev_forward, prev_right, prev_up,
+                 aspect, fov_scale):
+    """Compute screen-space flow vectors for temporal denoising.
+
+    Parameters
+    ----------
+    flow_out : cupy.ndarray
+        (height, width, 2) float32 output — per-pixel (dx, dy) in pixels.
+    primary_rays, primary_hits : cupy.ndarray
+        Ray buffers from current frame.
+    prev_pos, prev_forward, prev_right, prev_up : cupy.ndarray
+        Previous frame camera basis vectors (device arrays, shape (3,)).
+    aspect : float
+        Aspect ratio (width / height).
+    fov_scale : float
+        tan(fov_radians / 2).
+    """
+    num_rays = width * height
+    threadsperblock = 256
+    blockspergrid = (num_rays + threadsperblock - 1) // threadsperblock
+    _compute_flow_kernel[blockspergrid, threadsperblock](
+        flow_out, primary_rays, primary_hits, width, height,
+        prev_pos, prev_forward, prev_right, prev_up,
+        aspect, fov_scale
+    )
+
+
+@cuda.jit
+def _bloom_threshold_kernel(bright, output, height, width, threshold):
+    """Extract pixels brighter than threshold into a separate buffer."""
+    idx = cuda.grid(1)
+    if idx < height * width:
+        py = idx // width
+        px = idx % width
+        r = output[py, px, 0]
+        g = output[py, px, 1]
+        b = output[py, px, 2]
+        lum = 0.2126 * r + 0.7152 * g + 0.0722 * b
+        if lum > threshold:
+            scale = (lum - threshold) / lum
+            bright[py, px, 0] = r * scale
+            bright[py, px, 1] = g * scale
+            bright[py, px, 2] = b * scale
+        else:
+            bright[py, px, 0] = 0.0
+            bright[py, px, 1] = 0.0
+            bright[py, px, 2] = 0.0
+
+
+@cuda.jit
+def _bloom_blur_kernel(dst, src, height, width, radius, horizontal):
+    """Separable Gaussian blur (approximate with linear weights)."""
+    idx = cuda.grid(1)
+    if idx < height * width:
+        py = idx // width
+        px = idx % width
+
+        acc_r = 0.0
+        acc_g = 0.0
+        acc_b = 0.0
+        weight_sum = 0.0
+
+        for i in range(-radius, radius + 1):
+            if horizontal:
+                sx = px + i
+                sy = py
+            else:
+                sx = px
+                sy = py + i
+
+            if sx >= 0 and sx < width and sy >= 0 and sy < height:
+                # Gaussian weight: exp(-0.5 * (i/sigma)^2), sigma ≈ radius/2.5
+                sigma = float(radius) / 2.5
+                w = math.exp(-0.5 * (float(i) / sigma) * (float(i) / sigma))
+                acc_r += src[sy, sx, 0] * w
+                acc_g += src[sy, sx, 1] * w
+                acc_b += src[sy, sx, 2] * w
+                weight_sum += w
+
+        if weight_sum > 0:
+            dst[py, px, 0] = acc_r / weight_sum
+            dst[py, px, 1] = acc_g / weight_sum
+            dst[py, px, 2] = acc_b / weight_sum
+
+
+@cuda.jit
+def _bloom_composite_kernel(output, bloom, height, width, intensity):
+    """Additively blend bloom buffer into output."""
+    idx = cuda.grid(1)
+    if idx < height * width:
+        py = idx // width
+        px = idx % width
+        output[py, px, 0] += bloom[py, px, 0] * intensity
+        output[py, px, 1] += bloom[py, px, 1] * intensity
+        output[py, px, 2] += bloom[py, px, 2] * intensity
+
+
+def _bloom(output, temp, scratch, threshold=0.7, radius=12, intensity=0.35):
+    """Apply bloom post-process: threshold -> blur -> composite."""
+    height, width = output.shape[0], output.shape[1]
+    num_pixels = height * width
+    threadsperblock = 256
+    blockspergrid = (num_pixels + threadsperblock - 1) // threadsperblock
+
+    # Extract bright pixels into temp
+    _bloom_threshold_kernel[blockspergrid, threadsperblock](
+        temp, output, height, width, np.float32(threshold)
+    )
+
+    # Horizontal blur: temp -> scratch
+    _bloom_blur_kernel[blockspergrid, threadsperblock](
+        scratch, temp, height, width, np.int32(radius), True
+    )
+
+    # Vertical blur: scratch -> temp
+    _bloom_blur_kernel[blockspergrid, threadsperblock](
+        temp, scratch, height, width, np.int32(radius), False
+    )
+
+    # Composite: add bloom back into output
+    _bloom_composite_kernel[blockspergrid, threadsperblock](
+        output, temp, height, width, np.float32(intensity)
+    )
 
 
 # Lazy singletons for dummy GPU arrays (avoid per-frame allocations)
 _DUMMY_1x1 = None
 _DUMMY_1x1x3 = None
 _DUMMY_1x4 = None
+_DUMMY_AO_ONES = None  # (num_rays,) all-ones buffer for disabled AO
+_DUMMY_AO_SIZE = 0
+_DUMMY_GI_COLOR = None  # (num_rays, 3) all-zero for no GI
+_DUMMY_GI_SIZE = 0
+_DUMMY_REFL_HITS = None  # (num_rays, 4) all-zero for no reflections
+_DUMMY_REFL_RAYS = None
+_DUMMY_REFL_SIZE = 0
+_DUMMY_ALBEDO = None  # (1, 1, 3) placeholder when albedo not captured
 
 
 def _shade_terrain(
@@ -585,11 +1469,14 @@ def _shade_terrain(
     observer_x=-1e30, observer_y=-1e30,
     pixel_spacing_x=1.0, pixel_spacing_y=1.0,
     color_stretch=0,
-    sky_color=(0.0, 0.0, 0.0),
+    sky_color=(-1.0, 0.0, 0.0),
     rgb_texture=None,
     overlay_data=None, overlay_alpha=0.5,
     overlay_min=0.0, overlay_range=1.0,
     instance_ids=None, geometry_colors=None,
+    ao_factor=None, gi_color=None, gi_intensity=2.0,
+    reflection_hits=None, reflection_rays=None,
+    albedo_out=None,
 ):
     """Apply terrain shading with all effects."""
     threadsperblock = 256
@@ -624,8 +1511,41 @@ def _shade_terrain(
             _DUMMY_1x4 = cupy.zeros((1, 4), dtype=np.float32)
         geometry_colors = _DUMMY_1x4
 
+    # Handle AO factor - cached all-ones when disabled
+    global _DUMMY_AO_ONES, _DUMMY_AO_SIZE
+    if ao_factor is None:
+        if _DUMMY_AO_ONES is None or _DUMMY_AO_SIZE != num_rays:
+            _DUMMY_AO_ONES = cupy.ones(num_rays, dtype=np.float32)
+            _DUMMY_AO_SIZE = num_rays
+        ao_factor = _DUMMY_AO_ONES
+
+    # Handle GI color - cached all-zeros when disabled
+    global _DUMMY_GI_COLOR, _DUMMY_GI_SIZE
+    if gi_color is None:
+        if _DUMMY_GI_COLOR is None or _DUMMY_GI_SIZE != num_rays:
+            _DUMMY_GI_COLOR = cupy.zeros((num_rays, 3), dtype=np.float32)
+            _DUMMY_GI_SIZE = num_rays
+        gi_color = _DUMMY_GI_COLOR
+
+    # Handle reflection buffers - dummy zero arrays when no reflections
+    global _DUMMY_REFL_HITS, _DUMMY_REFL_RAYS, _DUMMY_REFL_SIZE
+    if reflection_hits is None:
+        if _DUMMY_REFL_HITS is None or _DUMMY_REFL_SIZE != num_rays:
+            _DUMMY_REFL_HITS = cupy.zeros((num_rays, 4), dtype=np.float32)
+            _DUMMY_REFL_RAYS = cupy.zeros((num_rays, 8), dtype=np.float32)
+            _DUMMY_REFL_SIZE = num_rays
+        reflection_hits = _DUMMY_REFL_HITS
+        reflection_rays = _DUMMY_REFL_RAYS
+
+    # Handle albedo output - dummy (1,1,3) when not capturing
+    global _DUMMY_ALBEDO
+    if albedo_out is None:
+        if _DUMMY_ALBEDO is None:
+            _DUMMY_ALBEDO = cupy.zeros((1, 1, 3), dtype=np.float32)
+        albedo_out = _DUMMY_ALBEDO
+
     _shade_terrain_kernel[blockspergrid, threadsperblock](
-        output, primary_rays, primary_hits, shadow_hits,
+        output, albedo_out, primary_rays, primary_hits, shadow_hits,
         elevation_data, color_lut, num_rays, width, height,
         sun_dir, ambient, cast_shadows,
         fog_density, fog_color[0], fog_color[1], fog_color[2],
@@ -637,7 +1557,9 @@ def _shade_terrain(
         color_stretch,
         rgb_texture,
         overlay_data, overlay_alpha, overlay_min, overlay_range,
-        instance_ids, geometry_colors
+        instance_ids, geometry_colors,
+        ao_factor, gi_color, np.float32(gi_intensity),
+        reflection_hits, reflection_rays
     )
 
 
@@ -674,24 +1596,55 @@ class _RenderBuffers:
         self.shadow_rays = None
         self.shadow_hits = None
         self.output = None
+        self.albedo = None
         self.instance_ids = None
+        self.ao_rays = None
+        self.ao_hits = None
+        self.gi_color = None
+        self.gi_throughput = None
+        self.reflection_rays = None
+        self.reflection_hits = None
+        self.bloom_temp = None
+        self.bloom_scratch = None
 
-    def get(self, width, height, shadows, alpha, need_instance_ids):
+    def get(self, width, height, shadows, alpha, need_instance_ids, ao=False):
         num_rays = width * height
         num_channels = 4 if alpha else 3
-        key = (width, height, shadows, alpha)
+        key = (width, height, shadows, alpha, ao)
         if key != self._key:
             self.primary_rays = cupy.empty((num_rays, 8), dtype=np.float32)
             self.primary_hits = cupy.empty((num_rays, 4), dtype=np.float32)
             self.shadow_rays = cupy.empty((num_rays, 8), dtype=np.float32)
             self.shadow_hits = cupy.empty((num_rays, 4), dtype=np.float32)
             self.output = cupy.zeros((height, width, num_channels), dtype=np.float32)
+            self.albedo = cupy.zeros((height, width, 3), dtype=np.float32)
             self.instance_ids = cupy.full(num_rays, -1, dtype=cupy.int32)
+            if ao:
+                self.ao_rays = cupy.empty((num_rays, 8), dtype=np.float32)
+                self.ao_hits = cupy.empty((num_rays, 4), dtype=np.float32)
+                self.gi_color = cupy.zeros((num_rays, 3), dtype=np.float32)
+                self.gi_throughput = cupy.ones((num_rays, 3), dtype=np.float32)
+            else:
+                self.ao_rays = None
+                self.ao_hits = None
+                self.gi_color = None
+                self.gi_throughput = None
+            if need_instance_ids:
+                self.reflection_rays = cupy.empty((num_rays, 8), dtype=np.float32)
+                self.reflection_hits = cupy.empty((num_rays, 4), dtype=np.float32)
+            else:
+                self.reflection_rays = None
+                self.reflection_hits = None
+            self.bloom_temp = cupy.zeros((height, width, 3), dtype=np.float32)
+            self.bloom_scratch = cupy.zeros((height, width, 3), dtype=np.float32)
             self._key = key
         else:
             self.output.fill(0)
+            self.albedo.fill(0)
             if need_instance_ids:
                 self.instance_ids.fill(-1)
+            if self.gi_color is not None:
+                self.gi_color.fill(0)
         return self
 
 
@@ -725,14 +1678,30 @@ def render(
     observer_position: Optional[Tuple[float, float]] = None,
     pixel_spacing_x: float = 1.0,
     pixel_spacing_y: float = 1.0,
-    mesh_type: str = 'tin',
+    mesh_type: str = 'heightfield',
     color_data=None,
     color_stretch: str = 'linear',
-    sky_color: Tuple[float, float, float] = (0.0, 0.0, 0.0),
+    sky_color: Optional[Tuple[float, float, float]] = None,
     rgb_texture=None,
     overlay_data=None,
     overlay_alpha: float = 0.5,
     geometry_colors=None,
+    ao_samples: int = 0,
+    ao_radius: Optional[float] = None,
+    ao_seed: int = 0,
+    gi_intensity: float = 2.0,
+    gi_bounces: int = 1,
+    frame_seed: int = 0,
+    sun_angle: float = 0.0,
+    aperture: float = 0.0,
+    focal_distance: float = 0.0,
+    tone_map: bool = True,
+    bloom: bool = True,
+    denoise: bool = False,
+    edge_lines: bool = True,
+    edge_strength: float = 0.6,
+    edge_color: Tuple[float, float, float] = (0.05, 0.05, 0.05),
+    _return_gpu: bool = False,
 ) -> np.ndarray:
     """Render terrain with a perspective camera for movie-quality visualization.
 
@@ -835,8 +1804,8 @@ def render(
     elev_range_orig = elev_max_orig - elev_min_orig
 
     if vertical_exaggeration is None:
-        # Auto-compute: scale so relief is ~20% of horizontal extent
-        horizontal_extent = max(H, W)
+        # Auto-compute: scale so relief is ~20% of horizontal extent (in world units)
+        horizontal_extent = max(H * pixel_spacing_y, W * pixel_spacing_x)
         if elev_range_orig > 0:
             vertical_exaggeration = (horizontal_extent * 0.2) / elev_range_orig
         else:
@@ -856,10 +1825,14 @@ def render(
         # Create a temporary raster with scaled elevations
         scaled_raster = raster.copy(data=scaled_elevation)
         # Don't reuse rtx when scaling - need fresh mesh
-        optix = prepare_mesh(scaled_raster, rtx=None, mesh_type=mesh_type)
+        optix = prepare_mesh(scaled_raster, rtx=None, mesh_type=mesh_type,
+                             pixel_spacing_x=pixel_spacing_x,
+                             pixel_spacing_y=pixel_spacing_y)
     else:
         scaled_raster = raster
-        optix = prepare_mesh(raster, rtx, mesh_type=mesh_type)
+        optix = prepare_mesh(raster, rtx, mesh_type=mesh_type,
+                             pixel_spacing_x=pixel_spacing_x,
+                             pixel_spacing_y=pixel_spacing_y)
 
     # Scale camera position and look_at z coordinates
     scaled_camera_position = (
@@ -912,23 +1885,41 @@ def render(
         elev_max = float(cupy.nanmax(colormap_data))
     elev_range = elev_max - elev_min
 
+    # Color stretch mode: string -> int for CUDA kernel (needed early for GI in AO loop)
+    _stretch_modes = {'linear': 0, 'cbrt': 1, 'log': 2, 'sqrt': 3}
+    stretch_int = _stretch_modes.get(color_stretch, 0)
+
+    # Detect NaN ocean terrain (needs reflection buffers even without geometry)
+    has_nan_ocean = bool(cupy.any(cupy.isnan(elevation_data)))
+
     # Allocate (or reuse) buffers
     bufs = _render_buffers.get(width, height, shadows, alpha,
-                               geometry_colors is not None)
+                               geometry_colors is not None or has_nan_ocean,
+                               ao=ao_samples > 0)
     d_primary_rays = bufs.primary_rays
     d_primary_hits = bufs.primary_hits
     d_shadow_rays = bufs.shadow_rays
     d_shadow_hits = bufs.shadow_hits
     d_output = bufs.output
 
-    device = cupy.cuda.Device(0)
+    # Compute derived seeds for AA and soft shadows from frame_seed
+    jitter_seed = np.uint32(frame_seed * 3 + 1) if frame_seed > 0 else np.uint32(0)
+    shadow_seed = np.uint32(frame_seed * 3 + 2) if frame_seed > 0 else np.uint32(0)
+    sun_angle_rad = math.radians(sun_angle) if sun_angle > 0 else 0.0
+
+    # Auto-compute focal distance from camera-to-lookat if not specified
+    if aperture > 0 and focal_distance <= 0:
+        dx = scaled_look_at[0] - scaled_camera_position[0]
+        dy = scaled_look_at[1] - scaled_camera_position[1]
+        dz = scaled_look_at[2] - scaled_camera_position[2]
+        focal_distance = math.sqrt(dx * dx + dy * dy + dz * dz)
 
     # Step 1: Generate perspective rays
     _generate_perspective_rays(
         d_primary_rays, width, height,
-        d_camera_pos, d_forward, d_right, d_up, fov
+        d_camera_pos, d_forward, d_right, d_up, fov,
+        jitter_seed=jitter_seed, aperture=aperture, focal_distance=focal_distance
     )
-    device.synchronize()
 
     # Step 2: Trace primary rays (with instance_ids if geometry_colors provided)
     d_instance_ids = bufs.instance_ids
@@ -940,13 +1931,79 @@ def render(
     # Step 3: Generate and trace shadow rays (if enabled)
     if shadows:
         _generate_shadow_rays_from_hits(
-            d_shadow_rays, d_primary_rays, d_primary_hits, num_rays, d_sun_dir
+            d_shadow_rays, d_primary_rays, d_primary_hits, num_rays, d_sun_dir,
+            sun_angle_rad=sun_angle_rad, shadow_seed=shadow_seed
         )
-        device.synchronize()
-        optix.trace(d_shadow_rays, d_shadow_hits, num_rays)
+        optix.trace(d_shadow_rays, d_shadow_hits, num_rays,
+                    ray_flags=RTX.RAY_FLAG_OCCLUSION)
     else:
         # Fill shadow hits with -1 (no shadow)
         d_shadow_hits.fill(-1)
+
+    # Step 3b: Ambient occlusion pass
+    d_ao_factor = None
+    if ao_samples > 0:
+        d_ao_rays = bufs.ao_rays
+        d_ao_hits = bufs.ao_hits
+
+        # Auto-compute AO radius from scene extent if not specified
+        if ao_radius is None:
+            H_raster, W_raster = raster.shape
+            diagonal = math.sqrt((H_raster * pixel_spacing_y) ** 2 +
+                                 (W_raster * pixel_spacing_x) ** 2)
+            ao_radius = diagonal * 0.05
+
+        d_ao_factor = cupy.ones(num_rays, dtype=np.float32)
+        d_gi_color = bufs.gi_color
+        d_gi_throughput = bufs.gi_throughput
+
+        for s in range(ao_samples):
+            sample_seed = ao_seed * ao_samples + s
+            d_gi_throughput.fill(1.0)  # reset per-sample path throughput
+
+            # Bounce 0 (existing flow)
+            _generate_ao_rays(d_ao_rays, d_primary_rays, d_primary_hits,
+                              num_rays, ao_radius, sample_seed)
+            optix.trace(d_ao_rays, d_ao_hits, num_rays,
+                        ray_flags=RTX.RAY_FLAG_OCCLUSION)
+            _accumulate_ao(d_ao_factor, d_ao_hits, num_rays, ao_samples)
+            _accumulate_gi(d_gi_color, d_ao_rays, d_ao_hits, num_rays,
+                           ao_samples, vertical_exaggeration,
+                           elev_min, elev_range, d_color_lut, stretch_int,
+                           d_gi_throughput)
+
+            # Additional bounces
+            for bounce in range(1, gi_bounces):
+                bounce_seed = sample_seed * 7919 + bounce * 6271
+                # In-place: new AO rays from previous hit points
+                _generate_ao_rays(d_ao_rays, d_ao_rays, d_ao_hits,
+                                  num_rays, ao_radius, bounce_seed)
+                optix.trace(d_ao_rays, d_ao_hits, num_rays,
+                            ray_flags=RTX.RAY_FLAG_OCCLUSION)
+                _accumulate_gi(d_gi_color, d_ao_rays, d_ao_hits, num_rays,
+                               ao_samples, vertical_exaggeration,
+                               elev_min, elev_range, d_color_lut, stretch_int,
+                               d_gi_throughput)
+
+    # Step 3c: Reflection rays for water surfaces and NaN ocean
+    d_reflection_hits = None
+    d_reflection_rays = None
+    if bufs.reflection_rays is not None:
+        d_reflection_rays = bufs.reflection_rays
+        d_reflection_hits = bufs.reflection_hits
+        # Use real geometry_colors or dummy for the kernel
+        gc = geometry_colors
+        if gc is None:
+            global _DUMMY_1x4
+            if _DUMMY_1x4 is None:
+                _DUMMY_1x4 = cupy.zeros((1, 4), dtype=np.float32)
+            gc = _DUMMY_1x4
+        _generate_reflection_rays(
+            d_reflection_rays, d_primary_rays, d_primary_hits,
+            d_instance_ids, gc, num_rays,
+            colormap_data, pixel_spacing_x, pixel_spacing_y
+        )
+        optix.trace(d_reflection_rays, d_reflection_hits, num_rays)
 
     # Prepare viewshed data if provided
     d_viewshed = None
@@ -965,10 +2022,6 @@ def render(
     # Get observer position for marker orb (sentinel = no observer placed)
     obs_x = float(observer_position[0]) if observer_position else -1e30
     obs_y = float(observer_position[1]) if observer_position else -1e30
-
-    # Color stretch mode: string -> int for CUDA kernel
-    _stretch_modes = {'linear': 0, 'cbrt': 1, 'log': 2, 'sqrt': 3}
-    stretch_int = _stretch_modes.get(color_stretch, 0)
 
     # Prepare overlay data for transparent blending
     d_overlay = None
@@ -994,13 +2047,41 @@ def render(
         obs_x, obs_y,
         pixel_spacing_x, pixel_spacing_y,
         stretch_int,
-        sky_color=sky_color,
+        sky_color=(-1.0, 0.0, 0.0) if sky_color is None else sky_color,
         rgb_texture=rgb_texture,
         overlay_data=d_overlay, overlay_alpha=overlay_alpha,
         overlay_min=ov_min, overlay_range=ov_range,
         instance_ids=d_instance_ids, geometry_colors=geometry_colors,
+        ao_factor=d_ao_factor,
+        gi_color=bufs.gi_color if ao_samples > 0 else None,
+        gi_intensity=gi_intensity,
+        reflection_hits=d_reflection_hits, reflection_rays=d_reflection_rays,
+        albedo_out=bufs.albedo,
     )
-    device.synchronize()
+
+    # AI denoiser (after shading, before bloom/tone mapping)
+    if denoise:
+        from ..rtx import denoise as _denoise
+        d_normals = d_primary_hits.reshape(height, width, 4)[:, :, 1:4].copy()
+        _denoise(d_output, d_normals, width, height, right, cam_up, forward,
+                 albedo=bufs.albedo)
+
+    # Edge outlines on placed geometry (after denoise, before bloom)
+    if edge_lines and geometry_colors is not None:
+        _edge_outline(d_output, d_instance_ids, edge_strength, edge_color)
+
+    # Bloom post-process (before tone mapping so ACES compresses bloom gracefully)
+    if bloom:
+        _bloom(d_output, bufs.bloom_temp, bufs.bloom_scratch)
+
+    # Tone mapping (ACES filmic curve)
+    if tone_map:
+        _tone_map_aces(d_output)
+
+    cupy.cuda.Stream.null.synchronize()
+
+    if _return_gpu:
+        return d_output
 
     # Transfer to CPU
     output = cupy.asnumpy(d_output)

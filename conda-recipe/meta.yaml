@@ -1,5 +1,5 @@
 {% set name = "rtxpy" %}
-{% set version = "0.0.5" %}
+{% set version = "0.0.6" %}
 
 package:
   name: {{ name|lower }}
@@ -22,9 +22,9 @@ requirements:
     - {{ compiler('cxx') }}  # [linux]
     - conda-forge::cmake
     - conda-forge::git  # [linux]
-    - cuda-nvcc >=12  # [linux]
-    - cuda-cudart-dev >=12  # [linux]
-    - cuda-nvrtc-dev >=12  # [linux]
+    - cuda-nvcc {{ cuda_version }}.*  # [linux]
+    - cuda-cudart-dev {{ cuda_version }}.*  # [linux]
+    - cuda-nvrtc-dev {{ cuda_version }}.*  # [linux]
     # Windows uses system CUDA Toolkit and Visual Studio Build Tools
 
   host:
@@ -35,9 +35,9 @@ requirements:
     - conda-forge::cmake
     - conda-forge::git  # [win]
     # Linux CUDA packages
-    - cuda-version >=12  # [linux]
-    - cuda-cudart-dev >=12  # [linux]
-    - cuda-nvrtc-dev >=12  # [linux]
+    - cuda-version {{ cuda_version }}.*  # [linux]
+    - cuda-cudart-dev {{ cuda_version }}.*  # [linux]
+    - cuda-nvrtc-dev {{ cuda_version }}.*  # [linux]
 
   run:
     - python >=3.10
@@ -45,6 +45,18 @@ requirements:
     - numpy >=2.0,<3  # [py>=313]
     - numba >=0.56
     - cupy >=12.0
+    - zarr >=2.0
+    - xarray
+    - rioxarray
+    - xarray-spatial
+    - pyproj
+    - pillow
+    - pyglfw
+    - moderngl
+    - scipy
+    - duckdb <1.4
+    - requests
+    - matplotlib
     - cuda-version >=12  # [linux]
     - __cuda  # [linux]
 
@@ -64,7 +76,7 @@ about:
   summary: Ray tracing using CUDA accessible from Python
   description: |
     RTXpy provides GPU-accelerated ray-triangle intersection using
-    NVIDIA's OptiX ray tracing engine via the otk-pyoptix Python bindings.
+    NVIDIA's OptiX ray tracing engine via the pyoptix-contrib Python bindings.
   dev_url: https://github.com/makepath/rtxpy
 
 extra:

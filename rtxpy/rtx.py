@@ -2,7 +2,7 @@
 RTXpy - Ray tracing using NVIDIA OptiX, accessible from Python.
 
 This module provides GPU-accelerated ray-triangle intersection using
-NVIDIA's OptiX ray tracing engine via the otk-pyoptix Python bindings.
+NVIDIA's OptiX ray tracing engine via the pyoptix-contrib Python bindings.
 """
 
 import os
@@ -14,6 +14,7 @@ from typing import Dict, List, Optional
 # CRITICAL: cupy must be imported before optix for proper CUDA context sharing
 import cupy
 has_cupy = True
+cupy.cuda.set_pinned_memory_allocator(cupy.cuda.PinnedMemoryPool().malloc)
 
 import optix
 
@@ -39,6 +40,8 @@ class _GASEntry:
     visible: bool = True
     num_vertices: int = 0
     num_triangles: int = 0
+    is_curve: bool = False  # True for round curve tube GAS
+    is_heightfield: bool = False  # True for heightfield custom primitive GAS
 
 
 # -----------------------------------------------------------------------------
@@ -62,15 +65,46 @@ class _OptixState:
         self.raygen_pg = None
         self.miss_pg = None
         self.hit_pg = None
+        self.curve_hit_pg = None  # Hit group for round curve tubes
+        self.curve_module = None  # Built-in IS module for curves
+        self.heightfield_hit_pg = None  # Hit group for heightfield custom primitives
         self.sbt = None
 
         # Device memory for params (shared, overwritten before each trace)
         self.d_params = None
 
+        # Capability / version info (populated during _init_optix)
+        self.capabilities = None
+
+        # Denoiser state
+        self.denoiser = None
+        self.d_denoiser_state = None
+        self.d_denoiser_scratch = None
+        self.d_denoiser_normals = None
+        self.d_denoiser_output = None
+        self.d_denoiser_albedo = None
+        self.d_denoiser_flow = None
+        self._denoiser_temporal = False
+        self.denoiser_width = 0
+        self.denoiser_height = 0
+        self._denoiser_failed = False
+
         self.initialized = False
 
     def cleanup(self):
         """Release all OptiX and CUDA resources."""
+        # Destroy denoiser
+        if self.denoiser is not None:
+            self.denoiser.destroy()
+        self.denoiser = None
+        self.d_denoiser_state = None
+        self.d_denoiser_scratch = None
+        self.d_denoiser_normals = None
+        self.d_denoiser_output = None
+        self.denoiser_width = 0
+        self.denoiser_height = 0
+        self._denoiser_failed = False
+
         # Reset device tracking
         self.device_id = None
 
@@ -80,6 +114,9 @@ class _OptixState:
         # OptiX objects are automatically cleaned up by Python GC
         self.sbt = None
         self.pipeline = None
+        self.heightfield_hit_pg = None
+        self.curve_hit_pg = None
+        self.curve_module = None
         self.hit_pg = None
         self.miss_pg = None
         self.raygen_pg = None
@@ -120,6 +157,16 @@ class _GeometryState:
         self.instances_buffer = None
         self.single_gas_mode = True  # False when multi-GAS active
 
+        # Heightfield state
+        self.heightfield_data = None      # GPU buffer (cupy) for elevation array
+        self.hf_width = 0
+        self.hf_height = 0
+        self.hf_spacing_x = 0.0
+        self.hf_spacing_y = 0.0
+        self.hf_ve = 1.0
+        self.hf_tile_size = 32
+        self.hf_num_tiles_x = 0
+
         # Device buffers for CPU->GPU transfers (per-instance)
         self.d_rays = None
         self.d_rays_size = 0
@@ -139,6 +186,16 @@ class _GeometryState:
         self.gas_handle = 0
         self.gas_buffer = None
         self.current_hash = 0xFFFFFFFFFFFFFFFF
+
+        # Clear heightfield state
+        self.heightfield_data = None
+        self.hf_width = 0
+        self.hf_height = 0
+        self.hf_spacing_x = 0.0
+        self.hf_spacing_y = 0.0
+        self.hf_ve = 1.0
+        self.hf_tile_size = 32
+        self.hf_num_tiles_x = 0
 
         # Reset to single-GAS mode
         self.single_gas_mode = True
@@ -251,6 +308,121 @@ def get_current_device() -> Optional[int]:
     return _state.device_id if _state.initialized else None
 
 
+def _detect_capabilities(context) -> dict:
+    """Detect OptiX and hardware capabilities after context creation."""
+    optix_version = optix.version()  # (major, minor, micro)
+
+    rtcore_version = context.getProperty(
+        optix.DEVICE_PROPERTY_RTCORE_VERSION
+    )
+
+    # CUDA driver version (e.g. 12080 → 12.8)
+    driver_version_int = cupy.cuda.runtime.driverGetVersion()
+    cuda_major = driver_version_int // 1000
+    cuda_minor = (driver_version_int % 1000) // 10
+
+    # GPU compute capability
+    dev = cupy.cuda.Device()
+    props = cupy.cuda.runtime.getDeviceProperties(dev.id)
+    cc_major = props['major']
+    cc_minor = props['minor']
+
+    # NVIDIA driver version from nvidia-smi (best-effort)
+    nvidia_driver = 'unknown'
+    try:
+        import subprocess
+        result = subprocess.run(
+            ['nvidia-smi', '--query-gpu=driver_version',
+             '--format=csv,noheader', '-i', str(dev.id)],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode == 0:
+            nvidia_driver = result.stdout.strip().split('\n')[0]
+    except Exception:
+        pass
+
+    # Feature flags — prefer runtime device property queries (OptiX 9.1+)
+    optix_major = optix_version[0] if isinstance(optix_version, tuple) else 0
+    has_optix9 = optix_major >= 9
+    is_blackwell = cc_major >= 10  # sm_100+ = Blackwell
+
+    # Query runtime cluster/coopvec support when OptiX 9+
+    has_clusters = False
+    has_cooperative_vectors = False
+    cluster_limits = {}
+    if has_optix9 and hasattr(optix, 'DEVICE_PROPERTY_CLUSTER_ACCEL'):
+        try:
+            cluster_flags = context.getProperty(
+                optix.DEVICE_PROPERTY_CLUSTER_ACCEL)
+            has_clusters = bool(
+                cluster_flags
+                & int(optix.DEVICE_PROPERTY_CLUSTER_ACCEL_FLAG_STANDARD))
+            if has_clusters:
+                cluster_limits = {
+                    'max_cluster_vertices': context.getProperty(
+                        optix.DEVICE_PROPERTY_LIMIT_MAX_CLUSTER_VERTICES),
+                    'max_cluster_triangles': context.getProperty(
+                        optix.DEVICE_PROPERTY_LIMIT_MAX_CLUSTER_TRIANGLES),
+                    'max_clusters_per_gas': context.getProperty(
+                        optix.DEVICE_PROPERTY_LIMIT_MAX_CLUSTERS_PER_GAS),
+                }
+        except Exception:
+            pass
+    if has_optix9 and hasattr(optix, 'DEVICE_PROPERTY_COOP_VEC'):
+        try:
+            coop_flags = context.getProperty(optix.DEVICE_PROPERTY_COOP_VEC)
+            has_cooperative_vectors = bool(
+                coop_flags
+                & int(optix.DEVICE_PROPERTY_COOP_VEC_FLAG_STANDARD))
+        except Exception:
+            pass
+
+    return {
+        'optix_version': optix_version,
+        'optix_version_str': '.'.join(str(x) for x in optix_version)
+            if isinstance(optix_version, tuple) else str(optix_version),
+        'rtcore_version': rtcore_version,
+        'cuda_driver': f'{cuda_major}.{cuda_minor}',
+        'nvidia_driver': nvidia_driver,
+        'compute_capability': (cc_major, cc_minor),
+        'gpu_name': (props['name'].decode('utf-8')
+                     if isinstance(props['name'], bytes) else props['name']),
+        # Feature flags (runtime-detected)
+        'has_clusters': has_clusters,
+        'has_cooperative_vectors': has_cooperative_vectors,
+        'has_hw_linear_curves': is_blackwell,
+        'has_rocaps_curves': has_optix9,
+        'has_round_quadratic_bspline': True,  # always (OptiX 7.4+)
+        # Cluster limits (only populated when has_clusters=True)
+        **cluster_limits,
+    }
+
+
+def get_capabilities() -> Optional[dict]:
+    """
+    Get OptiX and hardware capability information.
+
+    Returns None if RTX has not been initialized yet. Otherwise returns
+    a dict with keys:
+
+    - ``optix_version``: tuple (major, minor, micro)
+    - ``optix_version_str``: e.g. ``'7.7.0'``
+    - ``rtcore_version``: RT Core generation (e.g. 20 = 2nd gen)
+    - ``cuda_driver``: CUDA runtime driver version string
+    - ``nvidia_driver``: NVIDIA display driver version string
+    - ``compute_capability``: tuple (major, minor)
+    - ``gpu_name``: GPU device name string
+    - ``has_clusters``: OptiX 9+ cluster/mega-geometry BVH
+    - ``has_cooperative_vectors``: OptiX 9+ Tensor Core access (Blackwell)
+    - ``has_hw_linear_curves``: hardware-accelerated linear curves (Blackwell)
+    - ``has_rocaps_curves``: software Rocaps curve intersector (OptiX 9+)
+    - ``has_round_quadratic_bspline``: round curve tubes (always True)
+    """
+    if not _state.initialized or _state.capabilities is None:
+        return None
+    return dict(_state.capabilities)
+
+
 # -----------------------------------------------------------------------------
 # PTX loading
 # -----------------------------------------------------------------------------
@@ -328,23 +500,49 @@ def _init_optix(device: Optional[int] = None):
         )
     )
 
+    # Detect capabilities now that context exists
+    _state.capabilities = _detect_capabilities(_state.context)
+    caps = _state.capabilities
+    print(f"OptiX {caps['optix_version_str']} | "
+          f"RT Core {caps['rtcore_version']} | "
+          f"{caps['gpu_name']} (sm_{caps['compute_capability'][0]}"
+          f"{caps['compute_capability'][1]}) | "
+          f"Driver {caps['nvidia_driver']}")
+
     # Load PTX and create module
     ptx_data = _load_ptx_file("kernel.ptx")
+
+    # Payload semantics: raygen reads after trace, CH+MS write, AH/IS unused
+    _sem = (int(optix.PAYLOAD_SEMANTICS_TRACE_CALLER_READ)
+            | int(optix.PAYLOAD_SEMANTICS_CH_WRITE)
+            | int(optix.PAYLOAD_SEMANTICS_MS_WRITE))
+    payload_type = optix.PayloadType(payloadSemantics=[_sem] * 6)
 
     module_options = optix.ModuleCompileOptions(
         maxRegisterCount=optix.COMPILE_DEFAULT_MAX_REGISTER_COUNT,
         optLevel=optix.COMPILE_OPTIMIZATION_DEFAULT,
         debugLevel=optix.COMPILE_DEBUG_LEVEL_MINIMAL,
+        payloadTypes=[payload_type],
     )
 
-    pipeline_options = optix.PipelineCompileOptions(
+    _pco_kwargs = dict(
         usesMotionBlur=False,
         traversableGraphFlags=optix.TRAVERSABLE_GRAPH_FLAG_ALLOW_ANY,
         numPayloadValues=6,  # t, nx, ny, nz, primitive_id, instance_id
         numAttributeValues=2,
         exceptionFlags=optix.EXCEPTION_FLAG_NONE,
         pipelineLaunchParamsVariableName="params",
+        usesPrimitiveTypeFlags=(
+            optix.PRIMITIVE_TYPE_FLAGS_TRIANGLE
+            | optix.PRIMITIVE_TYPE_FLAGS_CUSTOM
+            | (optix.PRIMITIVE_TYPE_FLAGS_ROUND_QUADRATIC_BSPLINE_ROCAPS
+               if _state.capabilities.get('has_rocaps_curves')
+               else optix.PRIMITIVE_TYPE_FLAGS_ROUND_QUADRATIC_BSPLINE)
+        ),
     )
+    if _state.capabilities.get('has_clusters'):
+        _pco_kwargs['allowClusteredGeometry'] = 1
+    pipeline_options = optix.PipelineCompileOptions(**_pco_kwargs)
 
     _state.module, log = _state.context.moduleCreate(
         module_options,
@@ -375,7 +573,7 @@ def _init_optix(device: Optional[int] = None):
     )
     _state.miss_pg = _state.miss_pg[0]
 
-    # Hit group (closest hit only)
+    # Hit group (closest hit only — triangles)
     hit_desc = optix.ProgramGroupDesc()
     hit_desc.hitgroupModuleCH = _state.module
     hit_desc.hitgroupEntryFunctionNameCH = "__closesthit__chit"
@@ -385,12 +583,52 @@ def _init_optix(device: Optional[int] = None):
     )
     _state.hit_pg = _state.hit_pg[0]
 
+    # Built-in IS module for curves (Rocaps if available, else standard)
+    _curve_prim_type = (
+        optix.PRIMITIVE_TYPE_ROUND_QUADRATIC_BSPLINE_ROCAPS
+        if _state.capabilities.get('has_rocaps_curves')
+        else optix.PRIMITIVE_TYPE_ROUND_QUADRATIC_BSPLINE
+    )
+    _curve_is_options = optix.BuiltinISOptions(
+        builtinISModuleType=_curve_prim_type,
+        usesMotionBlur=False,
+    )
+    _state.curve_module = _state.context.builtinISModuleGet(
+        module_options,
+        pipeline_options,
+        _curve_is_options,
+    )
+
+    # Hit group for curves (same closest-hit, built-in IS for intersection)
+    curve_hit_desc = optix.ProgramGroupDesc()
+    curve_hit_desc.hitgroupModuleCH = _state.module
+    curve_hit_desc.hitgroupEntryFunctionNameCH = "__closesthit__chit"
+    curve_hit_desc.hitgroupModuleIS = _state.curve_module
+    _state.curve_hit_pg, log = _state.context.programGroupCreate(
+        [curve_hit_desc],
+        pg_options,
+    )
+    _state.curve_hit_pg = _state.curve_hit_pg[0]
+
+    # Hit group for heightfield custom primitives (custom IS + dedicated CH)
+    hf_hit_desc = optix.ProgramGroupDesc()
+    hf_hit_desc.hitgroupModuleCH = _state.module
+    hf_hit_desc.hitgroupEntryFunctionNameCH = "__closesthit__heightfield"
+    hf_hit_desc.hitgroupModuleIS = _state.module
+    hf_hit_desc.hitgroupEntryFunctionNameIS = "__intersection__heightfield"
+    _state.heightfield_hit_pg, log = _state.context.programGroupCreate(
+        [hf_hit_desc],
+        pg_options,
+    )
+    _state.heightfield_hit_pg = _state.heightfield_hit_pg[0]
+
     # Create pipeline
     link_options = optix.PipelineLinkOptions(
         maxTraceDepth=1,
     )
 
-    program_groups = [_state.raygen_pg, _state.miss_pg, _state.hit_pg]
+    program_groups = [_state.raygen_pg, _state.miss_pg, _state.hit_pg,
+                      _state.curve_hit_pg, _state.heightfield_hit_pg]
     _state.pipeline = _state.context.pipelineCreate(
         pipeline_options,
         link_options,
@@ -420,8 +658,8 @@ def _init_optix(device: Optional[int] = None):
     # Create shader binding table
     _create_sbt()
 
-    # Allocate params buffer (24 bytes: handle(8) + rays_ptr(8) + hits_ptr(8))
-    _state.d_params = cupy.zeros(40, dtype=cupy.uint8)  # 5 pointers * 8 bytes
+    # Allocate params buffer: 48 (existing) + 40 (heightfield fields) = 88
+    _state.d_params = cupy.zeros(88, dtype=cupy.uint8)
 
     _state.initialized = True
     atexit.register(_cleanup_at_exit)
@@ -445,10 +683,19 @@ def _create_sbt():
     optix.sbtRecordPackHeader(_state.miss_pg, miss_record)
     d_miss = cupy.array(np.frombuffer(miss_record, dtype=np.uint8))
 
-    # Pack hit group record
+    # Pack hit group records: [0] = triangles, [1] = curves, [2] = heightfield
     hit_record = bytearray(header_size)
     optix.sbtRecordPackHeader(_state.hit_pg, hit_record)
-    d_hit = cupy.array(np.frombuffer(hit_record, dtype=np.uint8))
+
+    curve_hit_record = bytearray(header_size)
+    optix.sbtRecordPackHeader(_state.curve_hit_pg, curve_hit_record)
+
+    hf_hit_record = bytearray(header_size)
+    optix.sbtRecordPackHeader(_state.heightfield_hit_pg, hf_hit_record)
+
+    # Concatenate all hit records into a single buffer
+    hit_all = bytearray(hit_record) + bytearray(curve_hit_record) + bytearray(hf_hit_record)
+    d_hit = cupy.array(np.frombuffer(hit_all, dtype=np.uint8))
 
     _state.sbt = optix.ShaderBindingTable(
         raygenRecord=d_raygen.data.ptr,
@@ -457,7 +704,7 @@ def _create_sbt():
         missRecordCount=1,
         hitgroupRecordBase=d_hit.data.ptr,
         hitgroupRecordStrideInBytes=header_size,
-        hitgroupRecordCount=1,
+        hitgroupRecordCount=3,
     )
 
     # Keep references to prevent garbage collection
@@ -567,6 +814,549 @@ def _build_gas_for_geometry(vertices, indices):
     return gas_handle, gas_buffer
 
 
+def _build_gas_clustered(vertices, indices, grid_H, grid_W):
+    """
+    Build a GAS via OptiX 9 Cluster Acceleration Structures (CLAS).
+
+    The terrain grid is partitioned into spatial blocks of up to BLOCK×BLOCK
+    cells.  Each block becomes one CLAS (cluster).  All clusters are then
+    assembled into a single GAS.
+
+    Args:
+        vertices: Vertex buffer (Nx3 float32, flattened) — already on GPU or host.
+        indices:  Index buffer (Mx3 int32, flattened).
+        grid_H:   Number of vertex rows in the terrain grid.
+        grid_W:   Number of vertex columns in the terrain grid.
+
+    Returns:
+        Tuple of (gas_handle, gas_buffer) or (0, None) on error.
+    """
+    global _state
+
+    if not _state.initialized:
+        _init_optix()
+
+    d_vertices = (vertices if isinstance(vertices, cupy.ndarray)
+                  else cupy.asarray(vertices, dtype=cupy.float32))
+    d_indices = (indices if isinstance(indices, cupy.ndarray)
+                 else cupy.asarray(indices, dtype=cupy.int32))
+
+    num_vertices = d_vertices.size // 3
+    num_triangles = d_indices.size // 3
+    if num_vertices == 0 or num_triangles == 0:
+        return 0, None
+
+    # -- Partition grid into spatial blocks --------------------------------
+    max_cluster_v = min(
+        _state.capabilities.get('max_cluster_vertices', 256), 256)
+    max_cluster_t = min(
+        _state.capabilities.get('max_cluster_triangles', 256), 256)
+
+    # Largest BLOCK so that (BLOCK+1)^2 ≤ max_verts AND 2*BLOCK^2 ≤ max_tris
+    import math
+    block_v = int(math.isqrt(max_cluster_v)) - 1       # vertices side
+    block_t = int(math.isqrt(max_cluster_t // 2))       # triangles side
+    BLOCK = max(1, min(block_v, block_t))                # cells per side
+
+    cell_rows = grid_H - 1
+    cell_cols = grid_W - 1
+    blocks_r = (cell_rows + BLOCK - 1) // BLOCK
+    blocks_c = (cell_cols + BLOCK - 1) // BLOCK
+    num_clusters = blocks_r * blocks_c
+
+    if num_clusters == 0:
+        return _build_gas_for_geometry(vertices, indices)
+
+    # -- Build per-cluster Args structs on host, then upload ---------------
+    # TrianglesArgs layout (72 bytes — see optix_types.h):
+    #   0: clusterId          u32
+    #   4: clusterFlags       u32
+    #   8: packed bitfield    u32  (triCount:9|vertCount:9|truncBits:6|idxFmt:4|ommFmt:4)
+    #  12: basePrimitiveInfo  u32  (sbtIndex:24|reserved:5|primFlags:3)
+    #  16: indexStride         u16
+    #  18: vertexStride        u16
+    #  20: primInfoStride      u16
+    #  22: ommIdxStride        u16
+    #  24: indexBuffer         u64
+    #  32: vertexBuffer        u64
+    #  40: primitiveInfoBuffer u64
+    #  48: opacityMicromapArray u64
+    #  56: opacityMicromapIdxBuf u64
+    #  64: instBBoxLimit       u64
+    ARGS_SIZE = 72
+
+    # We'll build small index sub-buffers per cluster (re-indexed)
+    # and collect them all into one large GPU buffer.
+    args_host = np.zeros(num_clusters * ARGS_SIZE, dtype=np.uint8)
+    h_indices = (d_indices.get() if isinstance(d_indices, cupy.ndarray)
+                 else np.asarray(d_indices, dtype=np.int32))
+    h_indices = h_indices.reshape(-1, 3)
+
+    # Per-cluster re-indexed index arrays (host)
+    cluster_index_arrays = []
+    max_tri_per_cluster = 0
+    max_vert_per_cluster = 0
+
+    for br in range(blocks_r):
+        for bc in range(blocks_c):
+            cid = br * blocks_c + bc
+            r0 = br * BLOCK
+            c0 = bc * BLOCK
+            r1 = min(r0 + BLOCK, cell_rows)
+            c1 = min(c0 + BLOCK, cell_cols)
+            bH = r1 - r0   # cells in this block
+            bW = c1 - c0
+
+            # Vertex range for this block: rows [r0..r1] × cols [c0..c1]
+            v_min = r0 * grid_W + c0
+            v_rows = bH + 1
+            v_cols = bW + 1
+            v_count = v_rows * v_cols
+
+            # Gather triangle indices for this block
+            tri_list = []
+            for lr in range(bH):
+                for lc in range(bW):
+                    gr = r0 + lr
+                    gc = c0 + lc
+                    tri_idx = (gr * cell_cols + gc) * 2
+                    tri_list.append(tri_idx)
+                    tri_list.append(tri_idx + 1)
+            tri_count = len(tri_list)
+
+            # Re-index: map global vertex ids → local [0..v_count)
+            local_indices = np.empty(tri_count * 3, dtype=np.int32)
+            for i, ti in enumerate(tri_list):
+                for k in range(3):
+                    gv = h_indices[ti, k]
+                    # Map from global (row*W+col) to local block coords
+                    gv_row = gv // grid_W - r0
+                    gv_col = gv % grid_W - c0
+                    local_indices[i * 3 + k] = gv_row * v_cols + gv_col
+
+            cluster_index_arrays.append(local_indices)
+            max_tri_per_cluster = max(max_tri_per_cluster, tri_count)
+            max_vert_per_cluster = max(max_vert_per_cluster, v_count)
+
+            # Pack the Args struct for this cluster
+            off = cid * ARGS_SIZE
+            # clusterId
+            struct.pack_into('<I', args_host, off + 0, cid)
+            # clusterFlags = NONE
+            struct.pack_into('<I', args_host, off + 4, 0)
+            # packed bitfield
+            idx_fmt = 4  # OPTIX_CLUSTER_ACCEL_INDICES_FORMAT_32BIT
+            packed = (tri_count & 0x1FF) | ((v_count & 0x1FF) << 9) | (idx_fmt << 24)
+            struct.pack_into('<I', args_host, off + 8, packed)
+            # basePrimitiveInfo: sbtIndex=0, primFlags=DISABLE_ANYHIT(bit 2)=4
+            prim_info = (0 & 0xFFFFFF) | (4 << 29)  # flags in top 3 bits
+            struct.pack_into('<I', args_host, off + 12, prim_info)
+            # strides (0 = natural)
+            struct.pack_into('<HHHH', args_host, off + 16, 0, 0, 0, 0)
+            # indexBuffer, vertexBuffer — filled after GPU upload
+            # others = 0 (no prim info, no OMM, no bbox)
+
+    # Upload all cluster index arrays to one contiguous GPU buffer
+    # and compute the per-cluster vertex buffer offsets.
+    max_idx_size = max(len(a) for a in cluster_index_arrays)
+    idx_padded = np.zeros(num_clusters * max_idx_size, dtype=np.int32)
+    for i, arr in enumerate(cluster_index_arrays):
+        idx_padded[i * max_idx_size: i * max_idx_size + len(arr)] = arr
+    d_cluster_indices = cupy.asarray(idx_padded)
+
+    # Now fill in the GPU pointers in each Args struct
+    for br in range(blocks_r):
+        for bc in range(blocks_c):
+            cid = br * blocks_c + bc
+            off = cid * ARGS_SIZE
+            r0 = br * BLOCK
+            c0 = bc * BLOCK
+
+            # Index buffer pointer
+            idx_ptr = d_cluster_indices.data.ptr + cid * max_idx_size * 4
+            struct.pack_into('<Q', args_host, off + 24, idx_ptr)
+
+            # Vertex buffer pointer: point to first vertex of this block
+            # Vertices for this block span rows [r0..r0+bH] × cols [c0..c0+bW]
+            # But the global vertex buffer is flat: vertex (r,c) = d_vertices[r*W+c]
+            # Clusters require contiguous vertex buffer, so we need sub-buffers.
+            # For now, we'll use row-stride trick: set vertex stride to grid_W*12
+            # and point at the first vertex in the block.
+            v_min = r0 * grid_W + c0
+            vert_ptr = d_vertices.data.ptr + v_min * 12  # 3 floats * 4 bytes
+            struct.pack_into('<Q', args_host, off + 32, vert_ptr)
+
+            # Override vertexStride to grid_W * 12 (bytes per row of the grid)
+            # Wait — vertexStride means distance between consecutive vertex
+            # indices, not consecutive grid rows.  Since the local index maps
+            # (local_row * v_cols + local_col) → vertex at global offset
+            # (r0 + local_row)*grid_W + (c0 + local_col), the layout IS NOT
+            # contiguous. We need a contiguous sub-buffer.
+
+    # The non-contiguous vertex layout means we need to extract and flatten
+    # sub-buffers per cluster. Let's build a single packed vertex buffer.
+    verts_per_cluster = []
+    for br in range(blocks_r):
+        for bc in range(blocks_c):
+            r0 = br * BLOCK
+            c0 = bc * BLOCK
+            r1 = min(r0 + BLOCK, cell_rows) + 1  # +1 for vertex count
+            c1 = min(c0 + BLOCK, cell_cols) + 1
+            # Extract sub-grid vertices and flatten
+            # d_vertices is flat: vertex (r,c) = d_vertices[(r*grid_W+c)*3 : ...]
+            rows = np.arange(r0, r1)
+            cols = np.arange(c0, c1)
+            # Global flat indices for each vertex in the block
+            global_ids = (rows[:, None] * grid_W + cols[None, :]).ravel()
+            verts_per_cluster.append(global_ids)
+
+    max_v_per_cluster = max(len(v) for v in verts_per_cluster)
+    # Build a flat packed vertex buffer: num_clusters × max_v × 3 floats
+    h_vertices = d_vertices.get().reshape(-1, 3)
+    packed_verts = np.zeros(num_clusters * max_v_per_cluster * 3,
+                            dtype=np.float32)
+    for i, gids in enumerate(verts_per_cluster):
+        base = i * max_v_per_cluster * 3
+        for j, gid in enumerate(gids):
+            packed_verts[base + j*3: base + j*3 + 3] = h_vertices[gid]
+    d_packed_verts = cupy.asarray(packed_verts)
+
+    # Update args with correct vertex pointers
+    for cid in range(num_clusters):
+        off = cid * ARGS_SIZE
+        vert_ptr = d_packed_verts.data.ptr + cid * max_v_per_cluster * 12
+        struct.pack_into('<Q', args_host, off + 32, vert_ptr)
+
+    # Upload args to GPU
+    d_args = cupy.asarray(np.frombuffer(args_host, dtype=np.uint8))
+
+    # -- Phase 1: Build clusters from triangles ----------------------------
+    cluster_build_input = {
+        'type': int(optix.CLUSTER_ACCEL_BUILD_TYPE_CLUSTERS_FROM_TRIANGLES),
+        'triangles': {
+            'flags': int(optix.CLUSTER_ACCEL_BUILD_FLAG_PREFER_FAST_TRACE),
+            'maxArgCount': num_clusters,
+            'vertexFormat': int(optix.VERTEX_FORMAT_FLOAT3),
+            'maxSbtIndexValue': 0,
+            'maxUniqueSbtIndexCountPerArg': 1,
+            'maxTriangleCountPerArg': max_tri_per_cluster,
+            'maxVertexCountPerArg': max_vert_per_cluster,
+            'maxTotalTriangleCount': num_triangles,
+            'maxTotalVertexCount': num_vertices,
+            'minPositionTruncateBitCount': 0,
+        },
+    }
+
+    # Compute memory for cluster build
+    clas_sizes = optix.clusterAccelComputeMemoryUsage(
+        _state.context,
+        optix.CLUSTER_ACCEL_BUILD_MODE_IMPLICIT_DESTINATIONS,
+        cluster_build_input,
+    )
+
+    d_clas_temp = cupy.zeros(max(clas_sizes.tempSizeInBytes, 1),
+                             dtype=cupy.uint8)
+    # Output buffer alignment: 128 bytes
+    out_size = clas_sizes.outputSizeInBytes
+    out_size = ((out_size + 127) // 128) * 128
+    d_clas_output = cupy.zeros(max(out_size, 128), dtype=cupy.uint8)
+    # Handles buffer: one uint64 per cluster
+    d_clas_handles = cupy.zeros(num_clusters, dtype=cupy.uint64)
+    # Sizes buffer: one uint32 per cluster
+    d_clas_sizes = cupy.zeros(num_clusters, dtype=cupy.uint32)
+
+    optix.clusterAccelBuild(
+        _state.context,
+        0,  # stream
+        optix.CLUSTER_ACCEL_BUILD_MODE_IMPLICIT_DESTINATIONS,
+        cluster_build_input,
+        d_clas_output.data.ptr,
+        d_clas_output.nbytes,
+        d_clas_temp.data.ptr,
+        d_clas_temp.nbytes,
+        d_clas_handles.data.ptr,
+        0,  # handles stride (natural = 8)
+        d_clas_sizes.data.ptr,
+        0,  # sizes stride (natural = 4)
+        d_args.data.ptr,
+        0,  # argsCount (null → use maxArgCount)
+        ARGS_SIZE,
+    )
+    cupy.cuda.Stream.null.synchronize()
+
+    # Free temp
+    del d_clas_temp
+
+    # -- Phase 2: Build GAS from clusters ----------------------------------
+    # Pack ClustersArgs struct (16 bytes) in device memory
+    clusters_args = np.zeros(16, dtype=np.uint8)
+    struct.pack_into('<I', clusters_args, 0, num_clusters)
+    struct.pack_into('<I', clusters_args, 4, 0)  # stride (natural = 8)
+    struct.pack_into('<Q', clusters_args, 8, d_clas_handles.data.ptr)
+    d_clusters_args = cupy.asarray(clusters_args)
+
+    gas_build_input = {
+        'type': int(optix.CLUSTER_ACCEL_BUILD_TYPE_GASES_FROM_CLUSTERS),
+        'clusters': {
+            'flags': int(optix.CLUSTER_ACCEL_BUILD_FLAG_PREFER_FAST_TRACE),
+            'maxArgCount': 1,
+            'maxTotalClusterCount': num_clusters,
+            'maxClusterCountPerArg': num_clusters,
+        },
+    }
+
+    gas_sizes = optix.clusterAccelComputeMemoryUsage(
+        _state.context,
+        optix.CLUSTER_ACCEL_BUILD_MODE_IMPLICIT_DESTINATIONS,
+        gas_build_input,
+    )
+
+    d_gas_temp = cupy.zeros(max(gas_sizes.tempSizeInBytes, 1),
+                            dtype=cupy.uint8)
+    gas_out_size = ((gas_sizes.outputSizeInBytes + 127) // 128) * 128
+    d_gas_output = cupy.zeros(max(gas_out_size, 128), dtype=cupy.uint8)
+    d_gas_handle = cupy.zeros(1, dtype=cupy.uint64)
+
+    optix.clusterAccelBuild(
+        _state.context,
+        0,  # stream
+        optix.CLUSTER_ACCEL_BUILD_MODE_IMPLICIT_DESTINATIONS,
+        gas_build_input,
+        d_gas_output.data.ptr,
+        d_gas_output.nbytes,
+        d_gas_temp.data.ptr,
+        d_gas_temp.nbytes,
+        d_gas_handle.data.ptr,
+        0,  # handles stride
+        0,  # sizes buffer (not needed for GAS)
+        0,  # sizes stride
+        d_clusters_args.data.ptr,
+        0,  # argsCount
+        0,  # argsStride (natural = 16)
+    )
+    cupy.cuda.Stream.null.synchronize()
+
+    gas_handle = int(d_gas_handle[0])
+
+    # Keep references to prevent GC of all backing buffers
+    gas_buffer = (d_gas_output, d_clas_output, d_clas_handles,
+                  d_packed_verts, d_cluster_indices)
+
+    return gas_handle, gas_buffer
+
+
+def _build_gas_for_curves(vertices, widths, indices, num_segments):
+    """
+    Build a GAS for round quadratic B-spline curve tubes.
+
+    Args:
+        vertices: Control point positions (N*3 float32, flattened)
+        widths: Per-control-point radii (N float32)
+        indices: Segment start indices (num_segments int32)
+        num_segments: Number of curve segments
+
+    Returns:
+        Tuple of (gas_handle, gas_buffer) or (0, None) on error
+    """
+    global _state
+
+    if not _state.initialized:
+        _init_optix()
+
+    d_vertices = cupy.asarray(vertices, dtype=cupy.float32)
+    d_widths = cupy.asarray(widths, dtype=cupy.float32)
+    d_indices = cupy.asarray(indices, dtype=cupy.int32)
+    num_vertices = d_vertices.size // 3
+
+    if num_vertices < 3 or num_segments == 0:
+        return 0, None
+
+    build_input = optix.BuildInputCurveArray()
+    build_input.curveType = (
+        optix.PRIMITIVE_TYPE_ROUND_QUADRATIC_BSPLINE_ROCAPS
+        if _state.capabilities and _state.capabilities.get('has_rocaps_curves')
+        else optix.PRIMITIVE_TYPE_ROUND_QUADRATIC_BSPLINE
+    )
+    build_input.numPrimitives = num_segments
+    build_input.numVertices = num_vertices
+    build_input.vertexBuffers = [d_vertices.data.ptr]
+    build_input.vertexStrideInBytes = 12  # 3 * sizeof(float)
+    build_input.widthBuffers = [d_widths.data.ptr]
+    build_input.widthStrideInBytes = 4   # sizeof(float)
+    build_input.indexBuffer = d_indices.data.ptr
+    build_input.indexStrideInBytes = 4   # sizeof(int)
+    build_input.flag = optix.GEOMETRY_FLAG_DISABLE_ANYHIT
+
+    accel_options = optix.AccelBuildOptions(
+        buildFlags=(optix.BUILD_FLAG_ALLOW_RANDOM_VERTEX_ACCESS
+                    | optix.BUILD_FLAG_ALLOW_COMPACTION),
+        operation=optix.BUILD_OPERATION_BUILD,
+    )
+
+    buffer_sizes = _state.context.accelComputeMemoryUsage(
+        [accel_options],
+        [build_input],
+    )
+
+    d_temp = cupy.zeros(buffer_sizes.tempSizeInBytes, dtype=cupy.uint8)
+    gas_buffer = cupy.zeros(buffer_sizes.outputSizeInBytes, dtype=cupy.uint8)
+    compacted_size_buffer = cupy.zeros(1, dtype=cupy.uint64)
+
+    gas_handle = _state.context.accelBuild(
+        0,  # stream
+        [accel_options],
+        [build_input],
+        d_temp.data.ptr,
+        buffer_sizes.tempSizeInBytes,
+        gas_buffer.data.ptr,
+        buffer_sizes.outputSizeInBytes,
+        [optix.AccelEmitDesc(compacted_size_buffer.data.ptr,
+                             optix.PROPERTY_TYPE_COMPACTED_SIZE)],
+    )
+
+    cupy.cuda.Stream.null.synchronize()
+
+    compacted_size = int(compacted_size_buffer[0])
+    if compacted_size < gas_buffer.nbytes:
+        compacted_buffer = cupy.zeros(compacted_size, dtype=cupy.uint8)
+        gas_handle = _state.context.accelCompact(
+            0,  # stream
+            gas_handle,
+            compacted_buffer.data.ptr,
+            compacted_size,
+        )
+        gas_buffer = compacted_buffer
+
+    return gas_handle, gas_buffer
+
+
+def _build_gas_for_heightfield(elevation_data, H, W, spacing_x, spacing_y, ve, tile_size):
+    """
+    Build a GAS for heightfield terrain using custom AABB primitives.
+
+    Each AABB covers a tile_size x tile_size region of the heightfield grid.
+    The intersection program ray-marches through cells within each tile.
+
+    Args:
+        elevation_data: numpy float32 array of shape (H, W) with elevation values
+        H: Number of rows
+        W: Number of columns
+        spacing_x: World-space pixel spacing in X
+        spacing_y: World-space pixel spacing in Y
+        ve: Vertical exaggeration factor
+        tile_size: Tile dimension (e.g. 32)
+
+    Returns:
+        Tuple of (gas_handle, gas_buffer, d_elevation, num_tiles_x, num_tiles_y)
+    """
+    global _state
+
+    if not _state.initialized:
+        _init_optix()
+
+    import math
+
+    num_tiles_x = math.ceil((W - 1) / tile_size)
+    num_tiles_y = math.ceil((H - 1) / tile_size)
+    num_tiles = num_tiles_x * num_tiles_y
+
+    # Upload elevation data to GPU
+    elev_np = np.asarray(elevation_data, dtype=np.float32)
+    d_elevation = cupy.asarray(elev_np)
+
+    # Build AABB for each tile
+    aabbs = np.zeros(num_tiles * 6, dtype=np.float32)
+    eps = 0.01  # Small padding for Z bounds
+
+    for ty in range(num_tiles_y):
+        for tx in range(num_tiles_x):
+            tile_idx = ty * num_tiles_x + tx
+
+            # Cell range for this tile
+            c0 = tx * tile_size
+            r0 = ty * tile_size
+            c1 = min(c0 + tile_size, W - 1)
+            r1 = min(r0 + tile_size, H - 1)
+
+            if c0 >= c1 or r0 >= r1:
+                # Degenerate tile — set a zero-volume AABB
+                base = tile_idx * 6
+                aabbs[base:base + 6] = 0.0
+                continue
+
+            # Extract elevation tile (include +1 for cell corners)
+            tile_elev = elev_np[r0:r1 + 1, c0:c1 + 1]
+            valid = tile_elev[~np.isnan(tile_elev)]
+            if valid.size == 0:
+                z_min = 0.0
+                z_max = 0.0
+            else:
+                z_min = float(valid.min())
+                z_max = float(valid.max())
+
+            z_min *= ve
+            z_max *= ve
+
+            base = tile_idx * 6
+            aabbs[base + 0] = c0 * spacing_x           # min_x
+            aabbs[base + 1] = r0 * spacing_y           # min_y
+            aabbs[base + 2] = z_min - eps              # min_z
+            aabbs[base + 3] = c1 * spacing_x           # max_x
+            aabbs[base + 4] = r1 * spacing_y           # max_y
+            aabbs[base + 5] = z_max + eps              # max_z
+
+    d_aabbs = cupy.asarray(aabbs)
+
+    # Build custom primitive GAS
+    build_input = optix.BuildInputCustomPrimitiveArray()
+    build_input.aabbBuffers = [d_aabbs.data.ptr]
+    build_input.numPrimitives = num_tiles
+    build_input.strideInBytes = 24  # 6 floats
+    build_input.flags = [optix.GEOMETRY_FLAG_DISABLE_ANYHIT]
+    build_input.numSbtRecords = 1
+
+    accel_options = optix.AccelBuildOptions(
+        buildFlags=optix.BUILD_FLAG_ALLOW_COMPACTION,
+        operation=optix.BUILD_OPERATION_BUILD,
+    )
+
+    buffer_sizes = _state.context.accelComputeMemoryUsage(
+        [accel_options],
+        [build_input],
+    )
+
+    d_temp = cupy.zeros(buffer_sizes.tempSizeInBytes, dtype=cupy.uint8)
+    gas_buffer = cupy.zeros(buffer_sizes.outputSizeInBytes, dtype=cupy.uint8)
+    compacted_size_buffer = cupy.zeros(1, dtype=cupy.uint64)
+
+    gas_handle = _state.context.accelBuild(
+        0,
+        [accel_options],
+        [build_input],
+        d_temp.data.ptr,
+        buffer_sizes.tempSizeInBytes,
+        gas_buffer.data.ptr,
+        buffer_sizes.outputSizeInBytes,
+        [optix.AccelEmitDesc(compacted_size_buffer.data.ptr,
+                             optix.PROPERTY_TYPE_COMPACTED_SIZE)],
+    )
+
+    cupy.cuda.Stream.null.synchronize()
+
+    compacted_size = int(compacted_size_buffer[0])
+    if compacted_size < gas_buffer.nbytes:
+        compacted_buffer = cupy.zeros(compacted_size, dtype=cupy.uint8)
+        gas_handle = _state.context.accelCompact(
+            0,
+            gas_handle,
+            compacted_buffer.data.ptr,
+            compacted_size,
+        )
+        gas_buffer = compacted_buffer
+
+    return gas_handle, gas_buffer, d_elevation, num_tiles_x, num_tiles_y
+
+
 def _build_ias(geom_state: _GeometryState):
     """
     Build an Instance Acceleration Structure (IAS) from all GAS entries.
@@ -613,8 +1403,14 @@ def _build_ias(geom_state: _GeometryState):
         # Pack instanceId (4 bytes)
         struct.pack_into('I', instances_data, offset + 48, i)
 
-        # Pack sbtOffset (4 bytes) - all use same hit group (SBT index 0)
-        struct.pack_into('I', instances_data, offset + 52, 0)
+        # Pack sbtOffset (4 bytes) - 0 for triangles, 1 for curves, 2 for heightfield
+        if entry.is_heightfield:
+            sbt_offset = 2
+        elif entry.is_curve:
+            sbt_offset = 1
+        else:
+            sbt_offset = 0
+        struct.pack_into('I', instances_data, offset + 52, sbt_offset)
 
         # Pack visibilityMask (4 bytes) - 0xFF = visible, 0x00 = hidden
         mask = 0xFF if entry.visible else 0x00
@@ -795,7 +1591,7 @@ def _build_accel(geom_state: _GeometryState, hash_value: int, vertices, indices)
 # -----------------------------------------------------------------------------
 
 def _trace_rays(geom_state: _GeometryState, rays, hits, num_rays: int,
-                primitive_ids=None, instance_ids=None) -> int:
+                primitive_ids=None, instance_ids=None, ray_flags=None) -> int:
     """
     Trace rays against the acceleration structure in the given geometry state.
 
@@ -812,6 +1608,9 @@ def _trace_rays(geom_state: _GeometryState, rays, hits, num_rays: int,
         instance_ids: Optional output buffer (Nx1 int32) for geometry/instance indices.
                       -1 indicates a miss. Useful in multi-GAS mode to identify
                       which geometry was hit.
+        ray_flags: Optional OptiX ray flags (unsigned int). Default is
+                   OPTIX_RAY_FLAG_CULL_BACK_FACING_TRIANGLES (0x10).
+                   Use RTX.RAY_FLAG_OCCLUSION for shadow/AO queries.
 
     Returns:
         0 on success, non-zero on error
@@ -895,14 +1694,50 @@ def _trace_rays(geom_state: _GeometryState, rays, hits, num_rays: int,
             inst_ids_on_host = True
         d_inst_ids_ptr = d_inst_ids.data.ptr
 
-    # Pack params: handle(8) + rays_ptr(8) + hits_ptr(8) + prim_ids_ptr(8) + inst_ids_ptr(8)
+    # Default ray flags: cull back-facing triangles
+    if ray_flags is None:
+        ray_flags = 0x10  # OPTIX_RAY_FLAG_CULL_BACK_FACING_TRIANGLES
+
+    # Pack params: 48 bytes (existing) + 48 bytes (heightfield) = 96 bytes
+    # Heightfield fields: ptr(8) + width(4) + height(4) + sx(4) + sy(4) + ve(4) + tile(4) + ntx(4) + pad(4) = 40+8 pad?
+    # Actually: Q(8) + ii(8) + ff(8) + f(4) + ii(8) + i_pad(4) = 40 → need pad to 48
+    hf_data_ptr = 0
+    hf_w = 0
+    hf_h = 0
+    hf_sx = 0.0
+    hf_sy = 0.0
+    hf_ve = 1.0
+    hf_tile = 0
+    hf_ntx = 0
+
+    if geom_state.heightfield_data is not None:
+        hf_data_ptr = geom_state.heightfield_data.data.ptr
+        hf_w = geom_state.hf_width
+        hf_h = geom_state.hf_height
+        hf_sx = geom_state.hf_spacing_x
+        hf_sy = geom_state.hf_spacing_y
+        hf_ve = geom_state.hf_ve
+        hf_tile = geom_state.hf_tile_size
+        hf_ntx = geom_state.hf_num_tiles_x
+
     params_data = struct.pack(
-        'QQQQQ',
-        trace_handle,
-        d_rays.data.ptr,
-        d_hits.data.ptr,
-        d_prim_ids_ptr,
-        d_inst_ids_ptr,
+        'QQQQQIIQiifffiii',
+        trace_handle,           # 8
+        d_rays.data.ptr,        # 8
+        d_hits.data.ptr,        # 8
+        d_prim_ids_ptr,         # 8
+        d_inst_ids_ptr,         # 8
+        ray_flags,              # 4
+        0,                      # 4 padding (existing)
+        hf_data_ptr,            # 8
+        hf_w,                   # 4
+        hf_h,                   # 4
+        hf_sx,                  # 4
+        hf_sy,                  # 4
+        hf_ve,                  # 4
+        hf_tile,                # 4
+        hf_ntx,                 # 4
+        0,                      # 4 padding
     )
     _state.d_params[:] = cupy.frombuffer(np.frombuffer(params_data, dtype=np.uint8), dtype=cupy.uint8)
 
@@ -911,7 +1746,7 @@ def _trace_rays(geom_state: _GeometryState, rays, hits, num_rays: int,
         _state.pipeline,
         0,  # stream
         _state.d_params.data.ptr,
-        40,  # sizeof(Params): 5 pointers * 8 bytes
+        88,  # sizeof(Params)
         _state.sbt,
         num_rays,  # width
         1,  # height
@@ -1014,7 +1849,15 @@ class RTX:
         """
         return self._geom_state.current_hash
 
-    def trace(self, rays, hits, numRays: int, primitive_ids=None, instance_ids=None) -> int:
+    # OptiX ray flag constants
+    RAY_FLAG_NONE = 0x00
+    RAY_FLAG_CULL_BACK_FACING = 0x10   # OPTIX_RAY_FLAG_CULL_BACK_FACING_TRIANGLES
+    RAY_FLAG_TERMINATE_ON_FIRST_HIT = 0x04  # OPTIX_RAY_FLAG_TERMINATE_ON_FIRST_HIT
+    # Combined flag for shadow/AO occlusion queries (early out + backface cull)
+    RAY_FLAG_OCCLUSION = 0x10 | 0x04
+
+    def trace(self, rays, hits, numRays: int, primitive_ids=None, instance_ids=None,
+              ray_flags=None) -> int:
         """
         Trace rays against the current acceleration structure.
 
@@ -1032,18 +1875,23 @@ class RTX:
             instance_ids: Optional output buffer (numRays x int32) for geometry/instance indices.
                           Will contain the instance ID of the hit geometry, or -1 for misses.
                           Useful in multi-GAS mode to identify which geometry was hit.
+            ray_flags: Optional OptiX ray flags (unsigned int). Default is
+                       RAY_FLAG_CULL_BACK_FACING. Use RAY_FLAG_OCCLUSION for
+                       shadow/AO queries to enable early termination.
 
         Returns:
             0 on success, non-zero on error
         """
-        return _trace_rays(self._geom_state, rays, hits, numRays, primitive_ids, instance_ids)
+        return _trace_rays(self._geom_state, rays, hits, numRays, primitive_ids, instance_ids,
+                           ray_flags=ray_flags)
 
     # -------------------------------------------------------------------------
     # Multi-GAS API
     # -------------------------------------------------------------------------
 
     def add_geometry(self, geometry_id: str, vertices, indices,
-                     transform: Optional[List[float]] = None) -> int:
+                     transform: Optional[List[float]] = None,
+                     grid_dims: Optional[tuple] = None) -> int:
         """
         Add a geometry (GAS) to the scene with an optional transform.
 
@@ -1057,6 +1905,9 @@ class RTX:
             transform: Optional 12-float list representing a 3x4 row-major
                       affine transform matrix. Defaults to identity.
                       Format: [Xx, Xy, Xz, Tx, Yx, Yy, Yz, Ty, Zx, Zy, Zz, Tz]
+            grid_dims: Optional (H, W) grid dimensions for cluster-accelerated
+                      builds.  When provided and OptiX 9+ clusters are
+                      available, uses the CLAS pipeline for faster BVH builds.
 
         Returns:
             0 on success, non-zero on error
@@ -1089,7 +1940,16 @@ class RTX:
             return 0
 
         # Build the GAS for this geometry
-        gas_handle, gas_buffer = _build_gas_for_geometry(vertices, indices)
+        use_clusters = (
+            grid_dims is not None
+            and _state.capabilities
+            and _state.capabilities.get('has_clusters')
+        )
+        if use_clusters:
+            gas_handle, gas_buffer = _build_gas_clustered(
+                vertices, indices, grid_dims[0], grid_dims[1])
+        else:
+            gas_handle, gas_buffer = _build_gas_for_geometry(vertices, indices)
         if gas_handle == 0:
             return -1
 
@@ -1106,8 +1966,9 @@ class RTX:
                 return -1
 
         # Compute vertex/triangle counts from input arrays
-        num_vertices = len(np.asarray(vertices).ravel()) // 3
-        num_triangles = len(np.asarray(indices).ravel()) // 3
+        num_vertices = len(vertices_for_hash.ravel()) // 3
+        indices_np = indices.get() if isinstance(indices, cupy.ndarray) else np.asarray(indices)
+        num_triangles = len(indices_np.ravel()) // 3
 
         # Create or update the GAS entry
         self._geom_state.gas_entries[geometry_id] = _GASEntry(
@@ -1123,6 +1984,172 @@ class RTX:
         # Mark IAS as needing rebuild
         self._geom_state.ias_dirty = True
 
+        return 0
+
+    def add_curve_geometry(self, geometry_id: str, vertices, widths,
+                           indices,
+                           transform: Optional[List[float]] = None) -> int:
+        """
+        Add round quadratic B-spline curve tubes to the scene.
+
+        This enables multi-GAS mode. Curve GAS entries use a separate
+        hit group with the built-in curve IS module.
+
+        Args:
+            geometry_id: Unique identifier for this geometry
+            vertices: Control point positions (N*3 float32, flattened)
+            widths: Per-control-point radii (N float32)
+            indices: Segment start indices (M int32, one per segment)
+            transform: Optional 12-float 3x4 row-major affine transform.
+
+        Returns:
+            0 on success, non-zero on error
+        """
+        global _state
+
+        if not _state.initialized:
+            _init_optix()
+
+        # Switch to multi-GAS mode if currently in single-GAS mode
+        if self._geom_state.single_gas_mode:
+            self._geom_state.gas_handle = 0
+            self._geom_state.gas_buffer = None
+            self._geom_state.current_hash = 0xFFFFFFFFFFFFFFFF
+            self._geom_state.single_gas_mode = False
+
+        # Compute hash to skip GAS rebuild when vertices haven't changed
+        if isinstance(vertices, cupy.ndarray):
+            vertices_for_hash = vertices.get()
+        else:
+            vertices_for_hash = np.asarray(vertices)
+        vertices_hash = hash(vertices_for_hash.tobytes())
+
+        existing = self._geom_state.gas_entries.get(geometry_id)
+        if existing is not None and existing.vertices_hash == vertices_hash:
+            if transform is not None:
+                existing.transform = list(transform)
+                self._geom_state.ias_dirty = True
+            return 0
+
+        # Compute segment count from indices
+        indices_np = indices.get() if isinstance(indices, cupy.ndarray) else np.asarray(indices)
+        num_segments = len(indices_np)
+
+        gas_handle, gas_buffer = _build_gas_for_curves(
+            vertices, widths, indices, num_segments)
+        if gas_handle == 0:
+            return -1
+
+        if transform is None:
+            transform = [
+                1.0, 0.0, 0.0, 0.0,
+                0.0, 1.0, 0.0, 0.0,
+                0.0, 0.0, 1.0, 0.0,
+            ]
+        else:
+            transform = list(transform)
+            if len(transform) != 12:
+                return -1
+
+        num_vertices = len(vertices_for_hash.ravel()) // 3
+
+        self._geom_state.gas_entries[geometry_id] = _GASEntry(
+            gas_id=geometry_id,
+            gas_handle=gas_handle,
+            gas_buffer=gas_buffer,
+            vertices_hash=vertices_hash,
+            transform=transform,
+            num_vertices=num_vertices,
+            num_triangles=0,
+            is_curve=True,
+        )
+
+        self._geom_state.ias_dirty = True
+        return 0
+
+    def add_heightfield_geometry(self, geometry_id: str, elevation,
+                                 H: int, W: int,
+                                 spacing_x: float, spacing_y: float,
+                                 ve: float = 1.0,
+                                 tile_size: int = 32) -> int:
+        """
+        Add a heightfield terrain as a custom-primitive GAS.
+
+        The terrain is represented as a set of tiled AABBs. A custom
+        intersection program ray-marches through the grid at trace time,
+        never materializing an explicit triangle mesh. This dramatically
+        reduces GPU memory for large terrains and provides smooth bilinear
+        normals.
+
+        Args:
+            geometry_id: Unique identifier (typically 'terrain').
+            elevation: 2-D array (H, W) of float32 elevation values (numpy or cupy).
+            H: Number of rows.
+            W: Number of columns.
+            spacing_x: World-space pixel spacing in X.
+            spacing_y: World-space pixel spacing in Y.
+            ve: Vertical exaggeration. Default 1.0.
+            tile_size: Tile dimension for AABB grouping. Default 32.
+
+        Returns:
+            0 on success, non-zero on error.
+        """
+        global _state
+
+        if not _state.initialized:
+            _init_optix()
+
+        # Switch to multi-GAS mode
+        if self._geom_state.single_gas_mode:
+            self._geom_state.gas_handle = 0
+            self._geom_state.gas_buffer = None
+            self._geom_state.current_hash = 0xFFFFFFFFFFFFFFFF
+            self._geom_state.single_gas_mode = False
+
+        # Get elevation as numpy
+        if hasattr(elevation, 'get'):
+            elev_np = elevation.get()
+        else:
+            elev_np = np.asarray(elevation, dtype=np.float32)
+
+        gas_handle, gas_buffer, d_elevation, num_tiles_x, num_tiles_y = \
+            _build_gas_for_heightfield(elev_np, H, W, spacing_x, spacing_y, ve, tile_size)
+
+        if gas_handle == 0:
+            return -1
+
+        # Store heightfield metadata on geometry state for params packing
+        self._geom_state.heightfield_data = d_elevation
+        self._geom_state.hf_width = W
+        self._geom_state.hf_height = H
+        self._geom_state.hf_spacing_x = spacing_x
+        self._geom_state.hf_spacing_y = spacing_y
+        self._geom_state.hf_ve = ve
+        self._geom_state.hf_tile_size = tile_size
+        self._geom_state.hf_num_tiles_x = num_tiles_x
+
+        # Identity transform
+        transform = [
+            1.0, 0.0, 0.0, 0.0,
+            0.0, 1.0, 0.0, 0.0,
+            0.0, 0.0, 1.0, 0.0,
+        ]
+
+        # Compute hash for cache invalidation
+        vertices_hash = hash(elev_np.tobytes())
+
+        self._geom_state.gas_entries[geometry_id] = _GASEntry(
+            gas_id=geometry_id,
+            gas_handle=gas_handle,
+            gas_buffer=gas_buffer,
+            vertices_hash=vertices_hash,
+            transform=transform,
+            num_vertices=0,
+            num_triangles=0,
+            is_heightfield=True,
+        )
+
+        self._geom_state.ias_dirty = True
         return 0
 
     def remove_geometry(self, geometry_id: str) -> int:
@@ -1300,3 +2327,194 @@ class RTX:
             'ray_buffers_bytes': ray_buffers_bytes,
             'total_bytes': total_bytes,
         }
+
+
+# -----------------------------------------------------------------------------
+# OptiX AI Denoiser
+# -----------------------------------------------------------------------------
+
+def _ensure_denoiser(width, height, temporal=False):
+    """Create or reconfigure the OptiX AI denoiser for the given dimensions.
+
+    Parameters
+    ----------
+    temporal : bool
+        If True, use DENOISER_MODEL_KIND_TEMPORAL (requires flow vectors).
+        If False, use DENOISER_MODEL_KIND_HDR (spatial only).
+
+    Returns True if the denoiser is ready, False if unavailable.
+    """
+    global _state
+
+    if _state._denoiser_failed:
+        return False
+
+    if not _state.initialized:
+        _init_optix()
+
+    # Recreate denoiser if mode changed or not yet created
+    need_create = _state.denoiser is None
+    if not need_create and _state._denoiser_temporal != temporal:
+        _state.denoiser = None
+        _state.denoiser_width = 0
+        _state.denoiser_height = 0
+        need_create = True
+
+    if need_create:
+        opts = optix.DenoiserOptions()
+        opts.guideNormal = 1
+        opts.guideAlbedo = 1
+        model = (optix.DENOISER_MODEL_KIND_TEMPORAL if temporal
+                 else optix.DENOISER_MODEL_KIND_HDR)
+        try:
+            _state.denoiser = _state.context.denoiserCreate(model, opts)
+        except RuntimeError:
+            import warnings
+            warnings.warn(
+                "OptiX AI Denoiser unavailable (missing nvoptix.bin "
+                "weights file). Denoising will be skipped.",
+                RuntimeWarning)
+            _state._denoiser_failed = True
+            return False
+        _state._denoiser_temporal = temporal
+
+    if _state.denoiser_width != width or _state.denoiser_height != height:
+        sizes = _state.denoiser.computeMemoryResources(width, height)
+        _state.d_denoiser_state = cupy.empty(
+            sizes.stateSizeInBytes, dtype=cupy.uint8)
+        _state.d_denoiser_scratch = cupy.empty(
+            sizes.withoutOverlapScratchSizeInBytes, dtype=cupy.uint8)
+        _state.denoiser.setup(
+            0,  # stream
+            width, height,
+            _state.d_denoiser_state.data.ptr, sizes.stateSizeInBytes,
+            _state.d_denoiser_scratch.data.ptr,
+            sizes.withoutOverlapScratchSizeInBytes)
+        _state.d_denoiser_normals = cupy.empty(
+            (height, width, 3), dtype=cupy.float32)
+        _state.d_denoiser_output = cupy.empty(
+            (height, width, 3), dtype=cupy.float32)
+        _state.d_denoiser_albedo = cupy.empty(
+            (height, width, 3), dtype=cupy.float32)
+        if temporal:
+            _state.d_denoiser_flow = cupy.zeros(
+                (height, width, 3), dtype=cupy.float32)
+        _state.denoiser_width = width
+        _state.denoiser_height = height
+
+    return True
+
+
+def denoise(d_color, d_normals, width, height, cam_right, cam_up, cam_forward,
+            albedo=None, flow=None):
+    """Apply the OptiX AI Denoiser to a noisy HDR image.
+
+    Parameters
+    ----------
+    d_color : cupy.ndarray
+        (height, width, 3) float32 HDR color buffer. Modified in-place
+        with denoised result.
+    d_normals : cupy.ndarray
+        (height, width, 3) float32 world-space hit normals.
+    width, height : int
+        Image dimensions.
+    cam_right, cam_up, cam_forward : array-like
+        Camera basis vectors (3,) for transforming normals to camera space.
+    albedo : cupy.ndarray, optional
+        (height, width, 3) float32 albedo guide (material color before lighting).
+    flow : cupy.ndarray, optional
+        (height, width, 2) float32 screen-space motion vectors (pixels).
+        If provided, temporal denoising is used.
+    """
+    global _state
+    temporal = flow is not None
+    if not _ensure_denoiser(width, height, temporal=temporal):
+        return
+
+    # Transform world-space normals to camera space via matrix multiply.
+    # Column matrix: columns = right, up, forward.
+    d_basis = cupy.asarray(
+        np.stack([np.asarray(cam_right, dtype=np.float32),
+                  np.asarray(cam_up, dtype=np.float32),
+                  np.asarray(cam_forward, dtype=np.float32)], axis=1),
+        dtype=cupy.float32)  # (3, 3)
+    flat_normals = d_normals.reshape(-1, 3)
+    _state.d_denoiser_normals.reshape(-1, 3)[:] = flat_normals @ d_basis
+
+    row_stride_3 = width * 3 * 4  # 3 float32 × 4 bytes
+    pixel_stride_3 = 3 * 4
+
+    color_image = optix.Image2D()
+    color_image.data = d_color.data.ptr
+    color_image.width = width
+    color_image.height = height
+    color_image.rowStrideInBytes = row_stride_3
+    color_image.pixelStrideInBytes = pixel_stride_3
+    color_image.format = optix.PIXEL_FORMAT_FLOAT3
+
+    output_image = optix.Image2D()
+    output_image.data = _state.d_denoiser_output.data.ptr
+    output_image.width = width
+    output_image.height = height
+    output_image.rowStrideInBytes = row_stride_3
+    output_image.pixelStrideInBytes = pixel_stride_3
+    output_image.format = optix.PIXEL_FORMAT_FLOAT3
+
+    normal_image = optix.Image2D()
+    normal_image.data = _state.d_denoiser_normals.data.ptr
+    normal_image.width = width
+    normal_image.height = height
+    normal_image.rowStrideInBytes = row_stride_3
+    normal_image.pixelStrideInBytes = pixel_stride_3
+    normal_image.format = optix.PIXEL_FORMAT_FLOAT3
+
+    layer = optix.DenoiserLayer()
+    layer.input = color_image
+    layer.output = output_image
+
+    guide = optix.DenoiserGuideLayer()
+    guide.normal = normal_image
+
+    # Albedo guide
+    if albedo is not None:
+        _state.d_denoiser_albedo[:] = albedo
+        albedo_image = optix.Image2D()
+        albedo_image.data = _state.d_denoiser_albedo.data.ptr
+        albedo_image.width = width
+        albedo_image.height = height
+        albedo_image.rowStrideInBytes = row_stride_3
+        albedo_image.pixelStrideInBytes = pixel_stride_3
+        albedo_image.format = optix.PIXEL_FORMAT_FLOAT3
+        guide.albedo = albedo_image
+
+    # Flow guide (temporal denoising)
+    if temporal:
+        # Flow is (H, W, 2) — copy into padded (H, W, 3) buffer for FLOAT3 format
+        _state.d_denoiser_flow[:, :, :2] = flow
+        flow_image = optix.Image2D()
+        flow_image.data = _state.d_denoiser_flow.data.ptr
+        flow_image.width = width
+        flow_image.height = height
+        flow_image.rowStrideInBytes = row_stride_3
+        flow_image.pixelStrideInBytes = pixel_stride_3
+        flow_image.format = optix.PIXEL_FORMAT_FLOAT3
+        guide.flow = flow_image
+
+    params = optix.DenoiserParams()
+    params.blendFactor = 0.0
+
+    _state.denoiser.invoke(
+        0,  # stream
+        params,
+        _state.d_denoiser_state.data.ptr,
+        _state.d_denoiser_state.nbytes,
+        guide,
+        layer,
+        1,     # numLayers
+        0, 0,  # inputOffsetX, inputOffsetY
+        _state.d_denoiser_scratch.data.ptr,
+        _state.d_denoiser_scratch.nbytes,
+    )
+
+    # Copy denoised result back into the input buffer
+    d_color[:] = _state.d_denoiser_output
