@@ -55,4 +55,15 @@ struct Params
     Hit*                   hits;
     int*                   primitive_ids;  // Optional: triangle index per ray (-1 for miss)
     int*                   instance_ids;   // Optional: geometry/instance index per ray (-1 for miss)
+    unsigned int           ray_flags;      // OptixRayFlags (e.g. CULL_BACK_FACING, TERMINATE_ON_FIRST_HIT)
+    // --- heightfield fields (offset 48) ---
+    float*                 heightfield_data;  // device pointer to H×W float32 elevation array
+    int                    hf_width;          // W (columns)
+    int                    hf_height;         // H (rows)
+    float                  hf_spacing_x;      // world-space pixel spacing X
+    float                  hf_spacing_y;      // world-space pixel spacing Y
+    float                  hf_ve;             // vertical exaggeration
+    int                    hf_tile_size;       // tile dimension (e.g. 32)
+    int                    hf_num_tiles_x;     // number of tiles in X direction
+    int                    _pad0;              // padding to 88 bytes
 };

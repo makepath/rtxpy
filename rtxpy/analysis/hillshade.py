@@ -10,7 +10,7 @@ import numpy as np
 from typing import Optional
 
 from .._cuda_utils import calc_dims, add, mul, dot, float3, make_float3, invert
-from ._common import generate_primary_rays, prepare_mesh
+from ._common import generate_primary_rays, prepare_mesh, _compute_pixel_spacing
 from ..rtx import RTX, has_cupy
 
 if has_cupy:
@@ -140,7 +140,8 @@ def _shade_lambert(hits, normals, output, H, W, sunDir, castShadows):
     return 0
 
 
-def _hillshade_rt(raster, optix, shadows, azimuth, angle_altitude, name):
+def _hillshade_rt(raster, optix, shadows, azimuth, angle_altitude, name,
+                  pixel_spacing_x=1.0, pixel_spacing_y=1.0):
     """Internal function to perform hillshade ray tracing."""
     xr = _lazy_import_xarray()
 
@@ -156,7 +157,9 @@ def _hillshade_rt(raster, optix, shadows, azimuth, angle_altitude, name):
     y_coords = cupy.array(raster.indexes.get('y').values)
     x_coords = cupy.array(raster.indexes.get('x').values)
 
-    generate_primary_rays(d_rays, x_coords, y_coords, H, W)
+    generate_primary_rays(d_rays, x_coords, y_coords, H, W,
+                          pixel_spacing_x=pixel_spacing_x,
+                          pixel_spacing_y=pixel_spacing_y)
     device = cupy.cuda.Device(0)
     device.synchronize()
     optix.trace(d_rays, d_hits, W * H)
@@ -264,8 +267,10 @@ def hillshade(raster,
             "Additional overhead will be incurred from CPU-GPU transfers."
         )
 
-    optix = prepare_mesh(raster, rtx)
+    psx, psy = _compute_pixel_spacing(raster)
+    optix = prepare_mesh(raster, rtx, pixel_spacing_x=psx, pixel_spacing_y=psy)
     return _hillshade_rt(
         raster, optix, shadows=shadows, azimuth=azimuth,
-        angle_altitude=angle_altitude, name=name
+        angle_altitude=angle_altitude, name=name,
+        pixel_spacing_x=psx, pixel_spacing_y=psy,
     )

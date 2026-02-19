@@ -29,17 +29,19 @@ classifiers = [
 dependencies = [
     "numpy>=1.21",
     "numba>=0.56",
+    "zarr>=2.0",
+    "pyoptix-contrib",
 ]
 
 [project.optional-dependencies]
 # GPU dependencies - cupy provides CUDA context management
 # Install cupy via: conda install -c conda-forge cupy
-# Note: otk-pyoptix must be installed separately from NVIDIA
-# See: https://github.com/NVIDIA/otk-pyoptix
 tests = ["pytest"]
 analysis = ["xarray"]
 tiles = ["Pillow", "pyproj"]
-all = ["xarray", "scipy", "Pillow", "pyproj"]
+viewer = ["glfw", "moderngl", "Pillow"]
+notebook = ["ipywidgets>=8.0", "ipyevents>=2.0", "Pillow"]
+all = ["xarray", "scipy", "Pillow", "pyproj", "glfw", "moderngl", "ipywidgets>=8.0", "ipyevents>=2.0"]
 
 [project.urls]
 Homepage = "https://github.com/makepath/rtxpy"

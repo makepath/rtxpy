@@ -71,7 +71,7 @@ conda install --use-local rtxpy
 1. **Clones OptiX SDK headers** from NVIDIA/optix-dev (v7.7.0 by default)
 2. **Detects GPU architecture** or uses the specified `GPU_ARCH`
 3. **Compiles kernel.cu to PTX** for the target architecture
-4. **Installs otk-pyoptix** from NVIDIA's repository
+4. **Installs pyoptix-contrib** (OptiX Python bindings)
 5. **Installs rtxpy** with the compiled PTX kernel
 
 ## GPU Architecture Reference

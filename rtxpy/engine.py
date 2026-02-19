@@ -976,7 +976,7 @@ class InteractiveViewer:
     - +/=: Increase speed
     - -: Decrease speed
     - G: Cycle terrain color (elevation → overlays)
-    - U: Cycle basemap (none → satellite → osm)
+    - U/Shift+U: Cycle basemap forward/backward (none → satellite → osm)
     - N: Cycle geometry layer (none → all → groups)
     - P: Jump to previous geometry in current group
     - ,/.: Decrease/increase overlay alpha (transparency)
@@ -1016,6 +1016,8 @@ class InteractiveViewer:
                  mesh_type: str = 'heightfield',
                  overlay_layers: dict = None,
                  title: str = None,
+                 subtitle: str = None,
+                 legend: dict = None,
                  subsample: int = 1):
         """
         Initialize the interactive viewer.
@@ -1256,6 +1258,12 @@ class InteractiveViewer:
         # Help text cache (pre-rendered RGBA numpy array via PIL)
         self._help_text_rgba = None
 
+        # Title / subtitle overlay (pre-rendered RGBA numpy array via PIL)
+        self._subtitle = subtitle
+        self._legend_config = legend
+        self._title_overlay_rgba = None
+        self._legend_rgba = None
+
         # FIRMS fire layer state
         self._accessor = None         # RTX accessor for place_geojson
         self._firms_loaded = False    # Whether fire data has been fetched
@@ -1459,7 +1467,8 @@ class InteractiveViewer:
                     verts.copy(), idxs.copy(), terrain_np.copy(),
                 )
 
-                rtx.add_geometry('terrain', verts, idxs)
+                rtx.add_geometry('terrain', verts, idxs,
+                                 grid_dims=(H, W))
 
     def _get_front(self):
         """Get the forward direction vector."""
@@ -1756,7 +1765,9 @@ class InteractiveViewer:
             # 4. Replace terrain geometry (add_geometry overwrites existing key
             #    in-place, preserving dict insertion order and instance IDs)
             if self.rtx is not None:
-                self.rtx.add_geometry('terrain', vertices, indices)
+                gd = (H, W) if self.mesh_type != 'voxel' else None
+                self.rtx.add_geometry('terrain', vertices, indices,
+                                      grid_dims=gd)
 
         self.elev_min = float(np.nanmin(terrain_np)) * ve
         self.elev_max = float(np.nanmax(terrain_np)) * ve
@@ -1999,7 +2010,9 @@ class InteractiveViewer:
 
             # Replace terrain geometry (preserves dict insertion order)
             if self.rtx is not None:
-                self.rtx.add_geometry('terrain', vertices, indices)
+                gd = (H, W) if self.mesh_type != 'voxel' else None
+                self.rtx.add_geometry('terrain', vertices, indices,
+                                      grid_dims=gd)
 
         # Update elevation stats (scaled)
         self.elev_min = float(np.nanmin(terrain_np)) * ve
@@ -3244,9 +3257,11 @@ class InteractiveViewer:
             self._rebuild_vertical_exaggeration(self.vertical_exaggeration)
             print(f"Mesh type: {self.mesh_type}")
 
-        # Basemap cycling: U = cycle none → satellite → osm → none
+        # Basemap cycling: U = cycle forward, Shift+U = cycle backward
         elif key == 'u':
             self._cycle_basemap()
+        elif key == 'U':
+            self._cycle_basemap(reverse=True)
 
         # Overlay alpha: , = decrease, . = increase
         elif key == ',':
@@ -3537,7 +3552,9 @@ class InteractiveViewer:
 
             # Replace terrain geometry
             if self.rtx is not None:
-                self.rtx.add_geometry('terrain', vertices, indices)
+                gd = (H, W) if self.mesh_type != 'voxel' else None
+                self.rtx.add_geometry('terrain', vertices, indices,
+                                      grid_dims=gd)
 
         # Reposition camera in new window
         self.position = np.array([
@@ -3695,12 +3712,13 @@ class InteractiveViewer:
 
         self._update_frame()
 
-    def _cycle_basemap(self):
+    def _cycle_basemap(self, reverse=False):
         """Cycle basemap: none → satellite → osm → none.
 
         Auto-creates XYZTileService on-the-fly if needed.
         """
-        self._basemap_idx = (self._basemap_idx + 1) % len(self._basemap_options)
+        step = -1 if reverse else 1
+        self._basemap_idx = (self._basemap_idx + step) % len(self._basemap_options)
         provider = self._basemap_options[self._basemap_idx]
 
         if provider == 'none':
@@ -4757,6 +4775,8 @@ class InteractiveViewer:
             sun_angle=1.5,
             aperture=dof_aperture,
             focal_distance=dof_focal,
+            edge_strength=0.2,
+            edge_color=(0.15, 0.13, 0.10),
             bloom=not defer_post,
             tone_map=not defer_post,
             _return_gpu=True,
@@ -4925,6 +4945,8 @@ class InteractiveViewer:
             (self._wind_enabled and self._wind_particles is not None)
             or (self._gtfs_rt_enabled and self._gtfs_rt_vehicles is not None)
             or self.show_minimap
+            or self._title_overlay_rgba is not None
+            or self._legend_rgba is not None
             or self.show_help
         )
         if needs_overlay:
@@ -4942,6 +4964,13 @@ class InteractiveViewer:
 
         # Minimap overlay
         self._blit_minimap_on_frame(img)
+
+        # Title overlay (hidden when help is shown — they overlap top-left)
+        if not self.show_help:
+            self._blit_title_on_frame(img)
+
+        # Legend overlay (always visible)
+        self._blit_legend_on_frame(img)
 
         # Help text overlay
         if self.show_help and self._help_text_rgba is not None:
@@ -5046,6 +5075,212 @@ class InteractiveViewer:
 
         self._update_frame()
 
+    # ------------------------------------------------------------------
+    # Title & legend overlays
+    # ------------------------------------------------------------------
+
+    def _render_title_overlay(self):
+        """Pre-render title + subtitle to an RGBA numpy array using PIL.
+
+        Called once at startup; cached in ``self._title_overlay_rgba``.
+        Skipped when no title is set.
+        """
+        if not self._title or self._title == 'rtxpy':
+            return
+        try:
+            from PIL import Image, ImageDraw, ImageFont
+
+            bold_path = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+            sans_path = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
+            try:
+                font_title = ImageFont.truetype(bold_path, 22)
+                font_sub = ImageFont.truetype(sans_path, 11)
+            except (OSError, IOError):
+                font_title = ImageFont.load_default()
+                font_sub = font_title
+
+            pad_x, pad_y = 14, 10
+            corner_r = 10
+            bg_color = (15, 18, 24, 200)
+
+            # Measure title
+            title_bbox = font_title.getbbox(self._title)
+            title_w = title_bbox[2] - title_bbox[0]
+            title_h = title_bbox[3] - title_bbox[1]
+
+            # Measure subtitle
+            sub_h = 0
+            sub_w = 0
+            if self._subtitle:
+                sub_bbox = font_sub.getbbox(self._subtitle)
+                sub_w = sub_bbox[2] - sub_bbox[0]
+                sub_h = sub_bbox[3] - sub_bbox[1] + 4  # 4px gap
+
+            img_w = pad_x * 2 + max(title_w, sub_w)
+            img_h = pad_y * 2 + title_h + sub_h
+
+            img = Image.new('RGBA', (img_w, img_h), (0, 0, 0, 0))
+            draw = ImageDraw.Draw(img)
+            draw.rounded_rectangle(
+                [0, 0, img_w - 1, img_h - 1],
+                radius=corner_r, fill=bg_color,
+            )
+            draw.rounded_rectangle(
+                [0, 0, img_w - 1, img_h - 1],
+                radius=corner_r, outline=(60, 70, 90, 140), width=1,
+            )
+
+            # Title
+            draw.text((pad_x, pad_y), self._title,
+                      fill=(255, 255, 255, 255), font=font_title)
+
+            # Subtitle
+            if self._subtitle:
+                draw.text((pad_x, pad_y + title_h + 4), self._subtitle,
+                          fill=(170, 180, 195, 220), font=font_sub)
+
+            self._title_overlay_rgba = np.array(img, dtype=np.float32) / 255.0
+        except ImportError:
+            pass
+
+    def _render_legend_overlay(self):
+        """Pre-render legend to an RGBA numpy array using PIL.
+
+        Called once at startup; cached in ``self._legend_rgba``.
+        Expects ``self._legend_config`` to be a dict with 'title' and
+        'entries' keys.
+        """
+        if not self._legend_config:
+            return
+        entries = self._legend_config.get('entries', [])
+        if not entries:
+            return
+        try:
+            from PIL import Image, ImageDraw, ImageFont
+
+            bold_path = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+            sans_path = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
+            try:
+                font_header = ImageFont.truetype(bold_path, 13)
+                font_label = ImageFont.truetype(sans_path, 12)
+            except (OSError, IOError):
+                font_header = ImageFont.load_default()
+                font_label = font_header
+
+            pad_x, pad_y = 14, 10
+            corner_r = 10
+            swatch_size = 12
+            swatch_gap = 8   # gap between swatch and label
+            line_h = 18
+            bg_color = (15, 18, 24, 200)
+            header_color = (180, 210, 255, 255)
+            label_color = (210, 215, 225, 220)
+
+            legend_title = self._legend_config.get('title', '')
+
+            # Measure widths
+            max_label_w = 0
+            for label, _color in entries:
+                bbox = font_label.getbbox(label)
+                max_label_w = max(max_label_w, bbox[2] - bbox[0])
+
+            content_w = swatch_size + swatch_gap + max_label_w
+            if legend_title:
+                hdr_bbox = font_header.getbbox(legend_title)
+                content_w = max(content_w, hdr_bbox[2] - hdr_bbox[0])
+
+            img_w = pad_x * 2 + content_w
+            header_h = 0
+            if legend_title:
+                header_h = 13 + 8  # font size + gap below header
+            img_h = pad_y * 2 + header_h + len(entries) * line_h
+
+            img = Image.new('RGBA', (img_w, img_h), (0, 0, 0, 0))
+            draw = ImageDraw.Draw(img)
+            draw.rounded_rectangle(
+                [0, 0, img_w - 1, img_h - 1],
+                radius=corner_r, fill=bg_color,
+            )
+            draw.rounded_rectangle(
+                [0, 0, img_w - 1, img_h - 1],
+                radius=corner_r, outline=(60, 70, 90, 140), width=1,
+            )
+
+            y = pad_y
+            if legend_title:
+                draw.text((pad_x, y), legend_title,
+                          fill=header_color, font=font_header)
+                y += header_h
+
+            for label, color_rgb in entries:
+                # Colour swatch
+                r8 = int(min(1.0, color_rgb[0]) * 255)
+                g8 = int(min(1.0, color_rgb[1]) * 255)
+                b8 = int(min(1.0, color_rgb[2]) * 255)
+                sx = pad_x
+                sy = y + (line_h - swatch_size) // 2
+                draw.rectangle(
+                    [sx, sy, sx + swatch_size - 1, sy + swatch_size - 1],
+                    fill=(r8, g8, b8, 255),
+                )
+                # Label
+                draw.text((pad_x + swatch_size + swatch_gap, y + 1),
+                          label, fill=label_color, font=font_label)
+                y += line_h
+
+            self._legend_rgba = np.array(img, dtype=np.float32) / 255.0
+        except ImportError:
+            pass
+
+    def _blit_title_on_frame(self, img):
+        """Alpha-composite cached title overlay onto the rendered frame.
+
+        Parameters
+        ----------
+        img : ndarray, shape (H, W, 3), float32 0-1
+            Rendered frame. Modified in-place.
+        """
+        if self._title_overlay_rgba is None:
+            return
+        ov = self._title_overlay_rgba
+        oh, ow = ov.shape[:2]
+        fh, fw = img.shape[:2]
+        margin = 12
+        bh = min(oh, fh - margin)
+        bw = min(ow, fw - margin)
+        if bh <= 0 or bw <= 0:
+            return
+        alpha = ov[:bh, :bw, 3:4]
+        rgb = ov[:bh, :bw, :3]
+        region = img[margin:margin+bh, margin:margin+bw]
+        region[:] = region * (1 - alpha) + rgb * alpha
+
+    def _blit_legend_on_frame(self, img):
+        """Alpha-composite cached legend overlay onto the rendered frame.
+
+        Parameters
+        ----------
+        img : ndarray, shape (H, W, 3), float32 0-1
+            Rendered frame. Modified in-place.
+        """
+        if self._legend_rgba is None:
+            return
+        ov = self._legend_rgba
+        oh, ow = ov.shape[:2]
+        fh, fw = img.shape[:2]
+        margin = 12
+        y0 = fh - margin - oh
+        if y0 < 0:
+            y0 = 0
+        bh = min(oh, fh - y0)
+        bw = min(ow, fw - margin)
+        if bh <= 0 or bw <= 0:
+            return
+        alpha = ov[:bh, :bw, 3:4]
+        rgb = ov[:bh, :bw, :3]
+        region = img[y0:y0+bh, margin:margin+bw]
+        region[:] = region * (1 - alpha) + rgb * alpha
+
     def _render_help_text(self):
         """Pre-render help text to an RGBA numpy array using PIL.
 
@@ -5065,7 +5300,7 @@ class InteractiveViewer:
             ]),
             ("TERRAIN", [
                 ("G", "Cycle terrain layer"),
-                ("U", "Cycle basemap"),
+                ("U / Shift+U", "Cycle basemap fwd / back"),
                 ("C", "Cycle colormap"),
                 ("Y", "Cycle color stretch"),
                 (", / .", "Overlay alpha"),
@@ -5348,6 +5583,8 @@ class InteractiveViewer:
 
         # --- Pre-render help text overlay ---
         self._render_help_text()
+        self._render_title_overlay()
+        self._render_legend_overlay()
 
         # --- Initialize minimap ---
         self._compute_minimap_background()
@@ -5539,6 +5776,8 @@ def explore(raster, width: int = 800, height: int = 600,
             overlay_layers: dict = None,
             color_stretch: str = 'linear',
             title: str = None,
+            subtitle: str = None,
+            legend: dict = None,
             tile_service=None,
             geometry_colors_builder=None,
             baked_meshes=None,
@@ -5628,7 +5867,7 @@ def explore(raster, width: int = 800, height: int = 600,
     - +/=: Increase speed
     - -: Decrease speed
     - G: Cycle terrain color (elevation → overlays)
-    - U: Cycle basemap (none → satellite → osm)
+    - U/Shift+U: Cycle basemap forward/backward (none → satellite → osm)
     - N: Cycle geometry layer (none → all → groups)
     - P: Jump to previous geometry in current group
     - ,/.: Decrease/increase overlay alpha (transparency)
@@ -5685,6 +5924,8 @@ def explore(raster, width: int = 800, height: int = 600,
         mesh_type=mesh_type,
         overlay_layers=overlay_layers,
         title=title,
+        subtitle=subtitle,
+        legend=legend,
         subsample=subsample,
     )
     viewer._geometry_colors_builder = geometry_colors_builder

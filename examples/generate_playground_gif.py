@@ -33,9 +33,6 @@ def load_terrain():
     crop = 20
     terrain = terrain[crop:-crop, crop:-crop]
 
-    # Scale down elevation for visualization
-    terrain.data = terrain.data * 0.2
-
     # Ensure contiguous array before GPU transfer
     terrain.data = np.ascontiguousarray(terrain.data)
 

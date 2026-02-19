@@ -124,17 +124,11 @@ jobs:
           echo "=== PTX compiled successfully ==="
           head -15 rtxpy/kernel.ptx
 
-      - name: Install otk-pyoptix from source
+      - name: Install pyoptix-contrib
         shell: bash -el {0}
         run: |
           echo "Using OptiX from: ${OptiX_INSTALL_DIR}"
-
-          # Clone and install otk-pyoptix
-          git clone --depth 1 https://github.com/NVIDIA/otk-pyoptix.git /tmp/otk-pyoptix
-          cd /tmp/otk-pyoptix/optix
-
-          # Install with OptiX path set
-          pip install .
+          pip install pyoptix-contrib
 
       - name: Install rtxpy with CUDA dependencies
         shell: bash -el {0}

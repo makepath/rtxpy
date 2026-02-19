@@ -98,15 +98,19 @@ def quickstart(
     cacheable = {k: v for k, v in feat.items() if k not in _TEMPORAL}
     temporal = {k: v for k, v in feat.items() if k in _TEMPORAL}
 
-    # Check for mesh cache in zarr
+    # Check for mesh cache in zarr and which features it contains
     has_cache = False
+    cached_features = set()
     if cacheable:
         try:
             import zarr as _zarr
             store = _zarr.open(str(zarr_path), mode='r',
                                use_consolidated=False)
-            has_cache = ('meshes' in store
-                         and len(list(store['meshes'])) > 0)
+            if 'meshes' in store and len(list(store['meshes'])) > 0:
+                has_cache = True
+                # Read which feature keys were stored with this cache
+                cached_features = set(
+                    store['meshes'].attrs.get('feature_keys', []))
             del store
         except Exception:
             pass
@@ -116,16 +120,65 @@ def quickstart(
                                 message="place_geojson called before")
         if has_cache:
             ds.rtx.load_meshes(zarr_path)
+            # Place any cacheable features missing from the cache.
+            # If the cache pre-dates feature_keys tracking, we only
+            # know which features were loaded by checking the scene's
+            # geometry IDs against known feature prefixes.
+            if cached_features:
+                missing = {k: v for k, v in cacheable.items()
+                           if k not in cached_features}
+            else:
+                # Legacy cache without feature_keys metadata —
+                # check which features actually have geometries loaded
+                loaded_gids = set(ds.rtx._get_terrain_da(
+                    list(ds.data_vars)[0]).rtx._rtx.list_geometries())
+                missing = {k: v for k, v in cacheable.items()
+                           if not _has_geometry_for_feature(k, loaded_gids)}
+            if missing:
+                names = ', '.join(missing)
+                print(f"Placing features not in cache: {names}")
+                _place_features(ds, missing, name, bounds, crs, cache_dir)
+                try:
+                    ds.rtx.save_meshes(zarr_path)
+                    _save_feature_keys(zarr_path, cacheable.keys())
+                except Exception as e:
+                    print(f"Could not update mesh cache: {e}")
+            elif not cached_features:
+                # Legacy cache is complete — stamp it with feature_keys
+                try:
+                    _save_feature_keys(zarr_path, cacheable.keys())
+                except Exception:
+                    pass
         elif cacheable:
             _place_features(ds, cacheable, name, bounds, crs, cache_dir)
             try:
                 ds.rtx.save_meshes(zarr_path)
+                _save_feature_keys(zarr_path, cacheable.keys())
             except Exception as e:
                 print(f"Could not save mesh cache: {e}")
 
         # Temporal features (always fresh, not cached in zarr)
         if temporal:
             _place_features(ds, temporal, name, bounds, crs, cache_dir)
+
+    # -- gtfs realtime --------------------------------------------------------
+    # When loading from cache, _place_gtfs() is never called, so _gtfs_data
+    # is not set.  Fetch the GTFS data directly for the realtime overlay.
+    gtfs_data = ds.attrs.pop('_gtfs_data', None)
+    if gtfs_data is None and 'gtfs' in feat:
+        gtfs_opts = feat['gtfs']
+        try:
+            from .remote_data import fetch_gtfs as _fetch_gtfs
+            gtfs_data = _fetch_gtfs(
+                bounds=bounds,
+                feed_url=gtfs_opts.get('feed_url'),
+                gtfs_path=gtfs_opts.get('gtfs_path'),
+                route_types=gtfs_opts.get('route_types'),
+                cache_path=cache_dir / f"{name}_gtfs.json",
+                crs=crs,
+                realtime_url=gtfs_opts.get('realtime_url'))
+        except Exception as e:
+            print(f"Skipping GTFS realtime: {e}")
 
     # -- wind -----------------------------------------------------------------
     wind_data = None
@@ -143,9 +196,6 @@ def quickstart(
     )
     defaults.update(explore_kwargs)
 
-    # -- gtfs realtime ----------------------------------------------------------
-    gtfs_data = ds.attrs.pop('_gtfs_data', None)
-
     print("\nLaunching explore...\n")
     ds.rtx.explore(z='elevation', scene_zarr=zarr_path,
                    wind_data=wind_data, gtfs_data=gtfs_data, **defaults)
@@ -154,6 +204,32 @@ def quickstart(
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
+
+def _has_geometry_for_feature(feature_key, loaded_gids):
+    """Check whether any geometry ID in the scene matches *feature_key*."""
+    _PREFIXES = {
+        'buildings': ('building_',),
+        'roads': ('road_major', 'road_minor'),
+        'water': ('water_',),
+        'places': ('places',),
+        'infrastructure': ('infrastructure',),
+        'land_use': ('land_use',),
+        'restaurant_grades': ('grade_a', 'grade_b', 'grade_c'),
+        'gtfs': ('gtfs_',),
+    }
+    prefixes = _PREFIXES.get(feature_key, (feature_key,))
+    return any(
+        any(gid == p or gid.startswith(p) for p in prefixes)
+        for gid in loaded_gids
+    )
+
+
+def _save_feature_keys(zarr_path, keys):
+    """Store feature keys in the zarr meshes group attributes."""
+    import zarr as _zarr
+    store = _zarr.open(str(zarr_path), mode='r+', use_consolidated=False)
+    store['meshes'].attrs['feature_keys'] = sorted(keys)
+
 
 def _parse_features(features):
     """Normalize *features* to ``{key: {opts}}`` dict."""

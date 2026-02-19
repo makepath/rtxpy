@@ -1853,8 +1853,9 @@ class RTXAccessor:
         self._pixel_spacing_y = pixel_spacing_y
         self._terrain_mesh_type = 'tin'
 
-        # Add to scene
-        self._rtx.add_geometry(geometry_id, vertices, indices)
+        # Add to scene (pass grid dims for cluster-accelerated BVH)
+        self._rtx.add_geometry(geometry_id, vertices, indices,
+                               grid_dims=(H, W))
 
         return vertices, indices
 
@@ -2663,6 +2664,7 @@ class RTXDatasetAccessor:
                 start_position=None, look_at=None, key_repeat_interval=0.05,
                 pixel_spacing_x=None, pixel_spacing_y=None,
                 mesh_type='heightfield', color_stretch='linear', title=None,
+                subtitle=None, legend=None,
                 subsample=1, wind_data=None, gtfs_data=None,
                 scene_zarr=None,
                 ao_samples=0, gi_bounces=1, denoise=False, repl=False, tour=None):
@@ -2759,6 +2761,8 @@ class RTXDatasetAccessor:
             overlay_layers=overlay_layers,
             color_stretch=color_stretch,
             title=title,
+            subtitle=subtitle,
+            legend=legend,
             tile_service=getattr(self, '_tile_service', None),
             geometry_colors_builder=geometry_colors_builder,
             baked_meshes=terrain_da.rtx._baked_meshes if terrain_da.rtx._baked_meshes else None,

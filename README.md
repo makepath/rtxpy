@@ -1,6 +1,6 @@
 # RTXpy
 
-Ray tracing using CUDA, accessible from Python.
+GPU-accelerated terrain analysis for the xarray ecosystem. Compute hillshade, viewshed, slope — get DataArrays back. Build a Dataset, then explore it interactively in 3D. Built-in data fetching (DEM, buildings, roads, water, fire, wind) makes it easy to go from a bounding box to a full scene.
 
 ![Crater Lake Viewshed Demo](examples/images/playground_demo.gif)
 
@@ -8,92 +8,146 @@ Ray tracing using CUDA, accessible from Python.
 
 ## Quick Start
 
+Fetch terrain, analyze, and explore — all from a bounding box:
+
 ```python
-import rtxpy  # registers the .rtx xarray accessor
-import rioxarray
+from rtxpy import fetch_dem
+import rtxpy
 
-# Load a GeoTIFF DEM as an xarray DataArray
-dem = rioxarray.open_rasterio('elevation.tif').squeeze()
-
-# Move data to GPU
+# Download 30m terrain (cached after first run)
+dem = fetch_dem(
+    bounds=(-122.3, 42.8, -121.9, 43.0),
+    output_path='crater_lake.zarr',
+    source='copernicus',
+)
 dem = dem.rtx.to_cupy()
 
-# Compute hillshade with ray-traced shadows
+# Analysis results are standard xarray DataArrays
 hillshade = dem.rtx.hillshade(shadows=True)
-
-# Compute viewshed from an observer location (pixel coordinates)
 viewshed = dem.rtx.viewshed(x=500, y=300, observer_elev=2)
 
-# Launch interactive 3D terrain explorer
+# Interactive 3D terrain exploration
 dem.rtx.explore()
+```
+
+Build a Dataset with multiple layers, then explore them together:
+
+```python
+import xarray as xr
+from xrspatial import slope, aspect
+from rtxpy import fetch_dem, fetch_buildings, fetch_roads
+
+bounds = (-122.3, 42.8, -121.9, 43.0)
+dem = fetch_dem(bounds, 'terrain.zarr', source='srtm', crs='EPSG:5070')
+dem = dem.rtx.to_cupy()
+
+ds = xr.Dataset({
+    'elevation': dem,
+    'slope': slope(dem),
+    'aspect': aspect(dem),
+})
+
+# Fetch and place vector features
+roads = fetch_roads(bounds, crs='EPSG:5070')
+ds.rtx.place_roads(roads, z='elevation')
+
+bldgs = fetch_buildings(bounds, source='overture', crs='EPSG:5070')
+ds.rtx.place_buildings(bldgs, z='elevation')
+
+# G cycles layers, N toggles geometry, U drapes satellite tiles
+ds.rtx.explore(z='elevation', mesh_type='voxel')
 ```
 
 ## Prerequisites
 
-- NVIDIA GPU with RTX support (Maxwell architecture or newer)
-- NVIDIA driver version:
-  - 456.71 or newer for Windows
-  - 455.28 or newer for Linux
-- OptiX SDK 7.6+ (set `OptiX_INSTALL_DIR` environment variable)
-- CUDA 12.x+
+- **NVIDIA GPU**: Maxwell architecture or newer (GTX 900+ / RTX series)
+- **NVIDIA driver**: 455.28+ (Linux) or 456.71+ (Windows)
+- **CUDA**: 12.x or newer
+
+See [INSTALL.md](INSTALL.md) for detailed instructions and troubleshooting.
 
 ## Installation
 
-I included some extra deps. here like rioxarray so the examples can load geotiffs
+### Conda (recommended)
 
-**Note:** The conda-forge version is currently outdated so please use makepath conda channel...will fix soon.
-
-### Linux w/ conda
 ```bash
-conda install -c conda-forge cupy rioxarray matplotlib requests jupyter makepath::rtxpy
+conda create -n rtxpy python=3.12 -y
+conda activate rtxpy
+conda install -c makepath -c conda-forge rtxpy
+
+# Additional deps for examples and interactive viewer
+conda install -c conda-forge \
+    xarray rioxarray xarray-spatial \
+    pyproj pillow pyglfw moderngl scipy \
+    "duckdb<1.4" requests matplotlib
 ```
 
-### Windows w/ conda
+### Pip + Conda hybrid (from source)
+
 ```bash
-conda install -c conda-forge cupy rioxarray matplotlib requests jupyter nvidia::cudatoolkit makepath::rtxpy
+# GPU foundation via conda
+conda create -n rtxpy-dev python=3.12 -y
+conda activate rtxpy-dev
+conda install -c conda-forge cupy numba zarr
+
+# OptiX SDK headers (needed for pyoptix-contrib build and PTX compilation)
+git clone --depth 1 https://github.com/NVIDIA/optix-dev.git /tmp/optix-dev
+CMAKE_PREFIX_PATH=/tmp/optix-dev \
+    pip install pyoptix-contrib
+
+# Install rtxpy (editable)
+pip install -e ".[all]"
 ```
 
-## Build from Source
-
-First, install the OptiX Python bindings (otk-pyoptix):
+### Development
 
 ```bash
-export OptiX_INSTALL_DIR=/path/to/OptiX-SDK
-pip install otk-pyoptix
-```
-
-Then install rtxpy:
-
-```bash
-pip install rtxpy
-```
-
-## Installation from source
-
-To install RTXpy from source:
-
-```bash
-export OptiX_INSTALL_DIR=/path/to/OptiX-SDK
-pip install otk-pyoptix
-pip install -ve .
-```
-
-To run tests:
-
-```bash
-pip install -ve .[tests]
+# After completing the pip + conda hybrid setup above:
+pip install -e ".[tests]"
 pytest -v rtxpy/tests
 ```
 
-## Building kernel.ptx from source
+## Features
 
-If you need to rebuild the PTX kernel (e.g., for a different GPU architecture or OptiX version):
+- **Analysis arrays** — `hillshade()`, `slope()`, `aspect()`, `viewshed()` return xarray DataArrays that fit into your existing Dataset
+- **Data fetching** — `fetch_dem()`, `fetch_buildings()`, `fetch_roads()`, `fetch_water()`, `fetch_wind()`, `fetch_firms()` — go from a bounding box to real data with automatic caching
+- **3D feature placement** — extrude buildings, drape roads, scatter custom meshes on terrain
+- **Interactive viewer** — `explore()` renders your Dataset in 3D with keyboard/mouse controls, satellite tiles, wind particles, and real-time viewshed
+- **Rendering** — perspective camera with shadows, fog, AO, depth-of-field, colormaps for static images and GIF animations
+- **Mesh I/O** — load GLB/OBJ/STL, save/load zarr scenes, export STL
+
+## Documentation
+
+- **[Getting Started](docs/getting-started.md)** — installation, prerequisites, first example, how the accessor works
+- **[User Guide](docs/user-guide.md)** — task-oriented workflows for analysis, placement, rendering, and the interactive viewer
+- **[API Reference](docs/api-reference.md)** — complete method signatures, parameters, and return values
+- **[Examples](docs/examples.md)** — annotated walkthrough, quick recipes, and example scripts
+
+## Low-Level API
+
+For custom ray tracing without the xarray accessor:
+
+```python
+import numpy as np
+from rtxpy import RTX
+
+rtx = RTX()
+
+verts = np.float32([0,0,0, 1,0,0, 0,1,0, 1,1,0])
+triangles = np.int32([0,1,2, 2,1,3])
+rtx.build(0, verts, triangles)
+
+rays = np.float32([0.33, 0.33, 100, 0, 0, 0, -1, 1000])
+hits = np.float32([0, 0, 0, 0])
+rtx.trace(rays, hits, 1)
+
+print(hits)  # [100.0, 0.0, 0.0, 1.0]
+```
+
+## Building the PTX Kernel
 
 ```bash
-# Detect your GPU's compute capability (e.g., 75 for Turing, 86 for Ampere)
 GPU_ARCH=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | tr -d '.')
-
-# Compile for your GPU architecture
 nvcc -ptx -o rtxpy/kernel.ptx cuda/kernel.cu \
     -arch=sm_${GPU_ARCH} \
     -I/path/to/OptiX-SDK/include \
@@ -101,96 +155,16 @@ nvcc -ptx -o rtxpy/kernel.ptx cuda/kernel.cu \
     --use_fast_math
 ```
 
-The CUDA source files are in the `cuda/` directory.
-
 ## Building with Conda
 
-The easiest way to build rtxpy with all dependencies is using the included conda recipe:
-
 ```bash
-# Install conda-build if not already installed
 conda install conda-build
-
-# Build the package (auto-detects GPU architecture)
 conda build conda-recipe
-
-# Or specify GPU architecture explicitly
-GPU_ARCH=86 conda build conda-recipe  # For RTX 30xx/A100
-
-# Install the built package
 conda install --use-local rtxpy
 ```
 
-The conda build automatically:
-1. Clones OptiX SDK headers from NVIDIA/optix-dev
-2. Detects your GPU architecture (or uses `GPU_ARCH` env var)
-3. Compiles the PTX kernel for your GPU
-4. Builds and installs otk-pyoptix
-5. Installs rtxpy
-
-You can also specify the OptiX version:
-```bash
-OPTIX_VERSION=7.7.0 conda build conda-recipe  # Requires driver 530.41+
-OPTIX_VERSION=8.0.0 conda build conda-recipe  # Requires driver 535+
-```
-
-See `conda-recipe/README.md` for detailed documentation, GPU architecture reference, and troubleshooting.
+Auto-detects GPU architecture, downloads OptiX headers, compiles PTX, and installs everything. Override with `GPU_ARCH=86` or `OPTIX_VERSION=8.0.0`. See `conda-recipe/README.md` for details.
 
 ## WSL2 Support
 
-To get OptiX working on WSL2, follow the instructions from the NVIDIA forums:
-https://forums.developer.nvidia.com/t/problem-running-optix-7-6-in-wsl/239355/8
-
-Summary:
-1. Install WSL 2 and enable CUDA
-2. Download and extract the Linux display driver (e.g., `NVIDIA-Linux-x86_64-590.44.01.run`)
-3. Extract with `./NVIDIA-Linux-x86_64-XXX.XX.run -x`
-4. Copy the following files to `C:/Windows/System32/lxss/lib`:
-   - `libnvoptix.so.XXX.00` (rename to `libnvoptix.so.1`)
-   - `libnvidia-rtcore.so.XXX.00` (keep original name)
-   - `libnvidia-ptxjitcompiler.so.XXX.00` (rename to `libnvidia-ptxjitcompiler.so.1`)
-5. Add `/usr/lib/wsl/lib` to your `LD_LIBRARY_PATH`
-6. Reset WSL cache with `wsl --shutdown` from PowerShell
-
-## Usage
-
-```python
-import numpy as np
-from rtxpy import RTX
-
-# Create RTX instance
-rtx = RTX()
-
-# Define geometry (vertices and triangle indices)
-verts = np.float32([0,0,0, 1,0,0, 0,1,0, 1,1,0])
-triangles = np.int32([0,1,2, 2,1,3])
-
-# Build acceleration structure
-rtx.build(0, verts, triangles)
-
-# Define rays: [ox, oy, oz, tmin, dx, dy, dz, tmax]
-rays = np.float32([0.33, 0.33, 100, 0, 0, 0, -1, 1000])
-hits = np.float32([0, 0, 0, 0])
-
-# Trace rays
-rtx.trace(rays, hits, 1)
-
-# hits contains: [t, nx, ny, nz]
-# t = distance to hit point (-1 if miss)
-# nx, ny, nz = surface normal at hit point
-print(hits)  # [100.0, 0.0, 0.0, 1.0]
-```
-
-For GPU-resident data, use CuPy arrays for better performance:
-
-```python
-import cupy
-
-verts = cupy.float32([0,0,0, 1,0,0, 0,1,0, 1,1,0])
-triangles = cupy.int32([0,1,2, 2,1,3])
-rays = cupy.float32([0.33, 0.33, 100, 0, 0, 0, -1, 1000])
-hits = cupy.float32([0, 0, 0, 0])
-
-rtx.build(0, verts, triangles)
-rtx.trace(rays, hits, 1)
-```
+See [Getting Started — WSL2 Setup](docs/getting-started.md#wsl2-setup) for instructions on getting OptiX working on WSL2.

@@ -1,6 +1,6 @@
 """XYZ map tile fetching and compositing service.
 
-Downloads map tiles (satellite, street map, topo, etc.) from XYZ tile servers
+Downloads map tiles (satellite, street map, etc.) from XYZ tile servers
 and composites them into an RGB texture that matches the terrain grid dimensions.
 Each tile is reprojected to the raster's native CRS so the imagery aligns with
 the terrain regardless of projection.  Tiles stream in the background via a
@@ -29,7 +29,6 @@ import numpy as np
 TILE_PROVIDERS = {
     'osm': 'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
     'satellite': 'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
-    'topo': 'https://tile.opentopomap.org/{z}/{x}/{y}.png',
 }
 
 

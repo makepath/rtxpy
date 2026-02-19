@@ -9,6 +9,11 @@ python:
   - "3.12"
   - "3.13"
 
+# CUDA major versions to build variants for
+cuda_version:
+  - "12"
+  - "13"
+
 # NumPy version (needed to avoid conda-build warning)
 numpy:
   - "1.26"

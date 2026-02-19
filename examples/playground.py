@@ -12,7 +12,7 @@ Crater Lake outline + Rim Drive path are placed as 3D geometry. Press G/N
 to cycle and jump between geometry layers.
 
 Requirements:
-    pip install rtxpy[all] matplotlib xarray rioxarray requests pyproj Pillow osmnx
+    pip install rtxpy[all] matplotlib xarray rioxarray requests pyproj Pillow osmnx duckdb
 """
 
 import warnings
@@ -24,7 +24,7 @@ from pathlib import Path
 from xrspatial import slope, aspect, quantile
 
 # Import rtxpy to register the .rtx accessor
-from rtxpy import fetch_dem, fetch_roads, fetch_water
+from rtxpy import fetch_dem, fetch_buildings, fetch_roads, fetch_water
 import rtxpy
 
 BOUNDS = (-122.3, 42.8, -121.9, 43.0)
@@ -36,16 +36,13 @@ def load_terrain():
     """Load Crater Lake terrain data, downloading if necessary."""
     terrain = fetch_dem(
         bounds=BOUNDS,
-        output_path=CACHE / "crater_lake_national_park.tif",
+        output_path=CACHE / "crater_lake_national_park.zarr",
         source='srtm',
         crs=CRS,
     )
 
     # Subsample for faster interactive performance
     terrain = terrain[::2, ::2]
-
-    # Scale down elevation for visualization (optional)
-    terrain.data = terrain.data * 0.1
 
     # Ensure contiguous array before GPU transfer
     terrain.data = np.ascontiguousarray(terrain.data)
@@ -58,7 +55,7 @@ def load_terrain():
     terrain = terrain.rtx.to_cupy()
 
     print(f"Terrain loaded: {terrain.shape}, elevation range: "
-          f"{elev_min:.0f}m to {elev_max:.0f}m (scaled)")
+          f"{elev_min:.0f}m to {elev_max:.0f}m")
 
     return terrain
 
@@ -166,38 +163,65 @@ if __name__ == "__main__":
         ],
     }
 
-    with warnings.catch_warnings():
-        warnings.filterwarnings("ignore", message="place_geojson called before")
-        info = ds.rtx.place_geojson(
-            crater_lake_geojson,
-            z='elevation',
-            height=15.0,
-            label_field='name',
-            geometry_id='landmark',
-        )
-    print(f"Placed {info['geometries']} GeoJSON geometries: "
-          f"{', '.join(info['geometry_ids'])}")
+    ZARR = CACHE / "crater_lake_national_park.zarr"
 
-    # --- OpenStreetMap roads ------------------------------------------------
+    # Ensure meshes exist in zarr (first run places + saves them)
     try:
-        roads_data = fetch_roads(bounds=BOUNDS, road_type='all', crs=CRS,
-                                 cache_path=CACHE / "crater_lake_roads.geojson")
-        info = ds.rtx.place_roads(roads_data, z='elevation', geometry_id='roads',
-                                  height=5, mesh_cache=CACHE / "crater_lake_roads_mesh.npz")
-        print(f"Placed {info['geometries']} road geometries")
-    except Exception as e:
-        print(f"Skipping roads: {e}")
+        import zarr as _zarr
+        _zarr.open(str(ZARR), mode='r', use_consolidated=False)['meshes']
+    except (KeyError, FileNotFoundError):
+        # First run — place features from sources and bake into zarr
+        # --- GeoJSON landmarks and outlines ----------------------------------
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", message="place_geojson called before")
+            info = ds.rtx.place_geojson(
+                crater_lake_geojson,
+                z='elevation',
+                height=15.0,
+                label_field='name',
+                geometry_id='landmark',
+            )
+        print(f"Placed {info['geometries']} GeoJSON geometries: "
+              f"{', '.join(info['geometry_ids'])}")
 
-    # --- OpenStreetMap water features ---------------------------------------
-    try:
-        water_data = fetch_water(bounds=BOUNDS, water_type='all', crs=CRS,
-                                 cache_path=CACHE / "crater_lake_water.geojson")
-        results = ds.rtx.place_water(water_data, z='elevation',
-                                     mesh_cache_prefix=CACHE / "crater_lake_water")
-        for cat, info in results.items():
-            print(f"Placed {info['geometries']} {cat} water features")
-    except Exception as e:
-        print(f"Skipping water: {e}")
+        # --- Overture Maps buildings -----------------------------------------
+        try:
+            bldgs_data = fetch_buildings(bounds=BOUNDS, source='overture', crs=CRS,
+                                         cache_path=CACHE / "crater_lake_buildings_overture.geojson")
+            if bldgs_data['features']:
+                info = ds.rtx.place_buildings(bldgs_data, z='elevation')
+                print(f"Placed {info['geometries']} Overture buildings")
+        except ImportError:
+            print("Skipping Overture buildings (pip install duckdb)")
+        except Exception as e:
+            print(f"Skipping Overture buildings: {e}")
+
+        # --- Overture Maps roads --------------------------------------------
+        try:
+            roads_data = fetch_roads(bounds=BOUNDS, road_type='all',
+                                     source='overture', crs=CRS,
+                                     cache_path=CACHE / "crater_lake_roads_overture.geojson")
+            if roads_data['features']:
+                info = ds.rtx.place_roads(roads_data, z='elevation',
+                                          geometry_id='roads', height=5)
+                print(f"Placed {info['geometries']} Overture road geometries")
+        except ImportError:
+            print("Skipping Overture roads (pip install duckdb)")
+        except Exception as e:
+            print(f"Skipping Overture roads: {e}")
+
+        # --- Water features (Overture Maps) ---------------------------------
+        try:
+            water_data = fetch_water(bounds=BOUNDS, water_type='all', crs=CRS,
+                                     cache_path=CACHE / "crater_lake_water.geojson")
+            results = ds.rtx.place_water(water_data, z='elevation')
+            for cat, info in results.items():
+                print(f"Placed {info['geometries']} {cat} water features")
+        except Exception as e:
+            print(f"Skipping water: {e}")
+
+        # Save all placed meshes into the DEM zarr
+        ds.rtx.save_meshes(ZARR, z='elevation')
 
     # --- Wind data --------------------------------------------------------
     wind = None
@@ -208,18 +232,20 @@ if __name__ == "__main__":
         # so they cover the field instead of clumping
         wind['n_particles'] = 15000
         wind['max_age'] = 120
-        wind['speed_mult'] = 80.0
+        wind['speed_mult'] = 400.0
     except Exception as e:
         print(f"Skipping wind: {e}")
 
     print("\nLaunching explore (press G to cycle layers, Shift+W for wind)...\n")
     ds.rtx.explore(
         z='elevation',
+        scene_zarr=ZARR,
         mesh_type='voxel',
         width=1024,
         height=768,
         render_scale=0.5,
         wind_data=wind,
+        repl=True,
     )
 
     print("Done")
