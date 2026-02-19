@@ -5536,6 +5536,15 @@ class InteractiveViewer:
             self.yaw = np.degrees(np.arctan2(direction[1], direction[0]))
             self.pitch = np.degrees(np.arcsin(np.clip(direction[2], -1, 1)))
 
+        # Save terminal state before GLFW (it can alter termios)
+        import sys
+        _saved_termios = None
+        try:
+            import termios
+            _saved_termios = termios.tcgetattr(sys.stdin.fileno())
+        except (ImportError, termios.error, ValueError):
+            pass
+
         # --- GLFW window creation ---
         if not glfw.init():
             raise RuntimeError("Failed to initialise GLFW")
@@ -5750,8 +5759,13 @@ class InteractiveViewer:
             glfw.destroy_window(window)
             glfw.terminate()
             self._glfw_window = None
-            # Reset terminal state (GLFW can hide cursor / alter termios)
-            import sys
+            # Restore terminal state (GLFW can disable echo / alter termios)
+            if _saved_termios is not None:
+                try:
+                    import termios
+                    termios.tcsetattr(sys.stdin.fileno(), termios.TCSANOW, _saved_termios)
+                except (ImportError, termios.error, ValueError):
+                    pass
             sys.stdout.write('\033[?25h')  # show cursor
             sys.stdout.flush()
 
