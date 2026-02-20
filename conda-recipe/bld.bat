@@ -81,7 +81,9 @@ echo.
 echo [3/4] Installing pyoptix-contrib...
 echo ----------------------------------------
 
-"%PYTHON%" -m pip install pyoptix-contrib --no-build-isolation
+:: Allow PyPI access (conda-build sets PIP_NO_INDEX=1 by default)
+set PIP_NO_INDEX=0
+"%PYTHON%" -m pip install pyoptix-contrib --no-deps --no-build-isolation
 if errorlevel 1 (
     echo ERROR: Failed to install pyoptix-contrib
     exit /b 1
