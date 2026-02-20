@@ -55,7 +55,7 @@ head -15 "${SRC_DIR}/rtxpy/kernel.ptx"
 # Step 3: Install pyoptix-contrib
 # ---------------------------------------------------------------------------
 echo "=== Installing pyoptix-contrib ==="
-${PYTHON} -m pip install pyoptix-contrib --no-deps --no-build-isolation -vv
+PIP_NO_INDEX=0 ${PYTHON} -m pip install pyoptix-contrib --no-deps --no-build-isolation -vv
 
 # ---------------------------------------------------------------------------
 # Step 4: Install rtxpy
