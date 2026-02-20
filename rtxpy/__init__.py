@@ -24,7 +24,7 @@ from .mesh_store import (
 from .analysis import viewshed, hillshade, render, flyover, view
 from .engine import explore
 
-__version__ = "0.0.6"
+__version__ = "0.0.7"
 
 # Optional convenience — network helpers with lazy dependency checks
 try:
