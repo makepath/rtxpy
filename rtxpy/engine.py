@@ -5546,6 +5546,10 @@ class InteractiveViewer:
             pass
 
         # --- GLFW window creation ---
+        # Force X11 on GLFW 3.4+ to get window decorations (title bar with
+        # min/max/close).  WSLg's Wayland compositor doesn't provide them.
+        if hasattr(glfw, 'PLATFORM'):
+            glfw.init_hint(glfw.PLATFORM, glfw.PLATFORM_X11)
         if not glfw.init():
             raise RuntimeError("Failed to initialise GLFW")
 

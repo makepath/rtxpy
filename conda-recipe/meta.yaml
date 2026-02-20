@@ -9,8 +9,13 @@ source:
   path: ..
 
 build:
-  number: 0
+  number: 1
   skip: true  # [py<310]
+  # Suppress tight run_exports from CUDA dev packages so the built package
+  # works with both CUDA 12 and 13+ at runtime (PTX is forward-compatible).
+  ignore_run_exports_from:
+    - cuda-cudart-dev  # [linux]
+    - cuda-nvrtc-dev  # [linux]
   script_env:
     - OPTIX_VERSION=9.1.0
     # GPU_ARCH can be set by user, otherwise detected at build time
@@ -34,7 +39,7 @@ requirements:
     - wheel
     - conda-forge::cmake
     - conda-forge::git  # [win]
-    # Linux CUDA packages
+    # Linux CUDA packages (needed for PTX compilation; run_exports suppressed above)
     - cuda-version {{ cuda_version }}.*  # [linux]
     - cuda-cudart-dev {{ cuda_version }}.*  # [linux]
     - cuda-nvrtc-dev {{ cuda_version }}.*  # [linux]
@@ -53,11 +58,14 @@ requirements:
     - pillow
     - pyglfw
     - moderngl
+    - libegl-devel  # [linux]
     - scipy
     - duckdb <1.4
     - requests
     - matplotlib
     - cuda-version >=12  # [linux]
+    - cuda-cudart >=12  # [linux]
+    - cuda-nvrtc >=12  # [linux]
     - __cuda  # [linux]
 
 test:
