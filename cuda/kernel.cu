@@ -100,15 +100,13 @@ extern "C" __global__ void __closesthit__chit()
     float3 n;
     if (optixIsTriangleHit()) {
         float3 data[3];
-#if OPTIX_VERSION >= 90100
-        // Parameterless overload: works for both regular and cluster GAS
-        optixGetTriangleVertexData(data);
-#else
+        // Always use the 4-parameter overload for backward compatibility.
+        // The parameterless overload (OptiX 9.1+) requires ABI version 99,
+        // which needs driver 570+.  The 4-param form works on all versions.
         OptixTraversableHandle gas = optixGetGASTraversableHandle();
         unsigned int sbtIdx = optixGetSbtGASIndex();
         float time = optixGetRayTime();
         optixGetTriangleVertexData(gas, primIdx, sbtIdx, time, data);
-#endif
         float3 AB = data[1] - data[0];
         float3 AC = data[2] - data[0];
         n = normalize(cross(AB, AC));
