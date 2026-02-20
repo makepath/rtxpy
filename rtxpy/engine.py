@@ -13,7 +13,7 @@ import numpy as np
 
 # On WSL2 the hardware GLX drivers often segfault. Force Mesa software
 # rendering for the display path (CUDA still handles the ray tracing).
-if 'microsoft' in os.uname().release.lower():
+if os.name != 'nt' and 'microsoft' in os.uname().release.lower():
     os.environ.setdefault('LIBGL_ALWAYS_SOFTWARE', '1')
 from typing import Optional, Tuple
 
