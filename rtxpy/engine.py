@@ -5542,7 +5542,7 @@ class InteractiveViewer:
         try:
             import termios
             _saved_termios = termios.tcgetattr(sys.stdin.fileno())
-        except (ImportError, termios.error, ValueError):
+        except (ImportError, OSError, ValueError):
             pass
 
         # --- GLFW window creation ---
@@ -5768,7 +5768,7 @@ class InteractiveViewer:
                 try:
                     import termios
                     termios.tcsetattr(sys.stdin.fileno(), termios.TCSANOW, _saved_termios)
-                except (ImportError, termios.error, ValueError):
+                except (ImportError, OSError, ValueError):
                     pass
             sys.stdout.write('\033[?25h')  # show cursor
             sys.stdout.flush()
