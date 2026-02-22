@@ -1,0 +1,110 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - v*
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build wheel and sdist
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install build dependencies
+        run: |
+          python -m pip install -U pip
+          python -m pip install build twine
+
+      - name: Build wheel and sdist
+        run: python -m build
+
+      - name: Check distributions
+        run: twine check dist/*
+
+      - name: Upload dist artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  test-wheel:
+    name: Test wheel installation
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Install Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Download dist
+        uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      - name: Install wheel and verify contents
+        run: |
+          python -m pip install dist/*.whl --no-deps
+          python -m pip install numpy
+          python -c "
+          import importlib.util, os
+          spec = importlib.util.find_spec('rtxpy')
+          assert spec is not None, 'rtxpy package not found'
+          pkg_dir = os.path.dirname(spec.origin)
+          for f in ('__init__.py', 'rtx.py', 'kernel.ptx'):
+              assert os.path.exists(os.path.join(pkg_dir, f)), f'{f} not found'
+          print('Wheel installation test PASSED')
+          "
+
+  publish-pypi:
+    name: Publish to PyPI
+    needs: [build, test-wheel]
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+
+    steps:
+      - name: Download dist
+        uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          password: ${{ secrets.PYPI_TOKEN }}
+
+  github-release:
+    name: Create GitHub Release
+    needs: [build, test-wheel, publish-pypi]
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download dist
+        uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: dist/*
