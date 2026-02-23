@@ -632,6 +632,17 @@ class ViewerProxy:
         self._submit(fn)
 
     # ------------------------------------------------------------------
+    # Picking
+    # ------------------------------------------------------------------
+
+    def pick(self, screen_x, screen_y):
+        """Pick geometry at screen coordinates. Returns hit info dict."""
+        def fn(v):
+            origin, direction = v._screen_to_ray(screen_x, screen_y)
+            return v.rtx.pick(origin, direction)
+        return self._submit(fn)
+
+    # ------------------------------------------------------------------
     # Layer management
     # ------------------------------------------------------------------
 
@@ -1486,6 +1497,32 @@ class InteractiveViewer:
         world_up = np.array([0, 0, 1], dtype=np.float32)
         right = np.cross(world_up, front)
         return right / (np.linalg.norm(right) + 1e-8)
+
+    def _screen_to_ray(self, screen_x, screen_y):
+        """Convert screen pixel coordinates to a world-space ray.
+
+        Returns (origin, direction) as numpy float32 arrays of shape (3,).
+        """
+        front = self._get_front()
+        world_up = np.array([0, 0, 1], dtype=np.float32)
+        right = np.cross(world_up, front)
+        rn = np.linalg.norm(right)
+        if rn > 1e-8:
+            right /= rn
+        else:
+            right = np.array([1, 0, 0], dtype=np.float32)
+        cam_up = np.cross(front, right)
+
+        fov_scale = np.tan(np.radians(self.fov) / 2.0)
+        aspect = self.render_width / max(1, self.render_height)
+
+        # Window coords → NDC  (-1..1)
+        nx = 2.0 * screen_x / max(1, self.width) - 1.0
+        ny = 1.0 - 2.0 * screen_y / max(1, self.height)
+
+        direction = front + nx * fov_scale * aspect * right + ny * fov_scale * cam_up
+        direction = direction / (np.linalg.norm(direction) + 1e-30)
+        return self.position.copy(), direction.astype(np.float32)
 
     def _get_look_at(self):
         """Get the current look-at point."""
@@ -5029,6 +5066,18 @@ class InteractiveViewer:
             self._mouse_last_x = xpos
             self._mouse_last_y = ypos
 
+        elif button == 1:  # right click — object picking
+            origin, direction = self._screen_to_ray(xpos, ypos)
+            result = self.rtx.pick(origin, direction)
+            if result['hit']:
+                gid = result['geometry_id'] or '?'
+                px, py, pz = result['position']
+                print(f"Pick: geometry='{gid}'  pos=({px:.1f}, {py:.1f}, {pz:.1f})  "
+                      f"t={result['t']:.1f}  prim={result['primitive_id']}  "
+                      f"instance={result['instance_id']}")
+            else:
+                print("Pick: no geometry hit")
+
     def _handle_mouse_release(self, button):
         """End drag on button release."""
         self._mouse_dragging = False
@@ -5327,6 +5376,7 @@ class InteractiveViewer:
             ("GEOMETRY", [
                 ("N", "Cycle geometry layer"),
                 ("P", "Prev geometry in group"),
+                ("Right-Click", "Pick geometry"),
             ]),
             ("OBSERVERS", [
                 ("1-8", "Select / create observer"),

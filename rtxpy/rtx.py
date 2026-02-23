@@ -1885,6 +1885,60 @@ class RTX:
         return _trace_rays(self._geom_state, rays, hits, numRays, primitive_ids, instance_ids,
                            ray_flags=ray_flags)
 
+    def pick(self, origin, direction) -> dict:
+        """Fire a single ray and return hit info.
+
+        Parameters
+        ----------
+        origin : array-like
+            Ray origin (x, y, z).
+        direction : array-like
+            Ray direction (dx, dy, dz), will be normalized.
+
+        Returns
+        -------
+        dict
+            Keys: 'hit' (bool), 'geometry_id' (str or None),
+            't' (float), 'normal' (tuple), 'position' (tuple),
+            'primitive_id' (int), 'instance_id' (int).
+        """
+        o = np.asarray(origin, dtype=np.float32)
+        d = np.asarray(direction, dtype=np.float32)
+        d = d / (np.linalg.norm(d) + 1e-30)
+
+        rays = cupy.array([o[0], o[1], o[2], 0.001,
+                           d[0], d[1], d[2], 1e10], dtype=cupy.float32)
+        hits = cupy.zeros(4, dtype=cupy.float32)
+        prim_ids = cupy.full(1, -1, dtype=cupy.int32)
+        inst_ids = cupy.full(1, -1, dtype=cupy.int32)
+
+        self.trace(rays, hits, 1, primitive_ids=prim_ids, instance_ids=inst_ids)
+
+        t = float(hits[0])
+        if t > 0:
+            iid = int(inst_ids[0])
+            geom_list = self.list_geometries()
+            geom_id = geom_list[iid] if 0 <= iid < len(geom_list) else None
+            pos = o + d * t
+            return {
+                'hit': True,
+                'geometry_id': geom_id,
+                't': t,
+                'normal': (float(hits[1]), float(hits[2]), float(hits[3])),
+                'position': (float(pos[0]), float(pos[1]), float(pos[2])),
+                'primitive_id': int(prim_ids[0]),
+                'instance_id': iid,
+            }
+        return {
+            'hit': False,
+            'geometry_id': None,
+            't': -1.0,
+            'normal': (0.0, 0.0, 0.0),
+            'position': (0.0, 0.0, 0.0),
+            'primitive_id': -1,
+            'instance_id': -1,
+        }
+
     # -------------------------------------------------------------------------
     # Multi-GAS API
     # -------------------------------------------------------------------------
