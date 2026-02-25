@@ -812,6 +812,137 @@ class RTXAccessor:
 
         return vertices, indices, transforms
 
+    def place_pointcloud(self, source, geometry_id='pointcloud',
+                         point_size=1.0, color='elevation',
+                         classification=None, returns=None,
+                         bounds=None, subsample=1, max_points=None,
+                         snap_to_terrain=False, colormap=None):
+        """
+        Place a lidar point cloud in the scene as sphere primitives.
+
+        Each point is rendered as an OptiX sphere with hardware-accelerated
+        ray-sphere intersection. Supports LAS/LAZ files, numpy arrays,
+        or callable data sources.
+
+        Args:
+            source: One of:
+                - str: Path to LAS/LAZ/COPC file (requires laspy)
+                - ndarray: (N, 3) float32 array of XYZ coordinates
+                - callable: Function returning (centers_N3, attributes_dict)
+            geometry_id: Unique identifier for this geometry. Default 'pointcloud'.
+            point_size: Sphere radius in world units. Default 1.0.
+                Can be a scalar (uniform) or (N,) array (per-point).
+            color: Color mode. One of:
+                - 'elevation': Color by Z value using colormap
+                - 'intensity': Grayscale from LAS intensity
+                - 'classification': ASPRS standard colors
+                - 'rgb': Direct RGB from LAS file
+                - (r, g, b) tuple: Uniform solid color [0-1]
+            classification: Optional int or list of ASPRS codes to filter.
+                Common: 2=ground, 3-5=vegetation, 6=building, 9=water.
+            returns: Optional 'first', 'last', or 'all' to filter by return.
+            bounds: Optional (xmin, ymin, xmax, ymax) spatial crop.
+            subsample: Keep every Nth point (default 1 = all).
+            max_points: Maximum points to keep (random sample if exceeded).
+            snap_to_terrain: If True, replace Z with DEM elevation.
+            colormap: Optional (256, 3) float32 LUT for elevation color mode.
+
+        Returns:
+            Dict with keys:
+                'num_points': Number of points placed
+                'geometry_id': The geometry ID used
+                'bounds': (xmin, ymin, zmin, xmax, ymax, zmax) of placed points
+        """
+        from .pointcloud import load_pointcloud, build_colors
+
+        # Load and filter point cloud data
+        centers, attributes = load_pointcloud(
+            source,
+            classification=classification,
+            returns=returns,
+            bounds=bounds,
+            subsample=subsample,
+            max_points=max_points,
+        )
+
+        if len(centers) == 0:
+            return {'num_points': 0, 'geometry_id': geometry_id, 'bounds': None}
+
+        terrain = self._obj.values
+        H, W = terrain.shape
+
+        # Convert coordinates to terrain pixel space if needed
+        # Check if coordinates are in world/geo space vs pixel space
+        # by comparing ranges to terrain dimensions
+        x_range = centers[:, 0].max() - centers[:, 0].min()
+        y_range = centers[:, 1].max() - centers[:, 1].min()
+
+        # Get pixel spacing from xarray coords
+        psx, psy = 1.0, 1.0
+        if 'x' in self._obj.coords and len(self._obj.coords['x']) > 1:
+            x_coords = self._obj.coords['x'].values
+            psx = abs(float(x_coords[1] - x_coords[0]))
+        if 'y' in self._obj.coords and len(self._obj.coords['y']) > 1:
+            y_coords = self._obj.coords['y'].values
+            psy = abs(float(y_coords[1] - y_coords[0]))
+
+        # If coords look like they're in a projected CRS (large values),
+        # convert to pixel space
+        if psx != 1.0 or psy != 1.0:
+            x_origin = float(self._obj.coords['x'].values[0])
+            y_origin = float(self._obj.coords['y'].values[0])
+            centers[:, 0] = (centers[:, 0] - x_origin) / psx
+            centers[:, 1] = (centers[:, 1] - y_origin) / psy
+
+        # Snap Z to terrain if requested
+        if snap_to_terrain:
+            for i in range(len(centers)):
+                vx, vy = centers[i, 0], centers[i, 1]
+                z = self._bilinear_terrain_z(terrain, vx, vy, 1.0, 1.0)
+                centers[i, 2] = z
+        else:
+            # Scale Z by pixel spacing to match terrain units
+            if psx != 1.0:
+                centers[:, 2] = centers[:, 2] / psx
+
+        # Build per-point colors
+        point_colors = build_colors(
+            centers, attributes, color_mode=color, colormap=colormap)
+
+        # Build radii array
+        if np.isscalar(point_size):
+            radii = float(point_size)
+        else:
+            radii = np.asarray(point_size, dtype=np.float32)
+
+        # Add sphere geometry to the RTX scene
+        result = self._rtx.add_sphere_geometry(
+            geometry_id,
+            centers.ravel(),
+            radii,
+            colors=point_colors.ravel(),
+        )
+
+        if result != 0:
+            raise RuntimeError(f"Failed to add sphere geometry '{geometry_id}'")
+
+        # Set geometry color to a marker value so the render kernel
+        # knows to use per-point colors (alpha > 0 triggers solid color)
+        self._geometry_colors[geometry_id] = (0.5, 0.5, 0.5)
+
+        point_bounds = (
+            float(centers[:, 0].min()), float(centers[:, 1].min()),
+            float(centers[:, 2].min()),
+            float(centers[:, 0].max()), float(centers[:, 1].max()),
+            float(centers[:, 2].max()),
+        )
+
+        return {
+            'num_points': len(centers),
+            'geometry_id': geometry_id,
+            'bounds': point_bounds,
+        }
+
     _GEOJSON_PALETTE = [
         (0.90, 0.22, 0.20),  # red
         (0.20, 0.56, 0.90),  # blue

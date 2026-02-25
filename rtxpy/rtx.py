@@ -42,6 +42,7 @@ class _GASEntry:
     num_triangles: int = 0
     is_curve: bool = False  # True for round curve tube GAS
     is_heightfield: bool = False  # True for heightfield custom primitive GAS
+    is_sphere: bool = False  # True for sphere primitive GAS (point clouds)
 
 
 # -----------------------------------------------------------------------------
@@ -167,6 +168,9 @@ class _GeometryState:
         self.hf_tile_size = 32
         self.hf_num_tiles_x = 0
 
+        # Point cloud state
+        self.point_colors = None  # GPU buffer (cupy) for per-point RGBA colors
+
         # Device buffers for CPU->GPU transfers (per-instance)
         self.d_rays = None
         self.d_rays_size = 0
@@ -196,6 +200,9 @@ class _GeometryState:
         self.hf_ve = 1.0
         self.hf_tile_size = 32
         self.hf_num_tiles_x = 0
+
+        # Clear point cloud state
+        self.point_colors = None
 
         # Reset to single-GAS mode
         self.single_gas_mode = True
@@ -535,6 +542,7 @@ def _init_optix(device: Optional[int] = None):
         usesPrimitiveTypeFlags=(
             optix.PRIMITIVE_TYPE_FLAGS_TRIANGLE
             | optix.PRIMITIVE_TYPE_FLAGS_CUSTOM
+            | optix.PRIMITIVE_TYPE_FLAGS_SPHERE
             | (optix.PRIMITIVE_TYPE_FLAGS_ROUND_QUADRATIC_BSPLINE_ROCAPS
                if _state.capabilities.get('has_rocaps_curves')
                else optix.PRIMITIVE_TYPE_FLAGS_ROUND_QUADRATIC_BSPLINE)
@@ -622,13 +630,36 @@ def _init_optix(device: Optional[int] = None):
     )
     _state.heightfield_hit_pg = _state.heightfield_hit_pg[0]
 
+    # Built-in IS module for spheres (point cloud rendering)
+    _sphere_is_options = optix.BuiltinISOptions(
+        builtinISModuleType=optix.PRIMITIVE_TYPE_SPHERE,
+        usesMotionBlur=False,
+    )
+    _state.sphere_module = _state.context.builtinISModuleGet(
+        module_options,
+        pipeline_options,
+        _sphere_is_options,
+    )
+
+    # Hit group for spheres (built-in IS for intersection, dedicated CH for normals)
+    sphere_hit_desc = optix.ProgramGroupDesc()
+    sphere_hit_desc.hitgroupModuleCH = _state.module
+    sphere_hit_desc.hitgroupEntryFunctionNameCH = "__closesthit__sphere"
+    sphere_hit_desc.hitgroupModuleIS = _state.sphere_module
+    _state.sphere_hit_pg, log = _state.context.programGroupCreate(
+        [sphere_hit_desc],
+        pg_options,
+    )
+    _state.sphere_hit_pg = _state.sphere_hit_pg[0]
+
     # Create pipeline
     link_options = optix.PipelineLinkOptions(
         maxTraceDepth=1,
     )
 
     program_groups = [_state.raygen_pg, _state.miss_pg, _state.hit_pg,
-                      _state.curve_hit_pg, _state.heightfield_hit_pg]
+                      _state.curve_hit_pg, _state.heightfield_hit_pg,
+                      _state.sphere_hit_pg]
     _state.pipeline = _state.context.pipelineCreate(
         pipeline_options,
         link_options,
@@ -658,8 +689,8 @@ def _init_optix(device: Optional[int] = None):
     # Create shader binding table
     _create_sbt()
 
-    # Allocate params buffer: 48 (existing) + 40 (heightfield fields) = 88
-    _state.d_params = cupy.zeros(88, dtype=cupy.uint8)
+    # Allocate params buffer: 48 + 40 (heightfield) + 8 (point_colors) = 96
+    _state.d_params = cupy.zeros(96, dtype=cupy.uint8)
 
     _state.initialized = True
     atexit.register(_cleanup_at_exit)
@@ -683,7 +714,7 @@ def _create_sbt():
     optix.sbtRecordPackHeader(_state.miss_pg, miss_record)
     d_miss = cupy.array(np.frombuffer(miss_record, dtype=np.uint8))
 
-    # Pack hit group records: [0] = triangles, [1] = curves, [2] = heightfield
+    # Pack hit group records: [0] = triangles, [1] = curves, [2] = heightfield, [3] = spheres
     hit_record = bytearray(header_size)
     optix.sbtRecordPackHeader(_state.hit_pg, hit_record)
 
@@ -693,8 +724,12 @@ def _create_sbt():
     hf_hit_record = bytearray(header_size)
     optix.sbtRecordPackHeader(_state.heightfield_hit_pg, hf_hit_record)
 
+    sphere_hit_record = bytearray(header_size)
+    optix.sbtRecordPackHeader(_state.sphere_hit_pg, sphere_hit_record)
+
     # Concatenate all hit records into a single buffer
-    hit_all = bytearray(hit_record) + bytearray(curve_hit_record) + bytearray(hf_hit_record)
+    hit_all = (bytearray(hit_record) + bytearray(curve_hit_record) +
+               bytearray(hf_hit_record) + bytearray(sphere_hit_record))
     d_hit = cupy.array(np.frombuffer(hit_all, dtype=np.uint8))
 
     _state.sbt = optix.ShaderBindingTable(
@@ -704,7 +739,7 @@ def _create_sbt():
         missRecordCount=1,
         hitgroupRecordBase=d_hit.data.ptr,
         hitgroupRecordStrideInBytes=header_size,
-        hitgroupRecordCount=3,
+        hitgroupRecordCount=4,
     )
 
     # Keep references to prevent garbage collection
@@ -1357,6 +1392,87 @@ def _build_gas_for_heightfield(elevation_data, H, W, spacing_x, spacing_y, ve, t
     return gas_handle, gas_buffer, d_elevation, num_tiles_x, num_tiles_y
 
 
+def _build_gas_for_spheres(centers, radii, single_radius=False):
+    """
+    Build a GAS for sphere primitives (point cloud rendering).
+
+    Args:
+        centers: Sphere center positions (N*3 float32, flattened)
+        radii: Per-sphere radii (N float32) or single float if single_radius=True
+        single_radius: If True, radii contains a single value for all spheres
+
+    Returns:
+        Tuple of (gas_handle, gas_buffer) or (0, None) on error
+    """
+    global _state
+
+    if not _state.initialized:
+        _init_optix()
+
+    d_centers = cupy.asarray(centers, dtype=cupy.float32)
+    num_vertices = d_centers.size // 3
+
+    if num_vertices == 0:
+        return 0, None
+
+    if single_radius:
+        d_radii = cupy.asarray([radii] if np.isscalar(radii) else radii,
+                               dtype=cupy.float32)
+    else:
+        d_radii = cupy.asarray(radii, dtype=cupy.float32)
+
+    build_input = optix.BuildInputSphereArray()
+    build_input.vertexBuffers = [d_centers.data.ptr]
+    build_input.numVertices = num_vertices
+    build_input.vertexStrideInBytes = 12  # 3 * sizeof(float)
+    build_input.radiusBuffers = [d_radii.data.ptr]
+    build_input.radiusStrideInBytes = 4 if not single_radius else 0
+    build_input.singleRadius = 1 if single_radius else 0
+    build_input.flags = [optix.GEOMETRY_FLAG_DISABLE_ANYHIT]
+    build_input.numSbtRecords = 1
+
+    accel_options = optix.AccelBuildOptions(
+        buildFlags=optix.BUILD_FLAG_ALLOW_COMPACTION,
+        operation=optix.BUILD_OPERATION_BUILD,
+    )
+
+    buffer_sizes = _state.context.accelComputeMemoryUsage(
+        [accel_options],
+        [build_input],
+    )
+
+    d_temp = cupy.zeros(buffer_sizes.tempSizeInBytes, dtype=cupy.uint8)
+    gas_buffer = cupy.zeros(buffer_sizes.outputSizeInBytes, dtype=cupy.uint8)
+    compacted_size_buffer = cupy.zeros(1, dtype=cupy.uint64)
+
+    gas_handle = _state.context.accelBuild(
+        0,  # stream
+        [accel_options],
+        [build_input],
+        d_temp.data.ptr,
+        buffer_sizes.tempSizeInBytes,
+        gas_buffer.data.ptr,
+        buffer_sizes.outputSizeInBytes,
+        [optix.AccelEmitDesc(compacted_size_buffer.data.ptr,
+                             optix.PROPERTY_TYPE_COMPACTED_SIZE)],
+    )
+
+    cupy.cuda.Stream.null.synchronize()
+
+    compacted_size = int(compacted_size_buffer[0])
+    if compacted_size < gas_buffer.nbytes:
+        compacted_buffer = cupy.zeros(compacted_size, dtype=cupy.uint8)
+        gas_handle = _state.context.accelCompact(
+            0,
+            gas_handle,
+            compacted_buffer.data.ptr,
+            compacted_size,
+        )
+        gas_buffer = compacted_buffer
+
+    return gas_handle, gas_buffer
+
+
 def _build_ias(geom_state: _GeometryState):
     """
     Build an Instance Acceleration Structure (IAS) from all GAS entries.
@@ -1403,8 +1519,10 @@ def _build_ias(geom_state: _GeometryState):
         # Pack instanceId (4 bytes)
         struct.pack_into('I', instances_data, offset + 48, i)
 
-        # Pack sbtOffset (4 bytes) - 0 for triangles, 1 for curves, 2 for heightfield
-        if entry.is_heightfield:
+        # Pack sbtOffset (4 bytes) - 0=triangles, 1=curves, 2=heightfield, 3=spheres
+        if entry.is_sphere:
+            sbt_offset = 3
+        elif entry.is_heightfield:
             sbt_offset = 2
         elif entry.is_curve:
             sbt_offset = 1
@@ -1720,15 +1838,20 @@ def _trace_rays(geom_state: _GeometryState, rays, hits, num_rays: int,
         hf_tile = geom_state.hf_tile_size
         hf_ntx = geom_state.hf_num_tiles_x
 
+    # Point cloud colors pointer
+    pc_colors_ptr = 0
+    if geom_state.point_colors is not None:
+        pc_colors_ptr = geom_state.point_colors.data.ptr
+
     params_data = struct.pack(
-        'QQQQQIIQiifffiii',
+        'QQQQQIIQiifffiiIQ',
         trace_handle,           # 8
         d_rays.data.ptr,        # 8
         d_hits.data.ptr,        # 8
         d_prim_ids_ptr,         # 8
         d_inst_ids_ptr,         # 8
         ray_flags,              # 4
-        0,                      # 4 padding (existing)
+        0,                      # 4 padding
         hf_data_ptr,            # 8
         hf_w,                   # 4
         hf_h,                   # 4
@@ -1737,7 +1860,8 @@ def _trace_rays(geom_state: _GeometryState, rays, hits, num_rays: int,
         hf_ve,                  # 4
         hf_tile,                # 4
         hf_ntx,                 # 4
-        0,                      # 4 padding
+        0,                      # 4 padding for alignment
+        pc_colors_ptr,          # 8
     )
     _state.d_params[:] = cupy.frombuffer(np.frombuffer(params_data, dtype=np.uint8), dtype=cupy.uint8)
 
@@ -1746,7 +1870,7 @@ def _trace_rays(geom_state: _GeometryState, rays, hits, num_rays: int,
         _state.pipeline,
         0,  # stream
         _state.d_params.data.ptr,
-        88,  # sizeof(Params)
+        96,  # sizeof(Params)
         _state.sbt,
         num_rays,  # width
         1,  # height
@@ -2202,6 +2326,92 @@ class RTX:
             num_triangles=0,
             is_heightfield=True,
         )
+
+        self._geom_state.ias_dirty = True
+        return 0
+
+    def add_sphere_geometry(self, geometry_id: str, centers, radii,
+                            colors=None,
+                            transform: Optional[List[float]] = None) -> int:
+        """
+        Add sphere primitives to the scene (for point cloud rendering).
+
+        Uses OptiX built-in sphere intersection for hardware-accelerated
+        ray-sphere tests. Each sphere is defined by a center point and radius.
+
+        Args:
+            geometry_id: Unique identifier for this geometry.
+            centers: Sphere center positions (N*3 float32, flattened or Nx3).
+            radii: Per-sphere radii (N float32), or a single float for uniform radius.
+            colors: Optional per-point RGBA colors (N*4 float32). If provided,
+                    stored on geometry state for use by the shade kernel.
+            transform: Optional 12-float 3x4 row-major affine transform.
+
+        Returns:
+            0 on success, non-zero on error.
+        """
+        global _state
+
+        if not _state.initialized:
+            _init_optix()
+
+        # Switch to multi-GAS mode if currently in single-GAS mode
+        if self._geom_state.single_gas_mode:
+            self._geom_state.gas_handle = 0
+            self._geom_state.gas_buffer = None
+            self._geom_state.current_hash = 0xFFFFFFFFFFFFFFFF
+            self._geom_state.single_gas_mode = False
+
+        # Prepare centers
+        if isinstance(centers, cupy.ndarray):
+            centers_for_hash = centers.get()
+        else:
+            centers_for_hash = np.asarray(centers, dtype=np.float32)
+        vertices_hash = hash(centers_for_hash.tobytes())
+
+        existing = self._geom_state.gas_entries.get(geometry_id)
+        if existing is not None and existing.vertices_hash == vertices_hash:
+            if transform is not None:
+                existing.transform = list(transform)
+                self._geom_state.ias_dirty = True
+            return 0
+
+        # Determine if single radius
+        single_radius = np.isscalar(radii)
+
+        gas_handle, gas_buffer = _build_gas_for_spheres(
+            centers, radii, single_radius=single_radius)
+        if gas_handle == 0:
+            return -1
+
+        if transform is None:
+            transform = [
+                1.0, 0.0, 0.0, 0.0,
+                0.0, 1.0, 0.0, 0.0,
+                0.0, 0.0, 1.0, 0.0,
+            ]
+        else:
+            transform = list(transform)
+            if len(transform) != 12:
+                return -1
+
+        num_vertices = len(centers_for_hash.ravel()) // 3
+
+        self._geom_state.gas_entries[geometry_id] = _GASEntry(
+            gas_id=geometry_id,
+            gas_handle=gas_handle,
+            gas_buffer=gas_buffer,
+            vertices_hash=vertices_hash,
+            transform=transform,
+            num_vertices=num_vertices,
+            num_triangles=0,
+            is_sphere=True,
+        )
+
+        # Store per-point colors if provided
+        if colors is not None:
+            self._geom_state.point_colors = cupy.asarray(
+                colors, dtype=cupy.float32)
 
         self._geom_state.ias_dirty = True
         return 0

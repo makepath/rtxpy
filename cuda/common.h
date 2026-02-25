@@ -65,5 +65,7 @@ struct Params
     float                  hf_ve;             // vertical exaggeration
     int                    hf_tile_size;       // tile dimension (e.g. 32)
     int                    hf_num_tiles_x;     // number of tiles in X direction
-    int                    _pad0;              // padding to 88 bytes
+    int                    _pad0;              // padding for pointer alignment
+    // --- point cloud fields (offset 88) ---
+    float*                 point_colors;       // per-point RGBA (4 floats per point, indexed by primitive_id)
 };
