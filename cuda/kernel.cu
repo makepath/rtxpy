@@ -357,6 +357,42 @@ extern "C" __global__ void __intersection__heightfield()
 }
 
 
+// ---------------------------------------------------------------------------
+// Sphere closest-hit program (point cloud / splat rendering)
+// ---------------------------------------------------------------------------
+extern "C" __global__ void __closesthit__sphere()
+{
+    const float t_val = optixGetRayTmax();
+    const unsigned int primIdx = optixGetPrimitiveIndex();
+
+    // Get sphere center in object space
+    float4 sphere_data[1];
+    optixGetSphereData(sphere_data);
+
+    // Transform sphere center from object to world space
+    float m[12];
+    optixGetObjectToWorldTransformMatrix(m);
+    const float cx = m[0]*sphere_data[0].x + m[1]*sphere_data[0].y + m[ 2]*sphere_data[0].z + m[ 3];
+    const float cy = m[4]*sphere_data[0].x + m[5]*sphere_data[0].y + m[ 6]*sphere_data[0].z + m[ 7];
+    const float cz = m[8]*sphere_data[0].x + m[9]*sphere_data[0].y + m[10]*sphere_data[0].z + m[11];
+
+    // World-space hit point and normal
+    const float3 ray_o = optixGetWorldRayOrigin();
+    const float3 ray_d = optixGetWorldRayDirection();
+    float3 n = normalize(make_float3(
+        ray_o.x + ray_d.x * t_val - cx,
+        ray_o.y + ray_d.y * t_val - cy,
+        ray_o.z + ray_d.z * t_val - cz));
+
+    optixSetPayload_0(float_as_int(t_val));
+    optixSetPayload_1(float_as_int(n.x));
+    optixSetPayload_2(float_as_int(n.y));
+    optixSetPayload_3(float_as_int(n.z));
+    optixSetPayload_4(primIdx);
+    optixSetPayload_5(optixGetInstanceId());
+}
+
+
 extern "C" __global__ void __closesthit__heightfield()
 {
     const float t = optixGetRayTmax();
