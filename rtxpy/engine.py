@@ -236,7 +236,7 @@ class _MeshChunkManager:
         if (cr, cc) in self._cache:
             return
         from .mesh_store import load_meshes_from_zarr
-        meshes, _, _, curves = load_meshes_from_zarr(
+        meshes, _, _, curves, _spheres = load_meshes_from_zarr(
             self._zarr_path, chunks=[(cr, cc)])
         # Merge curves into the same dict with a marker
         combined = {}
@@ -1211,7 +1211,7 @@ class InteractiveViewer:
         self.color_stretch = 'linear'
 
         # Ambient occlusion state
-        self.ao_enabled = False
+        self.ao_enabled = True
         self.ao_radius = None  # auto-computed from scene extent
         self.gi_intensity = 2.0  # GI bounce intensity multiplier
         self.gi_bounces = 1  # Number of GI bounces (1=single, 2-3=multi)
@@ -1221,8 +1221,11 @@ class InteractiveViewer:
         self._d_ao_accum = None  # GPU accumulation buffer (H, W, 3) float32
         self._prev_cam_state = None  # (position_tuple, yaw, pitch, fov) for dirty detection
 
+        # Eye Dome Lighting state
+        self.edl_enabled = True
+
         # Denoiser state
-        self.denoise_enabled = False
+        self.denoise_enabled = True
         self._prev_cam_for_flow = None  # (pos, forward, right, up, aspect, fov_scale) from prev frame
         self._d_flow = None  # (H, W, 2) float32 motion vectors
 
@@ -1234,7 +1237,7 @@ class InteractiveViewer:
         # Tile overlay settings
         self._tile_service = None
         self._tiles_enabled = False
-        self._geometry_layer_idx = 0  # Start at 'none'
+        self._geometry_layer_idx = 1  # Start at 'all'
 
         # Viewshed settings
         self.viewshed_enabled = False
@@ -3155,6 +3158,16 @@ class InteractiveViewer:
             self._toggle_wind()
             return
 
+        # Toggle terrain visibility: Shift+E
+        if raw_key == 'E':
+            entry = self.rtx._geom_state.gas_entries.get('terrain')
+            if entry is not None:
+                vis = not entry.visible
+                self.rtx.set_geometry_visible('terrain', vis)
+                print(f"Terrain {'shown' if vis else 'hidden'}")
+                self._needs_render = True
+            return
+
         # GTFS-RT realtime vehicle toggle: Shift+B
         if raw_key == 'B':
             self._toggle_gtfs_rt()
@@ -3178,6 +3191,13 @@ class InteractiveViewer:
             self._ao_frame_count = 0
             self._prev_cam_state = None
             print(f"GI bounces: {self.gi_bounces}")
+            self._update_frame()
+            return
+
+        # Eye Dome Lighting toggle: Shift+H
+        if raw_key == 'H':
+            self.edl_enabled = not self.edl_enabled
+            print(f"Eye Dome Lighting: {'ON' if self.edl_enabled else 'OFF'}")
             self._update_frame()
             return
 
@@ -4814,6 +4834,7 @@ class InteractiveViewer:
             focal_distance=dof_focal,
             edge_strength=0.2,
             edge_color=(0.15, 0.13, 0.10),
+            edl=self.edl_enabled,
             bloom=not defer_post,
             tone_map=not defer_post,
             _return_gpu=True,
@@ -5358,6 +5379,7 @@ class InteractiveViewer:
                 ("B", "Toggle TIN / Voxel"),
                 ("T", "Toggle shadows"),
                 ("Shift+T", "Cycle time of day"),
+                ("Shift+E", "Toggle terrain"),
             ]),
             ("DATA LAYERS", [
                 ("Shift+F", "FIRMS fire (7d)"),
@@ -5367,6 +5389,7 @@ class InteractiveViewer:
         col_right = [
             ("RENDERING", [
                 ("0", "Toggle ambient occlusion"),
+                ("Shift+H", "Toggle EDL lighting"),
                 ("Shift+G", "Cycle GI bounces (1-3)"),
                 ("Shift+D", "Toggle AI denoiser"),
                 ("9", "Toggle depth of field"),
