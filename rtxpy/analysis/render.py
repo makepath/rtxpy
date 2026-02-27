@@ -823,6 +823,7 @@ def _shade_terrain_kernel(
     color_stretch,
     rgb_texture,
     overlay_data, overlay_alpha, overlay_min, overlay_range,
+    overlay_as_water,
     instance_ids, geometry_colors,
     primitive_ids, point_colors, point_color_offsets,
     ao_factor, gi_color, gi_intensity,
@@ -986,33 +987,44 @@ def _shade_terrain_kernel(
                         if elev_y >= 0 and elev_y < ov_h and elev_x >= 0 and elev_x < ov_w:
                             ov_val = overlay_data[elev_y, elev_x]
                             if not math.isnan(ov_val):
-                                if overlay_range > 0:
-                                    ov_norm = (ov_val - overlay_min) / overlay_range
+                                if overlay_as_water and ov_val > 0.5:
+                                    # Flood water shader — same look as ocean
+                                    is_water = True
+                                    water_specular = 0.12
+                                    base_r = 0.06
+                                    base_g = 0.12
+                                    base_b = 0.22
+                                    nx = 0.0
+                                    ny = 0.0
+                                    nz = 1.0
                                 else:
-                                    ov_norm = 0.5
-                                if ov_norm < 0:
-                                    ov_norm = 0.0
-                                elif ov_norm > 1:
-                                    ov_norm = 1.0
-                                # Apply same color stretch
-                                if color_stretch == 1:
-                                    ov_norm = math.pow(ov_norm, 1.0 / 3.0)
-                                elif color_stretch == 2:
-                                    ov_norm = math.log(1.0 + ov_norm * 9.0) / math.log(10.0)
-                                elif color_stretch == 3:
-                                    ov_norm = math.sqrt(ov_norm)
-                                ov_idx = int(ov_norm * 255)
-                                if ov_idx > 255:
-                                    ov_idx = 255
-                                if ov_idx < 0:
-                                    ov_idx = 0
-                                ov_r = color_lut[ov_idx, 0]
-                                ov_g = color_lut[ov_idx, 1]
-                                ov_b = color_lut[ov_idx, 2]
-                                a = overlay_alpha
-                                base_r = base_r * (1.0 - a) + ov_r * a
-                                base_g = base_g * (1.0 - a) + ov_g * a
-                                base_b = base_b * (1.0 - a) + ov_b * a
+                                    if overlay_range > 0:
+                                        ov_norm = (ov_val - overlay_min) / overlay_range
+                                    else:
+                                        ov_norm = 0.5
+                                    if ov_norm < 0:
+                                        ov_norm = 0.0
+                                    elif ov_norm > 1:
+                                        ov_norm = 1.0
+                                    # Apply same color stretch
+                                    if color_stretch == 1:
+                                        ov_norm = math.pow(ov_norm, 1.0 / 3.0)
+                                    elif color_stretch == 2:
+                                        ov_norm = math.log(1.0 + ov_norm * 9.0) / math.log(10.0)
+                                    elif color_stretch == 3:
+                                        ov_norm = math.sqrt(ov_norm)
+                                    ov_idx = int(ov_norm * 255)
+                                    if ov_idx > 255:
+                                        ov_idx = 255
+                                    if ov_idx < 0:
+                                        ov_idx = 0
+                                    ov_r = color_lut[ov_idx, 0]
+                                    ov_g = color_lut[ov_idx, 1]
+                                    ov_b = color_lut[ov_idx, 2]
+                                    a = overlay_alpha
+                                    base_r = base_r * (1.0 - a) + ov_r * a
+                                    base_g = base_g * (1.0 - a) + ov_g * a
+                                    base_b = base_b * (1.0 - a) + ov_b * a
 
             # Write albedo (material color before lighting) for denoiser guide
             if albedo_out.shape[0] > 1:
@@ -1539,6 +1551,7 @@ def _shade_terrain(
     rgb_texture=None,
     overlay_data=None, overlay_alpha=0.5,
     overlay_min=0.0, overlay_range=1.0,
+    overlay_as_water=False,
     instance_ids=None, geometry_colors=None,
     primitive_ids=None, point_colors=None, point_color_offsets=None,
     ao_factor=None, gi_color=None, gi_intensity=2.0,
@@ -1642,6 +1655,7 @@ def _shade_terrain(
         color_stretch,
         rgb_texture,
         overlay_data, overlay_alpha, overlay_min, overlay_range,
+        overlay_as_water,
         instance_ids, geometry_colors,
         primitive_ids, point_colors, point_color_offsets,
         ao_factor, gi_color, np.float32(gi_intensity),
@@ -1773,6 +1787,7 @@ def render(
     rgb_texture=None,
     overlay_data=None,
     overlay_alpha: float = 0.5,
+    overlay_as_water: bool = False,
     geometry_colors=None,
     ao_samples: int = 0,
     ao_radius: Optional[float] = None,
@@ -2150,6 +2165,7 @@ def render(
         rgb_texture=rgb_texture,
         overlay_data=d_overlay, overlay_alpha=overlay_alpha,
         overlay_min=ov_min, overlay_range=ov_range,
+        overlay_as_water=overlay_as_water,
         instance_ids=d_instance_ids, geometry_colors=geometry_colors,
         primitive_ids=d_primitive_ids,
         point_colors=d_point_colors,

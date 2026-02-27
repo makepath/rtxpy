@@ -3009,7 +3009,10 @@ class RTXDatasetAccessor:
                 subtitle=None, legend=None,
                 subsample=1, wind_data=None, gtfs_data=None,
                 scene_zarr=None,
-                ao_samples=0, gi_bounces=1, denoise=False, repl=False, tour=None):
+                ao_samples=0, gi_bounces=1, denoise=False,
+                minimap_style=None, minimap_layer=None,
+                minimap_colors=None, info_text=None,
+                repl=False, tour=None):
         """Launch an interactive terrain viewer with Dataset variables as
         overlay layers cycled with the G key.
 
@@ -3116,6 +3119,10 @@ class RTXDatasetAccessor:
             ao_samples=ao_samples,
             gi_bounces=gi_bounces,
             denoise=denoise,
+            minimap_style=minimap_style,
+            minimap_layer=minimap_layer,
+            minimap_colors=minimap_colors,
+            info_text=info_text,
             repl=repl,
             tour=tour,
         )
