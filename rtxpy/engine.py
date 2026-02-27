@@ -776,6 +776,7 @@ class ViewerProxy:
                 if v._terrain_layer_idx >= len(v._terrain_layer_order):
                     v._terrain_layer_idx = 0
                     v._active_overlay_data = None
+                    v._overlay_as_water = False
                 v._update_frame()
                 print(f"Removed layer: {name}")
         self._submit(fn)
@@ -786,6 +787,7 @@ class ViewerProxy:
             if name == 'elevation':
                 v._active_color_data = None
                 v._active_overlay_data = None
+                v._overlay_as_water = False
                 v._terrain_layer_idx = 0
                 v._update_frame()
                 print("Terrain: elevation")
@@ -798,6 +800,7 @@ class ViewerProxy:
             v._terrain_layer_idx = idx
             v._active_color_data = None
             v._active_overlay_data = v._overlay_layers[name]
+            v._overlay_as_water = name.startswith('flood_')
             v._update_frame()
             print(f"Terrain: {name}")
         self._submit(fn)
@@ -1064,6 +1067,7 @@ def _add_overlay(viewer, name, data):
     viewer._terrain_layer_idx = idx
     viewer._active_color_data = None
     viewer._active_overlay_data = data
+    viewer._overlay_as_water = name.startswith('flood_')
     viewer._update_frame()
     print(f"Terrain: {name}")
 
@@ -1229,6 +1233,7 @@ class InteractiveViewer:
         self._active_color_data = None  # None = use elevation_data
         self._active_overlay_data = None  # Transparent overlay on top of base
         self._overlay_alpha = 0.7  # Overlay blending alpha (0=base only, 1=overlay only)
+        self._overlay_as_water = False  # True when flood layer renders as water
 
         # Independent terrain color cycling (G key): elevation + overlay names
         self._terrain_layer_order = ['elevation'] + list(self._overlay_names)
@@ -1362,7 +1367,7 @@ class InteractiveViewer:
 
         # State
         self.running = False
-        self.show_help = True
+        self._help_page_idx = 0  # -1 = off, 0..N-1 = page index
         self.show_minimap = True
         self.frame_count = 0
         self._last_title = None
@@ -1374,14 +1379,18 @@ class InteractiveViewer:
         self._minimap_scale_y = 1.0
         self._minimap_has_tiles = False
         self._minimap_rect = None  # (x0, y0, w, h) in frame coords
+        self._minimap_style = None  # 'cyberpunk' for neon edge outline
+        self._minimap_layer = None  # overlay layer name for minimap coloring
+        self._minimap_colors = None  # {value: (r,g,b)} categorical color map
         self._drone_glow = False
 
-        # Help text cache (pre-rendered RGBA numpy array via PIL)
-        self._help_text_rgba = None
+        # Help text cache (list of pre-rendered RGBA page arrays via PIL)
+        self._help_pages = []
 
         # Title / subtitle overlay (pre-rendered RGBA numpy array via PIL)
         self._subtitle = subtitle
         self._legend_config = legend
+        self._info_text = None  # Optional info blurb (appended to help pages)
         self._title_overlay_rgba = None
         self._legend_rgba = None
 
@@ -1773,17 +1782,35 @@ class InteractiveViewer:
         # Build RGBA image
         rgba = np.zeros((new_h, new_w, 4), dtype=np.float32)
 
-        # Land: smoky warm tones — blend hillshade with elevation tint
-        # Low elevation → dark olive/brown, high → pale sand/cream
-        lo = np.array([0.18, 0.20, 0.14])  # dark olive
-        hi = np.array([0.85, 0.80, 0.70])  # warm cream
-        for c in range(3):
-            tint = lo[c] + (hi[c] - lo[c]) * elev_norm
-            # Mix 60 % hillshade + 40 % elevation tint for a smoky look
-            rgba[:, :, c] = shaded * 0.6 * tint + tint * 0.4
-        rgba[:, :, 3] = 1.0  # fully opaque land
+        # Check for categorical overlay layer coloring
+        _layer_data = None
+        if (self._minimap_layer and self._minimap_colors
+                and self._minimap_layer in self._base_overlay_layers):
+            ld = self._base_overlay_layers[self._minimap_layer]
+            if hasattr(ld, 'get'):
+                ld = ld.get()
+            ld = np.asarray(ld, dtype=np.float64)
+            if longest > max_dim:
+                _layer_data = ld[np.ix_(y_idx, x_idx)]
+            else:
+                _layer_data = ld.copy()
 
-        # Water: dark blue-black, semi-transparent
+        # Grayscale hillshade base for all land
+        grey = shaded * 0.5 + elev_norm * 0.3 + 0.1
+        grey = np.clip(grey, 0, 1)
+        for c in range(3):
+            rgba[:, :, c] = grey
+        rgba[:, :, 3] = 1.0
+
+        if _layer_data is not None:
+            # Overlay risk colours on matched pixels; unmatched stays grey
+            for val, (r, g, b) in self._minimap_colors.items():
+                mask = np.isclose(_layer_data, float(val), atol=0.1)
+                for c, cv in enumerate((r, g, b)):
+                    rgba[:, :, c] = np.where(
+                        mask, cv * (shaded * 0.5 + 0.5), rgba[:, :, c])
+
+        # Water: dark blue-black
         rgba[water, 0] = 0.08
         rgba[water, 1] = 0.10
         rgba[water, 2] = 0.18
@@ -1808,9 +1835,96 @@ class InteractiveViewer:
                     rgba[:, :, c] = np.where(has_coverage, blended[:, :, c], rgba[:, :, c])
                 self._minimap_has_tiles = True
 
+        # Apply minimap style filter
+        if self._minimap_style == 'cyberpunk':
+            rgba = self._apply_cyberpunk_minimap(rgba, water)
+
         self._minimap_background = rgba
         self._minimap_scale_x = new_w / W
         self._minimap_scale_y = new_h / H
+
+    def _apply_cyberpunk_minimap(self, rgba, water):
+        """Apply a neon-edge cyberpunk filter to the minimap RGBA image.
+
+        Detects edges via Sobel, colours them with a cyan/magenta neon
+        palette, darkens the base, and adds faint scan-lines.
+        """
+        h, w = rgba.shape[:2]
+
+        # Convert to luminance for edge detection
+        lum = rgba[:, :, 0] * 0.299 + rgba[:, :, 1] * 0.587 + rgba[:, :, 2] * 0.114
+
+        # Sobel edge detection
+        # Horizontal kernel [-1 0 1; -2 0 2; -1 0 1]
+        sx = np.zeros_like(lum)
+        sy = np.zeros_like(lum)
+        if h > 2 and w > 2:
+            sx[1:-1, 1:-1] = (
+                -lum[:-2, :-2] + lum[:-2, 2:]
+                - 2 * lum[1:-1, :-2] + 2 * lum[1:-1, 2:]
+                - lum[2:, :-2] + lum[2:, 2:]
+            )
+            sy[1:-1, 1:-1] = (
+                -lum[:-2, :-2] - 2 * lum[:-2, 1:-1] - lum[:-2, 2:]
+                + lum[2:, :-2] + 2 * lum[2:, 1:-1] + lum[2:, 2:]
+            )
+
+        edges = np.sqrt(sx ** 2 + sy ** 2)
+        edges = np.clip(edges / (edges.max() + 1e-8), 0, 1)
+
+        # Boost contrast — power curve to sharpen edges
+        edges = edges ** 0.6
+
+        # Neon colour: cyan for terrain edges, magenta for strong edges
+        cyan = np.array([0.0, 1.0, 1.0])
+        magenta = np.array([1.0, 0.0, 0.8])
+        # Blend cyan→magenta based on edge intensity
+        neon = np.zeros((h, w, 3), dtype=np.float32)
+        for c in range(3):
+            neon[:, :, c] = cyan[c] + (magenta[c] - cyan[c]) * edges
+
+        # Dark base: heavily darken the original image
+        dark = np.zeros_like(rgba)
+        for c in range(3):
+            dark[:, :, c] = rgba[:, :, c] * 0.12
+        dark[:, :, 3] = rgba[:, :, 3]
+
+        # Water gets a deep dark blue-purple
+        dark[water, 0] = 0.03
+        dark[water, 1] = 0.02
+        dark[water, 2] = 0.08
+        dark[water, 3] = 0.85
+
+        # Composite neon edges onto dark base (additive blend)
+        edge_alpha = edges * 0.9  # edge glow strength
+        result = dark.copy()
+        for c in range(3):
+            result[:, :, c] = np.clip(
+                dark[:, :, c] + neon[:, :, c] * edge_alpha, 0, 1)
+
+        # Add faint simulated glow: dilate edges slightly via max-filter
+        if h > 4 and w > 4:
+            glow = edges.copy()
+            # Simple 3x3 max pooling for glow spread
+            padded = np.pad(glow, 1, mode='edge')
+            glow = np.maximum.reduce([
+                padded[:-2, :-2], padded[:-2, 1:-1], padded[:-2, 2:],
+                padded[1:-1, :-2], padded[1:-1, 1:-1], padded[1:-1, 2:],
+                padded[2:, :-2], padded[2:, 1:-1], padded[2:, 2:],
+            ])
+            glow_extra = np.clip(glow - edges, 0, 1) * 0.3
+            for c in range(3):
+                result[:, :, c] = np.clip(
+                    result[:, :, c] + neon[:, :, c] * glow_extra, 0, 1)
+
+        # Scan-lines: darken every other row slightly
+        scanline = np.ones(h, dtype=np.float32)
+        scanline[1::2] = 0.82
+        for c in range(3):
+            result[:, :, c] *= scanline[:, np.newaxis]
+
+        result[:, :, :3] = np.clip(result[:, :, :3], 0, 1)
+        return result
 
     def _rebuild_at_resolution(self, factor):
         """Rebuild terrain mesh at a different subsample factor.
@@ -1954,6 +2068,7 @@ class InteractiveViewer:
             terrain_name = self._terrain_layer_order[self._terrain_layer_idx]
             if terrain_name != 'elevation' and terrain_name in self._overlay_layers:
                 self._active_overlay_data = self._overlay_layers[terrain_name]
+                self._overlay_as_water = terrain_name.startswith('flood_')
 
         # 6. Invalidate chunk manager cache (meshes need new Z coords)
         if self._chunk_manager is not None:
@@ -2354,68 +2469,27 @@ class InteractiveViewer:
         mm_h, mm_w = mm_bg.shape[:2]
         fh, fw = img.shape[:2]
 
-        # Size the minimap to ~20% of frame width
-        target_w = max(40, int(fw * 0.2))
-        scale = target_w / mm_w
-        target_h = max(20, int(mm_h * scale))
-        target_w = min(target_w, fw - 8)
-        target_h = min(target_h, fh - 8)
+        # Size minimap: match legend height if available, else ~20% of frame
+        if self._legend_rgba is not None:
+            target_h = self._legend_rgba.shape[0]
+        else:
+            target_w = max(40, int(fw * 0.2))
+            scale = target_w / mm_w
+            target_h = max(20, int(mm_h * scale))
+        # Derive width from height to preserve aspect ratio
+        aspect = mm_w / mm_h
+        target_w = max(20, int(target_h * aspect))
+        target_w = min(target_w, fw)
+        target_h = min(target_h, fh)
 
         # Nearest-neighbour resize
         y_idx = np.linspace(0, mm_h - 1, target_h).astype(int)
         x_idx = np.linspace(0, mm_w - 1, target_w).astype(int)
         bg_resized = mm_bg[np.ix_(y_idx, x_idx)].copy()  # (th, tw, 4)
 
-        # --- Rounded corner mask ---
-        corner_radius = min(8, target_h // 4, target_w // 4)
-        if corner_radius > 1:
-            mask = np.ones((target_h, target_w), dtype=np.float32)
-            yy = np.arange(target_h)[:, None]
-            xx = np.arange(target_w)[None, :]
-            # Four corners: (cy, cx) of the inscribed circle center
-            corners = [
-                (corner_radius, corner_radius),                        # top-left
-                (corner_radius, target_w - 1 - corner_radius),        # top-right
-                (target_h - 1 - corner_radius, corner_radius),        # bottom-left
-                (target_h - 1 - corner_radius, target_w - 1 - corner_radius),  # bottom-right
-            ]
-            for cy, cx in corners:
-                # Select the corner quadrant
-                if cy <= corner_radius:
-                    row_sel = yy < corner_radius
-                else:
-                    row_sel = yy > target_h - 1 - corner_radius
-                if cx <= corner_radius:
-                    col_sel = xx < corner_radius
-                else:
-                    col_sel = xx > target_w - 1 - corner_radius
-                in_corner = row_sel & col_sel
-                dist_sq = (yy - cy) ** 2 + (xx - cx) ** 2
-                outside_circle = dist_sq > corner_radius ** 2
-                mask = np.where(in_corner & outside_circle, 0.0, mask)
-            bg_resized[:, :, 3] *= mask
-
-        # Placement: bottom-right with 6px margin
-        margin = 6
-        y0 = fh - target_h - margin
-        x0 = fw - target_w - margin
-
-        # --- Drop shadow (dark rounded rect offset by 2px) ---
-        shadow_off = 2
-        sy0 = y0 + shadow_off
-        sx0 = x0 + shadow_off
-        sy1 = min(sy0 + target_h, fh)
-        sx1 = min(sx0 + target_w, fw)
-        sh = sy1 - sy0
-        sw = sx1 - sx0
-        if sh > 0 and sw > 0:
-            shadow_alpha = 0.35
-            if corner_radius > 1:
-                shadow_mask = mask[:sh, :sw] * shadow_alpha
-            else:
-                shadow_mask = np.full((sh, sw), shadow_alpha, dtype=np.float32)
-            shadow_region = img[sy0:sy1, sx0:sx1]
-            shadow_region[:] = shadow_region * (1 - shadow_mask[:, :, None])
+        # Placement: flush bottom-right
+        y0 = fh - target_h
+        x0 = fw - target_w
 
         # Alpha-composite background onto frame
         alpha = bg_resized[:, :, 3:4]
@@ -3409,10 +3483,12 @@ class InteractiveViewer:
             self._update_frame()
             return
 
-        # Eye Dome Lighting toggle: Shift+H
+        # Previous help page: Shift+H
         if raw_key == 'H':
-            self.edl_enabled = not self.edl_enabled
-            print(f"Eye Dome Lighting: {'ON' if self.edl_enabled else 'OFF'}")
+            if self._help_pages:
+                self._help_page_idx -= 1
+                if self._help_page_idx < -1:
+                    self._help_page_idx = len(self._help_pages) - 1
             self._update_frame()
             return
 
@@ -3476,7 +3552,12 @@ class InteractiveViewer:
         elif key == 'p':
             self._jump_to_geometry(-1)  # Previous geometry in current group
         elif key == 'h':
-            self.show_help = not self.show_help
+            if self._help_pages:
+                self._help_page_idx += 1
+                if self._help_page_idx >= len(self._help_pages):
+                    self._help_page_idx = -1  # off
+            else:
+                self._help_page_idx = -1
             self._update_frame()
         elif key == 'm':
             self.show_minimap = not self.show_minimap
@@ -3980,12 +4061,17 @@ class InteractiveViewer:
         if layer_name == 'elevation':
             self._active_color_data = None
             self._active_overlay_data = None
+            self._overlay_as_water = False
             print(f"Terrain: elevation")
         else:
             self._active_color_data = None
             self._active_overlay_data = self._overlay_layers[layer_name]
-            alpha_pct = int(self._overlay_alpha * 100)
-            print(f"Terrain: {layer_name} (alpha {alpha_pct}%, ,/. to adjust)")
+            self._overlay_as_water = layer_name.startswith('flood_')
+            if self._overlay_as_water:
+                print(f"Terrain: {layer_name} (water)")
+            else:
+                alpha_pct = int(self._overlay_alpha * 100)
+                print(f"Terrain: {layer_name} (alpha {alpha_pct}%, ,/. to adjust)")
 
         self._update_frame()
 
@@ -4943,6 +5029,7 @@ class InteractiveViewer:
             rgb_texture=rgb_texture,
             overlay_data=self._active_overlay_data,
             overlay_alpha=self._overlay_alpha,
+            overlay_as_water=self._overlay_as_water,
             geometry_colors=geometry_colors,
         )
 
@@ -5091,6 +5178,7 @@ class InteractiveViewer:
             rgb_texture=rgb_texture,
             overlay_data=self._active_overlay_data,
             overlay_alpha=self._overlay_alpha,
+            overlay_as_water=self._overlay_as_water,
             geometry_colors=geometry_colors,
             ao_samples=ao_samples,
             ao_radius=self.ao_radius,
@@ -5283,12 +5371,13 @@ class InteractiveViewer:
                 glfw.set_window_title(self._glfw_window, combined)
 
         # Build display frame (copy if we need overlays, else use pinned directly)
+        _help_visible = (self._help_page_idx >= 0 and self._help_pages)
         needs_overlay = (
             (self._gtfs_rt_enabled and self._gtfs_rt_vehicles is not None)
             or self.show_minimap
             or self._title_overlay_rgba is not None
             or self._legend_rgba is not None
-            or self.show_help
+            or _help_visible
         )
         if needs_overlay:
             img = self._pinned_frame.copy()
@@ -5302,15 +5391,14 @@ class InteractiveViewer:
         # Minimap overlay
         self._blit_minimap_on_frame(img)
 
-        # Title overlay (hidden when help is shown — they overlap top-left)
-        if not self.show_help:
-            self._blit_title_on_frame(img)
+        # Title overlay
+        self._blit_title_on_frame(img)
 
         # Legend overlay (always visible)
         self._blit_legend_on_frame(img)
 
-        # Help text overlay
-        if self.show_help and self._help_text_rgba is not None:
+        # Help page overlay
+        if _help_visible:
             self._blit_help_on_frame(img)
 
         self._display_frame = img
@@ -5429,28 +5517,31 @@ class InteractiveViewer:
     # ------------------------------------------------------------------
 
     def _render_title_overlay(self):
-        """Pre-render title + subtitle to an RGBA numpy array using PIL.
+        """Pre-render title + subtitle with drop-shadow to an RGBA array.
 
-        Called once at startup; cached in ``self._title_overlay_rgba``.
-        Skipped when no title is set.
+        Rendered at 2x resolution for antialiased text, then downsampled.
+        No background — text floats over the scene with a strong shadow.
         """
         if not self._title or self._title == 'rtxpy':
             return
         try:
-            from PIL import Image, ImageDraw, ImageFont
+            from PIL import Image, ImageDraw, ImageFont, ImageFilter
 
             bold_path = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
             sans_path = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
+
+            # Render at 2x for antialiasing via supersample
+            ss = 2
             try:
-                font_title = ImageFont.truetype(bold_path, 22)
-                font_sub = ImageFont.truetype(sans_path, 11)
+                font_title = ImageFont.truetype(bold_path, 22 * ss)
+                font_sub = ImageFont.truetype(sans_path, 11 * ss)
             except (OSError, IOError):
                 font_title = ImageFont.load_default()
                 font_sub = font_title
+                ss = 1  # fall back to 1x with default font
 
-            pad_x, pad_y = 14, 10
-            corner_r = 10
-            bg_color = (15, 18, 24, 200)
+            pad_x, pad_y = 14 * ss, 10 * ss
+            shadow_spread = 4 * ss  # extra margin for shadow blur
 
             # Measure title
             title_bbox = font_title.getbbox(self._title)
@@ -5463,32 +5554,57 @@ class InteractiveViewer:
             if self._subtitle:
                 sub_bbox = font_sub.getbbox(self._subtitle)
                 sub_w = sub_bbox[2] - sub_bbox[0]
-                sub_h = sub_bbox[3] - sub_bbox[1] + 4  # 4px gap
+                sub_h = sub_bbox[3] - sub_bbox[1] + 4 * ss
 
-            img_w = pad_x * 2 + max(title_w, sub_w)
-            img_h = pad_y * 2 + title_h + sub_h
+            img_w = pad_x * 2 + max(title_w, sub_w) + shadow_spread * 2
+            img_h = pad_y * 2 + title_h + sub_h + shadow_spread * 2
 
-            img = Image.new('RGBA', (img_w, img_h), (0, 0, 0, 0))
-            draw = ImageDraw.Draw(img)
-            draw.rounded_rectangle(
-                [0, 0, img_w - 1, img_h - 1],
-                radius=corner_r, fill=bg_color,
-            )
-            draw.rounded_rectangle(
-                [0, 0, img_w - 1, img_h - 1],
-                radius=corner_r, outline=(60, 70, 90, 140), width=1,
-            )
+            # --- Shadow layer: black text, then blur ---
+            shadow_img = Image.new('RGBA', (img_w, img_h), (0, 0, 0, 0))
+            shadow_draw = ImageDraw.Draw(shadow_img)
+            sx = pad_x + shadow_spread
+            sy = pad_y + shadow_spread
 
-            # Title
-            draw.text((pad_x, pad_y), self._title,
-                      fill=(255, 255, 255, 255), font=font_title)
-
-            # Subtitle
+            # Draw shadow text with slight offset
+            shadow_off = 2 * ss
+            shadow_draw.text((sx + shadow_off, sy + shadow_off),
+                             self._title, fill=(0, 0, 0, 255),
+                             font=font_title)
             if self._subtitle:
-                draw.text((pad_x, pad_y + title_h + 4), self._subtitle,
-                          fill=(170, 180, 195, 220), font=font_sub)
+                shadow_draw.text(
+                    (sx + shadow_off, sy + title_h + 4 * ss + shadow_off),
+                    self._subtitle, fill=(0, 0, 0, 255), font=font_sub)
 
-            self._title_overlay_rgba = np.array(img, dtype=np.float32) / 255.0
+            # Multi-pass blur for a deep, soft shadow
+            for _ in range(3):
+                shadow_img = shadow_img.filter(
+                    ImageFilter.GaussianBlur(radius=3 * ss))
+
+            # Boost shadow opacity
+            shadow_arr = np.array(shadow_img, dtype=np.float32)
+            shadow_arr[:, :, 3] = np.clip(shadow_arr[:, :, 3] * 2.5, 0, 255)
+            shadow_img = Image.fromarray(shadow_arr.astype(np.uint8))
+
+            # --- Foreground layer: crisp white text ---
+            fg_img = Image.new('RGBA', (img_w, img_h), (0, 0, 0, 0))
+            fg_draw = ImageDraw.Draw(fg_img)
+            fg_draw.text((sx, sy), self._title,
+                         fill=(255, 255, 255, 255), font=font_title)
+            if self._subtitle:
+                fg_draw.text((sx, sy + title_h + 4 * ss), self._subtitle,
+                             fill=(200, 210, 225, 230), font=font_sub)
+
+            # Composite: shadow behind, text on top
+            result = Image.alpha_composite(shadow_img, fg_img)
+
+            # Downsample from 2x to 1x with antialiasing
+            if ss > 1:
+                final_w = img_w // ss
+                final_h = img_h // ss
+                result = result.resize((final_w, final_h), Image.LANCZOS)
+
+            self._title_overlay_rgba = (
+                np.array(result, dtype=np.float32) / 255.0)
         except ImportError:
             pass
 
@@ -5517,7 +5633,6 @@ class InteractiveViewer:
                 font_label = font_header
 
             pad_x, pad_y = 14, 10
-            corner_r = 10
             swatch_size = 12
             swatch_gap = 8   # gap between swatch and label
             line_h = 18
@@ -5546,13 +5661,13 @@ class InteractiveViewer:
 
             img = Image.new('RGBA', (img_w, img_h), (0, 0, 0, 0))
             draw = ImageDraw.Draw(img)
-            draw.rounded_rectangle(
+            draw.rectangle(
                 [0, 0, img_w - 1, img_h - 1],
-                radius=corner_r, fill=bg_color,
+                fill=bg_color,
             )
-            draw.rounded_rectangle(
+            draw.rectangle(
                 [0, 0, img_w - 1, img_h - 1],
-                radius=corner_r, outline=(60, 70, 90, 140), width=1,
+                outline=(60, 70, 90, 140), width=1,
             )
 
             y = pad_y
@@ -5584,6 +5699,8 @@ class InteractiveViewer:
     def _blit_title_on_frame(self, img):
         """Alpha-composite cached title overlay onto the rendered frame.
 
+        Placed flush in the top-left corner (no margin).
+
         Parameters
         ----------
         img : ndarray, shape (H, W, 3), float32 0-1
@@ -5594,18 +5711,19 @@ class InteractiveViewer:
         ov = self._title_overlay_rgba
         oh, ow = ov.shape[:2]
         fh, fw = img.shape[:2]
-        margin = 12
-        bh = min(oh, fh - margin)
-        bw = min(ow, fw - margin)
+        bh = min(oh, fh)
+        bw = min(ow, fw)
         if bh <= 0 or bw <= 0:
             return
         alpha = ov[:bh, :bw, 3:4]
         rgb = ov[:bh, :bw, :3]
-        region = img[margin:margin+bh, margin:margin+bw]
+        region = img[:bh, :bw]
         region[:] = region * (1 - alpha) + rgb * alpha
 
     def _blit_legend_on_frame(self, img):
         """Alpha-composite cached legend overlay onto the rendered frame.
+
+        Placed flush in the bottom-left corner (no margin).
 
         Parameters
         ----------
@@ -5617,27 +5735,25 @@ class InteractiveViewer:
         ov = self._legend_rgba
         oh, ow = ov.shape[:2]
         fh, fw = img.shape[:2]
-        margin = 12
-        y0 = fh - margin - oh
+        y0 = fh - oh
         if y0 < 0:
             y0 = 0
         bh = min(oh, fh - y0)
-        bw = min(ow, fw - margin)
+        bw = min(ow, fw)
         if bh <= 0 or bw <= 0:
             return
         alpha = ov[:bh, :bw, 3:4]
         rgb = ov[:bh, :bw, :3]
-        region = img[y0:y0+bh, margin:margin+bw]
+        region = img[y0:y0+bh, :bw]
         region[:] = region * (1 - alpha) + rgb * alpha
 
     def _render_help_text(self):
-        """Pre-render help text to an RGBA numpy array using PIL.
+        """Pre-render paginated help overlays cached in ``_help_pages``.
 
-        Called once at startup; the result is cached in self._help_text_rgba.
-        Two-column layout with styled section headers and key highlighting.
+        Each page matches the legend/minimap height and is positioned
+        at the bottom of the frame.  Press H to cycle pages, then off.
         """
-        # Two columns of (section_title, [(key, description), ...])
-        col_left = [
+        all_sections = [
             ("MOVEMENT", [
                 ("W/S/A/D", "Move fwd / back / left / right"),
                 ("Arrows", "Move fwd / back / left / right"),
@@ -5664,11 +5780,9 @@ class InteractiveViewer:
                 ("Shift+F", "FIRMS fire (7d)"),
                 ("Shift+W", "Toggle wind"),
             ]),
-        ]
-        col_right = [
             ("RENDERING", [
                 ("0", "Toggle ambient occlusion"),
-                ("Shift+H", "Toggle EDL lighting"),
+                ("Shift+H", "Prev help page"),
                 ("Shift+G", "Cycle GI bounces (1-3)"),
                 ("Shift+D", "Toggle AI denoiser"),
                 ("9", "Toggle depth of field"),
@@ -5693,10 +5807,20 @@ class InteractiveViewer:
             ("OTHER", [
                 ("F", "Screenshot"),
                 ("M", "Toggle minimap"),
-                ("H", "Toggle this help"),
+                ("H", "Cycle help pages"),
                 ("X / Esc", "Exit"),
             ]),
         ]
+
+        # Append info text as a section if provided
+        if self._info_text:
+            info_items = []
+            for line in self._info_text.strip().splitlines():
+                line = line.strip()
+                if line:
+                    info_items.append(("", line))
+            if info_items:
+                all_sections.append(("MODEL INFO", info_items))
 
         try:
             from PIL import Image, ImageDraw, ImageFont
@@ -5704,7 +5828,6 @@ class InteractiveViewer:
             font_size = 12
             header_size = 13
             mono_path = "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf"
-            bold_path = "/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf"
             sans_path = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
             sans_bold_path = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
             try:
@@ -5717,125 +5840,133 @@ class InteractiveViewer:
                 font_header = font
 
             line_h = font_size + 5
-            header_h = header_size + 8
+            hdr_h = header_size + 8
             section_gap = 6
-            key_col_w = 105  # width reserved for keys
-            desc_col_w = 195  # width for descriptions
+            key_col_w = 105
+            desc_col_w = 195
             col_w = key_col_w + desc_col_w
-            col_gap = 20
             pad_x = 14
-            pad_y = 12
-            corner_r = 10
+            pad_y = 10
 
             # Colors
-            bg_color = (15, 18, 24, 210)          # dark blue-black, 82% opaque
-            header_color = (180, 210, 255, 255)    # light blue
-            key_color = (255, 200, 100, 245)       # warm amber
-            desc_color = (210, 215, 225, 220)      # soft white
-            separator_color = (80, 90, 110, 120)   # subtle line
-            accent_color = (90, 140, 220, 180)     # blue accent for header underline
+            bg_color = (15, 18, 24, 210)
+            header_color = (180, 210, 255, 255)
+            key_color = (255, 200, 100, 245)
+            desc_color = (210, 215, 225, 220)
+            accent_color = (90, 140, 220, 180)
+            page_color = (120, 140, 170, 180)
 
-            def _column_height(sections):
-                h = 0
-                for i, (title, items) in enumerate(sections):
-                    if i > 0:
-                        h += section_gap
-                    h += header_h + 3  # header + underline space
-                    h += len(items) * line_h
-                return h
+            # Target height: match legend if available
+            if self._legend_rgba is not None:
+                target_h = self._legend_rgba.shape[0]
+            else:
+                target_h = 200
+            usable_h = target_h - pad_y * 2
 
-            left_h = _column_height(col_left)
-            right_h = _column_height(col_right)
-            content_h = max(left_h, right_h)
-            footer_h = header_h + section_gap  # space for "Press H to close"
-            img_w = pad_x * 2 + col_w * 2 + col_gap
-            img_h = pad_y * 2 + content_h + footer_h
+            def _section_h(section):
+                _, items = section
+                return hdr_h + 3 + len(items) * line_h
 
-            # Create with transparent background, then draw rounded rect
-            img = Image.new('RGBA', (img_w, img_h), (0, 0, 0, 0))
-            draw = ImageDraw.Draw(img)
+            # Pack sections into pages greedily
+            pages = []
+            current_page = []
+            current_h = 0
+            for sec in all_sections:
+                sh = _section_h(sec)
+                needed = sh + (section_gap if current_page else 0)
+                if current_page and current_h + needed > usable_h:
+                    pages.append(current_page)
+                    current_page = [sec]
+                    current_h = sh
+                else:
+                    current_h += needed
+                    current_page.append(sec)
+            if current_page:
+                pages.append(current_page)
 
-            # Rounded rectangle background
-            draw.rounded_rectangle(
-                [0, 0, img_w - 1, img_h - 1],
-                radius=corner_r, fill=bg_color,
-            )
+            n_pages = len(pages)
+            img_w = pad_x * 2 + col_w
 
-            # Subtle border
-            draw.rounded_rectangle(
-                [0, 0, img_w - 1, img_h - 1],
-                radius=corner_r, outline=(60, 70, 90, 140), width=1,
-            )
+            self._help_pages = []
+            for pi, page_sections in enumerate(pages):
+                img = Image.new('RGBA', (img_w, target_h), (0, 0, 0, 0))
+                draw = ImageDraw.Draw(img)
+                draw.rectangle(
+                    [0, 0, img_w - 1, target_h - 1], fill=bg_color)
+                draw.rectangle(
+                    [0, 0, img_w - 1, target_h - 1],
+                    outline=(60, 70, 90, 140), width=1)
 
-            def _draw_column(sections, x_start, y_start):
-                y = y_start
-                for si, (title, items) in enumerate(sections):
+                y = pad_y
+                for si, (title, items) in enumerate(page_sections):
                     if si > 0:
                         y += section_gap
-                    # Section header
-                    draw.text((x_start, y), title, fill=header_color,
+                    draw.text((pad_x, y), title, fill=header_color,
                               font=font_header)
-                    # Accent underline
                     underline_y = y + header_size + 2
                     draw.line(
-                        [(x_start, underline_y),
-                         (x_start + col_w - 10, underline_y)],
+                        [(pad_x, underline_y),
+                         (pad_x + col_w - 10, underline_y)],
                         fill=accent_color, width=1)
                     y = underline_y + 3
-
-                    # Key-description rows
                     for key_text, desc_text in items:
-                        draw.text((x_start, y), key_text,
-                                  fill=key_color, font=font_key)
-                        draw.text((x_start + key_col_w, y), desc_text,
-                                  fill=desc_color, font=font)
+                        if key_text:
+                            draw.text((pad_x, y), key_text,
+                                      fill=key_color, font=font_key)
+                            draw.text((pad_x + key_col_w, y), desc_text,
+                                      fill=desc_color, font=font)
+                        else:
+                            draw.text((pad_x, y), desc_text,
+                                      fill=desc_color, font=font)
                         y += line_h
 
-            _draw_column(col_left, pad_x, pad_y)
-            _draw_column(col_right, pad_x + col_w + col_gap, pad_y)
+                # Page indicator (top-right)
+                page_text = f"{pi + 1}/{n_pages}"
+                bbox = font_header.getbbox(page_text)
+                ptw = bbox[2] - bbox[0]
+                draw.text((img_w - pad_x - ptw, pad_y), page_text,
+                          fill=page_color, font=font_header)
 
-            # Vertical separator between columns
-            sep_x = pad_x + col_w + col_gap // 2
-            draw.line(
-                [(sep_x, pad_y + 4), (sep_x, pad_y + content_h - 4)],
-                fill=separator_color, width=1)
-
-            # Bold "Press H to close" footer, centered
-            footer_text = "Press H to close"
-            bbox = font_header.getbbox(footer_text)
-            fw = bbox[2] - bbox[0]
-            footer_x = (img_w - fw) // 2
-            footer_y = pad_y + content_h + section_gap
-            draw.text((footer_x, footer_y), footer_text,
-                      fill=header_color, font=font_header)
-
-            self._help_text_rgba = np.array(img, dtype=np.float32) / 255.0
+                self._help_pages.append(
+                    np.array(img, dtype=np.float32) / 255.0)
         except ImportError:
-            self._help_text_rgba = None
+            self._help_pages = []
 
     def _blit_help_on_frame(self, img):
-        """Alpha-composite cached help text onto the rendered frame.
+        """Alpha-composite the current help page onto the rendered frame.
+
+        Positioned flush at the bottom, right after the legend.
 
         Parameters
         ----------
         img : ndarray, shape (H, W, 3), float32 0-1
             Rendered frame. Modified in-place.
         """
-        if self._help_text_rgba is None:
+        idx = self._help_page_idx
+        if idx < 0 or idx >= len(self._help_pages):
             return
-        ht = self._help_text_rgba
+        ht = self._help_pages[idx]
         hh, hw = ht.shape[:2]
         fh, fw = img.shape[:2]
-        # Top-left with small margin
-        margin = 8
-        # Clamp to frame size
-        bh = min(hh, fh - margin)
-        bw = min(hw, fw - margin)
+
+        # X: right after legend, or flush left
+        if self._legend_rgba is not None:
+            x0 = self._legend_rgba.shape[1]
+        else:
+            x0 = 0
+
+        # Flush bottom
+        y0 = fh - hh
+        if y0 < 0:
+            y0 = 0
+
+        bh = min(hh, fh - y0)
+        bw = min(hw, fw - x0)
         if bh <= 0 or bw <= 0:
             return
         alpha = ht[:bh, :bw, 3:4]
         rgb = ht[:bh, :bw, :3]
-        region = img[margin:margin+bh, margin:margin+bw]
+        region = img[y0:y0+bh, x0:x0+bw]
         region[:] = region * (1 - alpha) + rgb * alpha
 
     def run(self, start_position: Optional[Tuple[float, float, float]] = None,
@@ -5949,9 +6080,9 @@ class InteractiveViewer:
         frame_tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
 
         # --- Pre-render help text overlay ---
-        self._render_help_text()
         self._render_title_overlay()
         self._render_legend_overlay()
+        self._render_help_text()
 
         # --- Initialize minimap ---
         self._compute_minimap_background()
@@ -6162,6 +6293,10 @@ def explore(raster, width: int = 800, height: int = 600,
             ao_samples: int = 0,
             gi_bounces: int = 1,
             denoise: bool = False,
+            minimap_style: str = None,
+            minimap_layer: str = None,
+            minimap_colors: dict = None,
+            info_text: str = None,
             repl: bool = False,
             tour=None):
     """
@@ -6303,6 +6438,10 @@ def explore(raster, width: int = 800, height: int = 600,
     )
     viewer._geometry_colors_builder = geometry_colors_builder
     viewer._baked_meshes = baked_meshes or {}
+    viewer._minimap_style = minimap_style
+    viewer._minimap_layer = minimap_layer
+    viewer._minimap_colors = minimap_colors
+    viewer._info_text = info_text
     viewer._accessor = accessor
     viewer._terrain_loader = terrain_loader
     if scene_zarr is not None:
