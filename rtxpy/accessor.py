@@ -36,6 +36,9 @@ class RTXAccessor:
         self._geometry_colors_gpu = None
         # Baked merged meshes for VE rescaling: {geometry_id: (vertices, indices)}
         self._baked_meshes = {}
+        # Point cloud attributes for interactive color mode cycling
+        # {geometry_id: (centers_N3, attributes_dict)}
+        self._pc_attributes = {}
 
     @property
     def _rtx(self):
@@ -970,6 +973,9 @@ class RTXAccessor:
         # Alpha=5.0 signals per-point color lookup in the shade kernel
         self._geometry_colors[geometry_id] = (0.5, 0.5, 0.5, 5.0)
 
+        # Store attributes for interactive color mode cycling
+        self._pc_attributes[geometry_id] = (centers.copy(), attributes)
+
         # Store baked data for zarr caching and VE rescaling
         n_pts = len(centers)
         radii_arr = (np.full(n_pts, radii, dtype=np.float32)
@@ -1122,6 +1128,9 @@ class RTXAccessor:
 
             self._geometry_colors[gid] = (0.5, 0.5, 0.5, 5.0)
             self._geometry_colors_dirty = True
+
+            # Store attributes for interactive color mode cycling
+            self._pc_attributes[gid] = (centers.copy(), attributes)
 
             # Store baked data for zarr caching and VE rescaling
             n = len(centers)

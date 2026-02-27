@@ -42,12 +42,15 @@ def _has_lidar_cache(zarr_path):
 
 
 def main():
+    # Resolve paths relative to this script's directory
+    _here = Path(__file__).resolve().parent
+
     # Full NYC DEM extent in WGS84
     dem_bounds = (-74.26, 40.49, -73.70, 40.92)
     # Manhattan LiDAR subset
     lidar_bounds = (-74.02, 40.70, -73.97, 40.88)
-    cache_dir = Path('examples/cache/lidar')
-    zarr_path = 'examples/nyc_dem.zarr'
+    cache_dir = _here / 'cache' / 'lidar'
+    zarr_path = str(_here / 'nyc_dem.zarr')
 
     # Load NYC DEM (write CRS back — rioxarray doesn't auto-detect from zarr)
     ds = xr.open_zarr(zarr_path)
@@ -78,7 +81,7 @@ def main():
         # Buildings from Overture Maps (full DEM extent)
         buildings = rtxpy.fetch_buildings(
             bounds=dem_bounds, source='overture',
-            cache_path='examples/cache/nyc_lidar_buildings.geojson')
+            cache_path=str(_here / 'cache' / 'nyc_lidar_buildings.geojson'))
         terrain.rtx.place_buildings(buildings)
 
         # Place all LAZ tiles in parallel (threaded LAZ decompression)

@@ -710,7 +710,7 @@ def _generate_reflection_rays_kernel(reflection_rays, primary_rays, primary_hits
             inst_id = instance_ids[idx]
             if inst_id >= 0 and inst_id < geometry_colors.shape[0]:
                 gc_alpha = geometry_colors[inst_id, 3]
-                if gc_alpha >= 2.0:
+                if gc_alpha >= 2.0 and gc_alpha < 5.0:
                     is_water = True
 
             # Check if terrain hit is NaN ocean
@@ -824,6 +824,7 @@ def _shade_terrain_kernel(
     rgb_texture,
     overlay_data, overlay_alpha, overlay_min, overlay_range,
     instance_ids, geometry_colors,
+    primitive_ids, point_colors, point_color_offsets,
     ao_factor, gi_color, gi_intensity,
     reflection_hits, reflection_rays
 ):
@@ -869,6 +870,7 @@ def _shade_terrain_kernel(
             # Alpha encoding: 0 = no override, (0,1] = normal shaded,
             #                  (1,2) = emissive glow (alpha-1 = min lighting floor),
             #                  >=2   = water shader  (alpha-2 = specular strength)
+            #                  >=5   = per-point color (sphere/point cloud)
             inst_id = instance_ids[idx]
             has_color_override = False
             emissive = 0.0
@@ -876,7 +878,25 @@ def _shade_terrain_kernel(
             water_specular = 0.0
             if inst_id >= 0 and inst_id < geometry_colors.shape[0]:
                 gc_alpha = geometry_colors[inst_id, 3]
-                if gc_alpha > 0.0:
+                if gc_alpha >= 5.0:
+                    # Per-point color lookup for sphere geometries
+                    prim_id = primitive_ids[idx]
+                    if (inst_id < point_color_offsets.shape[0]
+                            and point_color_offsets[inst_id] >= 0
+                            and prim_id >= 0):
+                        pc_idx = (point_color_offsets[inst_id] + prim_id) * 4
+                        if pc_idx + 3 < point_colors.shape[0]:
+                            base_r = point_colors[pc_idx]
+                            base_g = point_colors[pc_idx + 1]
+                            base_b = point_colors[pc_idx + 2]
+                            has_color_override = True
+                    if not has_color_override:
+                        # Fallback to geometry color RGB
+                        base_r = geometry_colors[inst_id, 0]
+                        base_g = geometry_colors[inst_id, 1]
+                        base_b = geometry_colors[inst_id, 2]
+                        has_color_override = True
+                elif gc_alpha > 0.0:
                     base_r = geometry_colors[inst_id, 0]
                     base_g = geometry_colors[inst_id, 1]
                     base_b = geometry_colors[inst_id, 2]
@@ -1282,6 +1302,52 @@ def _edge_outline(output, instance_ids, edge_strength=0.6,
 
 
 @cuda.jit
+def _edl_kernel(output, depth, height, width, radius, strength):
+    """Eye Dome Lighting: darken pixels at depth discontinuities."""
+    idx = cuda.grid(1)
+    if idx >= height * width:
+        return
+    py = idx // width
+    px = idx % width
+    center_d = depth[idx]
+    if center_d <= 0.0:
+        return
+    log_center = math.log2(center_d)
+    response = 0.0
+    # Sample 8 directions (pi/4 apart)
+    for i in range(8):
+        angle = i * (math.pi / 4.0)
+        # math.floor(x + 0.5) for correct rounding of negative offsets
+        nx = px + int(math.floor(radius * math.cos(angle) + 0.5))
+        ny = py + int(math.floor(radius * math.sin(angle) + 0.5))
+        if 0 <= nx < width and 0 <= ny < height:
+            nd = depth[ny * width + nx]
+            if nd > 0.0:
+                dd = log_center - math.log2(nd)
+                if dd > 0.0:
+                    response += dd
+            else:
+                # Empty/sky neighbor — silhouette edge, add fixed contribution
+                response += 0.5
+        else:
+            # Out-of-bounds — treat as silhouette edge
+            response += 0.5
+    shade = math.exp(-response * strength)
+    output[py, px, 0] *= shade
+    output[py, px, 1] *= shade
+    output[py, px, 2] *= shade
+
+
+def _edl(output, depth, width, height, radius=2.0, strength=0.7):
+    """Apply Eye Dome Lighting post-process for depth-edge enhancement."""
+    num_pixels = height * width
+    threadsperblock = 256
+    blockspergrid = (num_pixels + threadsperblock - 1) // threadsperblock
+    _edl_kernel[blockspergrid, threadsperblock](
+        output, depth, height, width, radius, strength)
+
+
+@cuda.jit
 def _compute_flow_kernel(flow_out, primary_rays, primary_hits,
                          width, height,
                          prev_pos, prev_forward, prev_right, prev_up,
@@ -1474,6 +1540,7 @@ def _shade_terrain(
     overlay_data=None, overlay_alpha=0.5,
     overlay_min=0.0, overlay_range=1.0,
     instance_ids=None, geometry_colors=None,
+    primitive_ids=None, point_colors=None, point_color_offsets=None,
     ao_factor=None, gi_color=None, gi_intensity=2.0,
     reflection_hits=None, reflection_rays=None,
     albedo_out=None,
@@ -1510,6 +1577,24 @@ def _shade_terrain(
         if _DUMMY_1x4 is None:
             _DUMMY_1x4 = cupy.zeros((1, 4), dtype=np.float32)
         geometry_colors = _DUMMY_1x4
+
+    # Handle per-point colors for sphere geometries
+    global _DUMMY_PC_PRIMS, _DUMMY_PC_PRIMS_SIZE
+    global _DUMMY_PC_COLORS, _DUMMY_PC_OFFSETS
+    if primitive_ids is None:
+        if not hasattr(_shade_terrain, '_dpc_prims') or \
+                _shade_terrain._dpc_prims_size != num_rays:
+            _shade_terrain._dpc_prims = cupy.full(num_rays, -1, dtype=cupy.int32)
+            _shade_terrain._dpc_prims_size = num_rays
+        primitive_ids = _shade_terrain._dpc_prims
+    if point_colors is None:
+        if not hasattr(_shade_terrain, '_dpc_colors'):
+            _shade_terrain._dpc_colors = cupy.zeros(4, dtype=cupy.float32)
+        point_colors = _shade_terrain._dpc_colors
+    if point_color_offsets is None:
+        if not hasattr(_shade_terrain, '_dpc_offsets'):
+            _shade_terrain._dpc_offsets = cupy.full(1, -1, dtype=cupy.int32)
+        point_color_offsets = _shade_terrain._dpc_offsets
 
     # Handle AO factor - cached all-ones when disabled
     global _DUMMY_AO_ONES, _DUMMY_AO_SIZE
@@ -1558,6 +1643,7 @@ def _shade_terrain(
         rgb_texture,
         overlay_data, overlay_alpha, overlay_min, overlay_range,
         instance_ids, geometry_colors,
+        primitive_ids, point_colors, point_color_offsets,
         ao_factor, gi_color, np.float32(gi_intensity),
         reflection_hits, reflection_rays
     )
@@ -1598,6 +1684,7 @@ class _RenderBuffers:
         self.output = None
         self.albedo = None
         self.instance_ids = None
+        self.primitive_ids = None
         self.ao_rays = None
         self.ao_hits = None
         self.gi_color = None
@@ -1619,6 +1706,7 @@ class _RenderBuffers:
             self.output = cupy.zeros((height, width, num_channels), dtype=np.float32)
             self.albedo = cupy.zeros((height, width, 3), dtype=np.float32)
             self.instance_ids = cupy.full(num_rays, -1, dtype=cupy.int32)
+            self.primitive_ids = cupy.full(num_rays, -1, dtype=cupy.int32)
             if ao:
                 self.ao_rays = cupy.empty((num_rays, 8), dtype=np.float32)
                 self.ao_hits = cupy.empty((num_rays, 4), dtype=np.float32)
@@ -1701,6 +1789,9 @@ def render(
     edge_lines: bool = True,
     edge_strength: float = 0.6,
     edge_color: Tuple[float, float, float] = (0.05, 0.05, 0.05),
+    edl: bool = True,
+    edl_strength: float = 0.7,
+    edl_radius: float = 2.0,
     _return_gpu: bool = False,
 ) -> np.ndarray:
     """Render terrain with a perspective camera for movie-quality visualization.
@@ -1923,8 +2014,10 @@ def render(
 
     # Step 2: Trace primary rays (with instance_ids if geometry_colors provided)
     d_instance_ids = bufs.instance_ids
+    d_primitive_ids = bufs.primitive_ids
     if geometry_colors is not None:
-        optix.trace(d_primary_rays, d_primary_hits, num_rays, instance_ids=d_instance_ids)
+        optix.trace(d_primary_rays, d_primary_hits, num_rays,
+                    instance_ids=d_instance_ids, primitive_ids=d_primitive_ids)
     else:
         optix.trace(d_primary_rays, d_primary_hits, num_rays)
 
@@ -2036,6 +2129,12 @@ def render(
         ov_max = float(cupy.nanmax(d_overlay))
         ov_range = ov_max - ov_min
 
+    # Build per-point color buffers for sphere geometries
+    d_point_colors = None
+    d_point_color_offsets = None
+    if optix is not None:
+        d_point_colors, d_point_color_offsets = optix.build_point_colors_gpu()
+
     # Step 4: Shade terrain
     _shade_terrain(
         d_output, d_primary_rays, d_primary_hits, d_shadow_hits,
@@ -2052,6 +2151,9 @@ def render(
         overlay_data=d_overlay, overlay_alpha=overlay_alpha,
         overlay_min=ov_min, overlay_range=ov_range,
         instance_ids=d_instance_ids, geometry_colors=geometry_colors,
+        primitive_ids=d_primitive_ids,
+        point_colors=d_point_colors,
+        point_color_offsets=d_point_color_offsets,
         ao_factor=d_ao_factor,
         gi_color=bufs.gi_color if ao_samples > 0 else None,
         gi_intensity=gi_intensity,
@@ -2069,6 +2171,12 @@ def render(
     # Edge outlines on placed geometry (after denoise, before bloom)
     if edge_lines and geometry_colors is not None:
         _edge_outline(d_output, d_instance_ids, edge_strength, edge_color)
+
+    # Eye Dome Lighting (depth-edge enhancement, especially for point clouds)
+    if edl:
+        d_depth_1d = d_primary_hits.reshape(num_rays, 4)[:, 0].copy()
+        _edl(d_output, d_depth_1d, width, height,
+             radius=edl_radius, strength=edl_strength)
 
     # Bloom post-process (before tone mapping so ACES compresses bloom gracefully)
     if bloom:

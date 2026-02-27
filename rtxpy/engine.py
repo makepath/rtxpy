@@ -5,6 +5,7 @@ exploring terrain interactively with keyboard controls.
 Uses GLFW for windowing/input and ModernGL for GPU texture display.
 """
 
+import math
 import os
 import queue
 import threading
@@ -21,6 +22,7 @@ from .rtx import RTX, has_cupy
 
 if has_cupy:
     import cupy as cp
+    from numba import cuda
 
 
 # ---------------------------------------------------------------------------
@@ -46,6 +48,106 @@ void main() {
     fragColor = vec4(texture(frame, v_uv).rgb, 1.0);
 }
 """
+
+
+# ---------------------------------------------------------------------------
+# Numba CUDA kernel for wind particle splatting
+# ---------------------------------------------------------------------------
+if has_cupy:
+    @cuda.jit
+    def _wind_splat_kernel(
+        trails,       # (N*T, 2) float32 — (row, col) per trail point
+        alphas,       # (N*T,) float32 — pre-computed alpha per trail point
+        terrain,      # (tH, tW) float32 — terrain elevation
+        output,       # (sh, sw, 3) float32 — frame buffer (atomic add)
+        # Camera basis — scalar args to avoid tiny GPU allocations
+        cam_x, cam_y, cam_z,
+        fwd_x, fwd_y, fwd_z,
+        rgt_x, rgt_y, rgt_z,
+        up_x, up_y, up_z,
+        # Projection params
+        fov_scale, aspect_ratio,
+        # Terrain/world params
+        psx, psy, ve, subsample_f, min_depth,
+        # Splat params
+        dot_radius,
+        # Wind color
+        color_r, color_g, color_b,
+    ):
+        idx = cuda.grid(1)
+        if idx >= trails.shape[0]:
+            return
+
+        a = alphas[idx]
+        if a < 1e-6:
+            return
+
+        row = trails[idx, 0]
+        col = trails[idx, 1]
+
+        # Terrain Z lookup (nearest-neighbor, clamped)
+        tH = terrain.shape[0]
+        tW = terrain.shape[1]
+        sr = int(row / subsample_f)
+        sc = int(col / subsample_f)
+        if sr < 0:
+            sr = 0
+        elif sr >= tH:
+            sr = tH - 1
+        if sc < 0:
+            sc = 0
+        elif sc >= tW:
+            sc = tW - 1
+        z_raw = terrain[sr, sc]
+        # Ocean/water pixels are NaN — map to 0 (matches CPU path)
+        if z_raw != z_raw:  # NaN check (works under fast math)
+            z_raw = 0.0
+        z_val = z_raw * ve + 3.0
+
+        # World position
+        wx = col * psx
+        wy = row * psy
+
+        # Camera-relative
+        dx = wx - cam_x
+        dy = wy - cam_y
+        dz = z_val - cam_z
+
+        # Depth along forward axis
+        depth = dx * fwd_x + dy * fwd_y + dz * fwd_z
+        if depth <= min_depth:
+            return
+
+        inv_depth = 1.0 / (depth + 1e-10)
+        u_cam = dx * rgt_x + dy * rgt_y + dz * rgt_z
+        v_cam = dx * up_x + dy * up_y + dz * up_z
+        u_ndc = u_cam * inv_depth / (fov_scale * aspect_ratio)
+        v_ndc = v_cam * inv_depth / fov_scale
+
+        sh = output.shape[0]
+        sw = output.shape[1]
+        sx = int((u_ndc + 1.0) * 0.5 * sw)
+        sy = int((1.0 - v_ndc) * 0.5 * sh)
+
+        if sx < 0 or sx >= sw or sy < 0 or sy >= sh:
+            return
+
+        # Circular stamp splat
+        r = dot_radius
+        for offy in range(-r, r + 1):
+            for offx in range(-r, r + 1):
+                dist_sq = offx * offx + offy * offy
+                if dist_sq > r * r:
+                    continue
+                falloff = 1.0 - math.sqrt(dist_sq) / r
+                px = sx + offx
+                py = sy + offy
+                if px < 0 or px >= sw or py < 0 or py >= sh:
+                    continue
+                contrib = a * falloff
+                cuda.atomic.add(output, (py, px, 0), contrib * color_r)
+                cuda.atomic.add(output, (py, px, 1), contrib * color_g)
+                cuda.atomic.add(output, (py, px, 2), contrib * color_b)
 
 
 def _glfw_to_key(glfw_key, mods):
@@ -990,6 +1092,7 @@ class InteractiveViewer:
     - U/Shift+U: Cycle basemap forward/backward (none → satellite → osm)
     - N: Cycle geometry layer (none → all → groups)
     - P: Jump to previous geometry in current group
+    - Shift+C: Cycle point cloud color mode (elevation/intensity/classification/rgb)
     - ,/.: Decrease/increase overlay alpha (transparency)
     - O: Place observer (for viewshed) at look-at point
     - Shift+O: Cycle drone mode (off → 3rd person → FPV → off)
@@ -1234,6 +1337,10 @@ class InteractiveViewer:
         self._dof_aperture = 20.0  # lens radius in scene units
         self._dof_focal_distance = 1000.0  # focal plane distance (= look_at distance)
 
+        # Point cloud color mode cycling
+        self._pc_color_modes = ['elevation', 'intensity', 'classification', 'rgb']
+        self._pc_color_mode_idx = 0
+
         # Tile overlay settings
         self._tile_service = None
         self._tiles_enabled = False
@@ -1300,6 +1407,13 @@ class InteractiveViewer:
         self._wind_alpha = 0.055      # Per-pixel alpha for particle dots
         self._wind_min_visible_age = 6  # Ticks before particle becomes visible (builds trail first)
         self._wind_terrain_np = None  # Cached CPU terrain for wind Z lookup
+
+        # GPU wind splatting buffers
+        self._d_wind_trails = None    # (N*T, 2) float32 GPU buffer
+        self._d_wind_alpha = None     # (N*T,) float32 GPU buffer
+        self._d_base_frame = None     # (H, W, 3) float32 — post-processed frame before wind
+        self._d_wind_scratch = None   # (H, W, 3) float32 — scratch for idle replay
+        self._wind_done_event = None  # CUDA event for stream sync
 
         # GTFS-RT realtime vehicle overlay state
         self._gtfs_rt_url = None
@@ -1726,6 +1840,8 @@ class InteractiveViewer:
 
         self.raster = sub
         self._wind_terrain_np = None  # invalidate cached terrain
+        self._d_base_frame = None     # invalidate GPU wind buffers
+        self._d_wind_scratch = None
         H, W = sub.shape
         self.terrain_shape = (H, W)
 
@@ -2796,7 +2912,6 @@ class InteractiveViewer:
             return
 
         from .analysis.render import _compute_camera_basis
-        import math
 
         sh, sw = img.shape[:2]
         N = self._wind_particles.shape[0]
@@ -2914,6 +3029,101 @@ class InteractiveViewer:
 
         np.clip(img, 0, 1, out=img)
         return img
+
+    def _splat_wind_gpu(self, d_frame):
+        """Project and splat wind particles on GPU via Numba CUDA kernel.
+
+        Parameters
+        ----------
+        d_frame : cupy.ndarray, shape (H, W, 3)
+            GPU frame buffer (float32 0-1). Modified in-place via atomic add.
+        """
+        if self._wind_particles is None or self._wind_trails is None:
+            return
+
+        from .analysis.render import _compute_camera_basis
+
+        sh, sw = d_frame.shape[:2]
+        N = self._wind_particles.shape[0]
+        trail_len = self._wind_trail_len
+
+        # Camera basis
+        cam_pos = self.position
+        look_at = self._get_look_at()
+        forward, right, cam_up = _compute_camera_basis(
+            tuple(cam_pos), tuple(look_at), (0, 0, 1),
+        )
+        fov_scale = math.tan(math.radians(self.fov) / 2.0)
+        aspect_ratio = sw / sh
+
+        # Pre-compute alpha on CPU (vectorized — same logic as _draw_wind_on_frame)
+        ages = self._wind_ages
+        lifetimes = self._wind_lifetimes
+        trail_idx = np.tile(np.arange(trail_len, dtype=np.float32), N)
+        ages_rep = np.repeat(ages, trail_len)
+        lifetimes_rep = np.repeat(lifetimes, trail_len)
+        age_ok = ages_rep > trail_idx
+
+        mva = self._wind_min_visible_age
+        fade_in = np.clip((ages_rep - mva) / 10.0, 0, 1)
+        fade_out = np.clip((lifetimes_rep - ages_rep) / 20.0, 0, 1)
+        trail_fade = 1.0 - (trail_idx / trail_len)
+        alpha = self._wind_alpha * fade_in * fade_out * trail_fade
+        alpha[~age_ok] = 0.0
+
+        # Flatten trails: (N, T, 2) → (N*T, 2)
+        all_pts = self._wind_trails.reshape(-1, 2).astype(np.float32)
+        alpha = alpha.astype(np.float32)
+        total = N * trail_len
+
+        # Upload to reusable GPU buffers
+        if self._d_wind_trails is None or self._d_wind_trails.shape[0] != total:
+            self._d_wind_trails = cp.empty((total, 2), dtype=cp.float32)
+            self._d_wind_alpha = cp.empty(total, dtype=cp.float32)
+        self._d_wind_trails.set(all_pts)
+        self._d_wind_alpha.set(alpha)
+
+        # GPU terrain — use raster.data directly
+        terrain_data = self.raster.data
+        if not isinstance(terrain_data, cp.ndarray):
+            terrain_data = cp.asarray(terrain_data)
+
+        # Kernel launch
+        threadsperblock = 256
+        blockspergrid = (total + threadsperblock - 1) // threadsperblock
+
+        f = float(self.subsample_factor)
+        psx = float(self._base_pixel_spacing_x)
+        psy = float(self._base_pixel_spacing_y)
+        ve = float(self.vertical_exaggeration)
+        min_depth = float(self._wind_min_depth)
+        r = int(self._wind_dot_radius)
+
+        _wind_splat_kernel[blockspergrid, threadsperblock](
+            self._d_wind_trails,
+            self._d_wind_alpha,
+            terrain_data,
+            d_frame,
+            # Camera position
+            float(cam_pos[0]), float(cam_pos[1]), float(cam_pos[2]),
+            # Forward
+            float(forward[0]), float(forward[1]), float(forward[2]),
+            # Right
+            float(right[0]), float(right[1]), float(right[2]),
+            # Up
+            float(cam_up[0]), float(cam_up[1]), float(cam_up[2]),
+            # Projection
+            float(fov_scale), float(aspect_ratio),
+            # Terrain/world
+            psx, psy, ve, f, min_depth,
+            # Splat
+            r,
+            # Color (teal)
+            0.3, 0.9, 0.8,
+        )
+
+        # Clamp output
+        cp.clip(d_frame, 0, 1, out=d_frame)
 
     # ------------------------------------------------------------------
     # GTFS-RT realtime vehicle overlay
@@ -3171,6 +3381,11 @@ class InteractiveViewer:
         # GTFS-RT realtime vehicle toggle: Shift+B
         if raw_key == 'B':
             self._toggle_gtfs_rt()
+            return
+
+        # Point cloud color mode cycle: Shift+C
+        if raw_key == 'C':
+            self._cycle_pointcloud_colors()
             return
 
         # Denoiser toggle: Shift+D (before movement keys capture 'd')
@@ -3511,6 +3726,8 @@ class InteractiveViewer:
         self._base_raster = new_raster
         self.raster = new_raster
         self._wind_terrain_np = None  # invalidate cached terrain
+        self._d_base_frame = None     # invalidate GPU wind buffers
+        self._d_wind_scratch = None
 
         # Update coordinate tracking
         self._coord_origin_x = new_origin_x
@@ -3730,8 +3947,8 @@ class InteractiveViewer:
             if self._chunk_manager.update(self.position[0], self.position[1], self):
                 self._geometry_colors_builder = self._accessor._build_geometry_colors_gpu
                 self._render_needed = True
-        # AO: keep accumulating samples when camera is stationary
-        if (self.ao_enabled and not self._held_keys
+        # AO/DOF: keep accumulating samples when camera is stationary
+        if ((self.ao_enabled or self.dof_enabled) and not self._held_keys
                 and not self._mouse_dragging
                 and self._ao_frame_count < self._ao_max_frames):
             self._render_needed = True
@@ -3739,10 +3956,13 @@ class InteractiveViewer:
         if self._render_needed:
             self._update_frame()
             self._render_needed = False
-        elif self._wind_enabled and self._wind_particles is not None and self._pinned_frame is not None:
+        elif self._wind_enabled and self._wind_particles is not None and self._d_base_frame is not None:
             # Wind is on but camera didn't move — skip the expensive ray
-            # trace and just re-advect particles + re-composite overlays.
+            # trace and just re-advect particles + GPU splat on fresh copy.
             self._update_wind_particles()
+            cp.copyto(self._d_wind_scratch, self._d_base_frame)
+            self._splat_wind_gpu(self._d_wind_scratch)
+            self._d_wind_scratch.get(out=self._pinned_frame)
             self._composite_overlays()
 
     def _cycle_terrain_layer(self):
@@ -3843,6 +4063,51 @@ class InteractiveViewer:
 
         self._current_geom_idx = 0
         self._update_frame()
+
+    def _cycle_pointcloud_colors(self):
+        """Cycle point cloud color mode: elevation → intensity → classification → rgb."""
+        acc = self._accessor
+        if acc is None or not hasattr(acc, '_pc_attributes') or not acc._pc_attributes:
+            print("No point cloud geometries in scene")
+            return
+
+        from .pointcloud import build_colors
+
+        self._pc_color_mode_idx = (self._pc_color_mode_idx + 1) % len(self._pc_color_modes)
+        mode = self._pc_color_modes[self._pc_color_mode_idx]
+
+        updated = 0
+        for gid, (centers, attributes) in acc._pc_attributes.items():
+            # Check the geometry still exists
+            if self.rtx is None or not self.rtx.has_geometry(gid):
+                continue
+
+            # Build new colors
+            new_colors = build_colors(centers, attributes, color_mode=mode)
+            colors_flat = new_colors.ravel().astype(np.float32)
+
+            # Update per-point colors on the RTX geometry state
+            gs = self.rtx._geom_state
+            gs.point_colors_per_gas[gid] = colors_flat
+            # Invalidate concatenated GPU buffer so it gets rebuilt
+            gs.point_colors = None
+            gs.point_color_offsets = None
+
+            # Update baked mesh colors (3rd element of 4-tuple)
+            if gid in acc._baked_meshes:
+                baked = acc._baked_meshes[gid]
+                acc._baked_meshes[gid] = (baked[0], baked[1], colors_flat.copy(), baked[3])
+
+            updated += 1
+
+        if updated > 0:
+            print(f"Point cloud color: {mode}")
+            self._d_ao_accum = None
+            self._ao_frame_count = 0
+            self._prev_cam_state = None
+            self._update_frame()
+        else:
+            print(f"No active point cloud geometries to recolor")
 
     def _jump_to_geometry(self, direction):
         """Jump camera to next/previous geometry in current layer.
@@ -4681,8 +4946,8 @@ class InteractiveViewer:
             geometry_colors=geometry_colors,
         )
 
-        # Accumulated multi-frame screenshot when AO is enabled
-        num_frames = 64 if self.ao_enabled else 1
+        # Accumulated multi-frame screenshot when AO or DOF is enabled
+        num_frames = 64 if (self.ao_enabled or self.dof_enabled) else 1
 
         if num_frames > 1:
             import cupy
@@ -4776,16 +5041,20 @@ class InteractiveViewer:
         if builder is not None:
             geometry_colors = builder()
 
+        # Progressive accumulation is needed for AO convergence and/or
+        # DOF (thin-lens jitter needs multi-frame averaging to converge).
+        needs_accum = self.ao_enabled or self.dof_enabled
+
         # AO parameters: multiple samples per frame for smooth early results,
         # with progressive accumulation across frames for further refinement
         ao_samples = self._ao_samples_per_frame if self.ao_enabled else 0
         ao_seed = self._ao_frame_count if self.ao_enabled else 0
 
         # When progressive accumulation is active, pass frame seed for AA + soft shadows + DOF
-        frame_seed = self._ao_frame_count + 1 if self.ao_enabled else 0
+        frame_seed = self._ao_frame_count + 1 if needs_accum else 0
 
-        # Depth of field (requires progressive accumulation via AO)
-        if self.dof_enabled and self.ao_enabled:
+        # Depth of field
+        if self.dof_enabled:
             dof_aperture = self._dof_aperture
             dof_focal = self._dof_focal_distance
         else:
@@ -4851,8 +5120,9 @@ class InteractiveViewer:
         d_output = self._render_frame()
         self.frame_count += 1
 
-        # Progressive AO accumulation
-        if self.ao_enabled:
+        # Progressive accumulation (needed for AO convergence and/or DOF)
+        needs_accum = self.ao_enabled or self.dof_enabled
+        if needs_accum:
             from .analysis.render import _bloom, _tone_map_aces, _render_buffers
 
             # Check if camera moved — compare current state to previous
@@ -4876,11 +5146,11 @@ class InteractiveViewer:
             d_display = d_output
 
         # Deferred post-processing: denoise → bloom → tone map.
-        # These are deferred when AO or denoiser is active so they
+        # These are deferred when AO, DOF, or denoiser is active so they
         # operate on the clean / averaged signal.
-        defer_post = self.ao_enabled or self.denoise_enabled
+        defer_post = needs_accum or self.denoise_enabled
         if defer_post:
-            if not self.ao_enabled:
+            if not needs_accum:
                 from .analysis.render import _bloom, _tone_map_aces, _render_buffers
 
             if self.denoise_enabled:
@@ -4940,12 +5210,26 @@ class InteractiveViewer:
                 self._pinned_mem, dtype=np.float32, count=d_display.size
             ).reshape(d_display.shape)
 
-        # Start async D2H copy on non-blocking stream
-        d_display.get(out=self._pinned_frame, stream=self._readback_stream)
+        # Save clean post-processed frame for idle wind replay
+        if self._wind_enabled:
+            if self._d_base_frame is None or self._d_base_frame.shape != d_display.shape:
+                self._d_base_frame = cp.empty_like(d_display)
+                self._d_wind_scratch = cp.empty_like(d_display)
+            cp.copyto(self._d_base_frame, d_display)
 
-        # CPU work while DMA runs
+        # GPU wind: advect on CPU, splat on GPU, then readback
         if self._wind_enabled and self._wind_particles is not None:
             self._update_wind_particles()
+            self._splat_wind_gpu(d_display)
+
+            # Sync: wind kernel runs on stream 0, readback on non-blocking stream
+            if self._wind_done_event is None:
+                self._wind_done_event = cp.cuda.Event()
+            self._wind_done_event.record()
+            self._readback_stream.wait_event(self._wind_done_event)
+
+        # Async D2H copy on non-blocking stream
+        d_display.get(out=self._pinned_frame, stream=self._readback_stream)
 
         # Wait for DMA to complete
         self._readback_stream.synchronize()
@@ -5000,8 +5284,7 @@ class InteractiveViewer:
 
         # Build display frame (copy if we need overlays, else use pinned directly)
         needs_overlay = (
-            (self._wind_enabled and self._wind_particles is not None)
-            or (self._gtfs_rt_enabled and self._gtfs_rt_vehicles is not None)
+            (self._gtfs_rt_enabled and self._gtfs_rt_vehicles is not None)
             or self.show_minimap
             or self._title_overlay_rgba is not None
             or self._legend_rgba is not None
@@ -5011,10 +5294,6 @@ class InteractiveViewer:
             img = self._pinned_frame.copy()
         else:
             img = self._pinned_frame
-
-        # Wind overlay
-        if self._wind_enabled and self._wind_particles is not None:
-            self._draw_wind_on_frame(img)
 
         # GTFS-RT vehicle overlay
         if self._gtfs_rt_enabled and self._gtfs_rt_vehicles is not None:
@@ -5399,6 +5678,7 @@ class InteractiveViewer:
             ("GEOMETRY", [
                 ("N", "Cycle geometry layer"),
                 ("P", "Prev geometry in group"),
+                ("Shift+C", "Cycle point cloud colors"),
                 ("Right-Click", "Pick geometry"),
             ]),
             ("OBSERVERS", [
@@ -5962,6 +6242,7 @@ def explore(raster, width: int = 800, height: int = 600,
     - U/Shift+U: Cycle basemap forward/backward (none → satellite → osm)
     - N: Cycle geometry layer (none → all → groups)
     - P: Jump to previous geometry in current group
+    - Shift+C: Cycle point cloud color mode (elevation/intensity/classification/rgb)
     - ,/.: Decrease/increase overlay alpha (transparency)
     - O: Place observer (for viewshed) at look-at point
     - Shift+O: Cycle drone mode (off → 3rd person → FPV → off)
