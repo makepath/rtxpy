@@ -120,19 +120,25 @@ _KEYBOARD_CAPTURE_JS = """
         el.style.outline = 'none';
         el.style.cursor = 'crosshair';
 
+        // Tell Lumino (JupyterLab) to skip shortcut processing for
+        // keyboard events originating from this element.  ipyevents
+        // already captures keyboard via its own document-level listener,
+        // so we just need Lumino to not interfere.
+        el.setAttribute('data-lm-suppress-shortcuts', 'true');
+
         // Visual focus indicator
         el.addEventListener('focus', function() {
             el.style.outline = '2px solid #4a9eff';
+            // Classic Notebook: disable its keyboard manager
+            if (window.IPython && IPython.keyboard_manager) {
+                IPython.keyboard_manager.disable();
+            }
         });
         el.addEventListener('blur', function() {
             el.style.outline = 'none';
-        });
-
-        // Stop keyboard events from bubbling to notebook handlers
-        ['keydown', 'keyup', 'keypress'].forEach(function(type) {
-            el.addEventListener(type, function(e) {
-                e.stopPropagation();
-            });
+            if (window.IPython && IPython.keyboard_manager) {
+                IPython.keyboard_manager.enable();
+            }
         });
 
         // Stop wheel from scrolling the notebook page
@@ -181,6 +187,16 @@ class JupyterViewer(InteractiveViewer):
             img = Image.fromarray((ht * 255).astype(np.uint8), 'RGBA')
             img = img.resize((new_w, new_h), Image.LANCZOS)
             self._help_text_rgba = np.array(img, dtype=np.float32) / 255.0
+
+    def _handle_key_press(self, raw_key, key):
+        """Override to suppress exit keys in Jupyter.
+
+        In Jupyter, 'x' and 'escape' shouldn't kill the viewer — too easy
+        to hit accidentally.  Use ``widget.stop()`` instead.
+        """
+        if key in ('escape', 'x'):
+            return
+        super()._handle_key_press(raw_key, key)
 
     def run(self, start_position: Optional[Tuple[float, float, float]] = None,
             look_at: Optional[Tuple[float, float, float]] = None):
@@ -258,7 +274,7 @@ class JupyterViewer(InteractiveViewer):
                 'wheel',
             ],
             prevent_default_action=True,
-            wait=8,
+            wait=0,
         )
         event_handler.on_dom_event(self._handle_dom_event)
         self._event_handler = event_handler
@@ -284,9 +300,7 @@ class JupyterViewer(InteractiveViewer):
         )
         self._render_thread.start()
 
-        print(f"rtxpy Jupyter viewer started ({self.width}x{self.height})")
-        print("Click the image to focus (blue border), then use keyboard/mouse.")
-        print("Press H for controls. Call widget.stop() to exit.")
+        print(f"rtxpy viewer ({self.width}x{self.height}) — click image to focus, H for help, widget.stop() to exit")
 
         # Display widget + keyboard isolation JavaScript
         display(self._widget)
