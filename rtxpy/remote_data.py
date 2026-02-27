@@ -474,6 +474,153 @@ def fetch_dem(bounds, output_path, source="copernicus", crs=None, cache_dir=None
     return merged
 
 
+def _query_usgs_lidar_tiles(bounds):
+    """Query USGS TNM API for LiDAR Point Cloud (LPC) LAZ tiles.
+
+    Parameters
+    ----------
+    bounds : tuple of float
+        (west, south, east, north) in WGS84 degrees.
+
+    Returns
+    -------
+    list of (tile_name, url, size_bytes)
+        Sorted by newest ``publicationDate`` first, deduplicated by tile name.
+    """
+    try:
+        import requests
+    except ImportError:
+        raise ImportError(
+            "requests is required for fetch_lidar(). "
+            "Install it with: pip install requests"
+        )
+
+    west, south, east, north = bounds
+    all_items = []
+    offset = 0
+
+    while True:
+        params = {
+            "datasets": "Lidar Point Cloud (LPC)",
+            "bbox": f"{west},{south},{east},{north}",
+            "prodFormats": "LAZ",
+            "max": 100,
+            "offset": offset,
+        }
+        resp = requests.get(_TNM_API_URL, params=params, timeout=60)
+        resp.raise_for_status()
+        data = resp.json()
+
+        items = data.get("items", [])
+        all_items.extend(items)
+        if len(items) < 100:
+            break
+        offset += 100
+
+    # Prefer newer publications when tiles overlap
+    all_items.sort(
+        key=lambda item: item.get("publicationDate", ""),
+        reverse=True,
+    )
+
+    seen_names = set()
+    tiles = []
+    for item in all_items:
+        url = item.get("downloadURL", "")
+        if not url:
+            continue
+
+        tile_name = item.get("title", url.split("/")[-1])
+        # Sanitize tile name for use as filename
+        tile_name = re.sub(r'[^\w\-.]', '_', tile_name)
+
+        if tile_name in seen_names:
+            continue
+        seen_names.add(tile_name)
+
+        size_bytes = item.get("sizeInBytes", 0)
+        tiles.append((tile_name, url, size_bytes))
+
+    return tiles
+
+
+def fetch_lidar(bounds, cache_dir=None, max_tiles=None):
+    """Download USGS 3DEP LiDAR LAZ tiles for a bounding box.
+
+    Queries the USGS TNM API for Lidar Point Cloud (LPC) tiles in LAZ
+    format, downloads them with caching, and returns paths to the local
+    files.  The LAZ files can be passed directly to
+    ``place_pointcloud()`` which handles coordinate conversion.
+
+    Parameters
+    ----------
+    bounds : tuple of float
+        (west, south, east, north) in WGS84 degrees.
+    cache_dir : str or Path, optional
+        Directory for cached LAZ files.  Defaults to
+        ``~/.cache/rtxpy/lidar/``.
+    max_tiles : int, optional
+        Limit the number of tiles downloaded.  Tiles are sorted by
+        newest publication date first, so the most recent data is
+        preferred.  ``None`` downloads all available tiles.
+
+    Returns
+    -------
+    list of Path
+        Paths to downloaded LAZ files.
+    """
+    try:
+        import requests  # noqa: F401 — validate dependency early
+    except ImportError:
+        raise ImportError(
+            "requests is required for fetch_lidar(). "
+            "Install it with: pip install requests"
+        )
+
+    if cache_dir is None:
+        cache_dir = Path.home() / ".cache" / "rtxpy" / "lidar"
+    else:
+        cache_dir = Path(cache_dir)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+
+    tiles = _query_usgs_lidar_tiles(bounds)
+    if not tiles:
+        print("No LiDAR tiles found for the given bounds.")
+        return []
+
+    total_mb = sum(s for _, _, s in tiles) / (1 << 20)
+    print(f"Found {len(tiles)} LiDAR tile(s) ({total_mb:.0f} MB total)")
+
+    if max_tiles is not None and max_tiles < len(tiles):
+        print(f"  Limiting to {max_tiles} of {len(tiles)} tile(s)")
+        tiles = tiles[:max_tiles]
+
+    laz_paths = []
+    for tile_name, url, size_bytes in tiles:
+        # Ensure .laz extension
+        fname = tile_name if tile_name.endswith(".laz") else f"{tile_name}.laz"
+        tile_path = cache_dir / fname
+
+        if tile_path.exists() and tile_path.stat().st_size > 0:
+            print(f"  Using cached {tile_name}")
+        else:
+            size_mb = size_bytes / (1 << 20)
+            print(f"  Downloading {tile_name} ({size_mb:.1f} MB)...")
+            try:
+                _download_tile(url, tile_path)
+            except Exception as e:
+                print(f"  Warning: Failed to download {tile_name}: {e}")
+                continue
+
+        laz_paths.append(tile_path)
+
+    if not laz_paths:
+        raise RuntimeError("Failed to download any LiDAR tiles")
+
+    print(f"  {len(laz_paths)} LAZ file(s) ready")
+    return laz_paths
+
+
 def fetch_osm(bounds, tags=None, crs=None, cache_path=None):
     """Download OpenStreetMap features for a bounding box.
 

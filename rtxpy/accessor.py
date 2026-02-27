@@ -36,6 +36,9 @@ class RTXAccessor:
         self._geometry_colors_gpu = None
         # Baked merged meshes for VE rescaling: {geometry_id: (vertices, indices)}
         self._baked_meshes = {}
+        # Point cloud attributes for interactive color mode cycling
+        # {geometry_id: (centers_N3, attributes_dict)}
+        self._pc_attributes = {}
 
     @property
     def _rtx(self):
@@ -413,11 +416,16 @@ class RTXAccessor:
             elev_chunks = elev.metadata.chunk_grid.chunk_shape
         store = None
 
-        # Separate triangle meshes (3-tuple) from curves (4-tuple)
+        # Separate triangle meshes, curves, and spheres
         meshes = {}
         curves = {}
+        spheres = {}
         for gid, baked in self._baked_meshes.items():
-            if len(baked) == 4:
+            entry = self._rtx._geom_state.gas_entries.get(gid)
+            if entry and entry.is_sphere:
+                # sphere geometry: (centers, radii, colors, base_z)
+                spheres[gid] = (baked[0], baked[1], baked[2])
+            elif len(baked) == 4:
                 # curve geometry: (verts, widths, indices, base_z)
                 curves[gid] = (baked[0], baked[1], baked[2])
             else:
@@ -431,6 +439,7 @@ class RTXAccessor:
             elevation_shape=elev_shape,
             elevation_chunks=elev_chunks,
             curves=curves,
+            spheres=spheres,
         )
 
     def load_meshes(self, zarr_path, chunks=None):
@@ -450,7 +459,7 @@ class RTXAccessor:
         """
         from .mesh_store import load_meshes_from_zarr
 
-        meshes, colors, meta, curves = load_meshes_from_zarr(
+        meshes, colors, meta, curves, spheres = load_meshes_from_zarr(
             zarr_path, chunks=chunks)
 
         psx, psy = meta['pixel_spacing']
@@ -498,6 +507,29 @@ class RTXAccessor:
                                        indices.copy(), base_z)
             loaded_curves.append(gid)
 
+        # Load sphere geometries (point clouds)
+        loaded_spheres = []
+        total_sphere_pts = 0
+        for gid, (centers, radii, sph_colors) in spheres.items():
+            if len(centers) == 0:
+                continue
+            # Determine uniform vs per-point radii
+            unique_r = np.unique(radii)
+            r_arg = float(unique_r[0]) if len(unique_r) == 1 else radii
+            self._rtx.add_sphere_geometry(
+                gid, centers, r_arg, colors=sph_colors if len(sph_colors) > 0 else None)
+            self._geometry_colors[gid] = colors.get(gid, (0.5, 0.5, 0.5, 5.0))
+
+            # Compute base_z for VE rescaling
+            vx = centers[0::3]
+            vy = centers[1::3]
+            base_z = self._bilinear_terrain_z(
+                terrain_data_np, vx, vy, psx, psy)
+            self._baked_meshes[gid] = (
+                centers.copy(), radii.copy(), sph_colors.copy(), base_z)
+            loaded_spheres.append(gid)
+            total_sphere_pts += len(radii)
+
         self._geometry_colors_dirty = True
         n_tris = sum(len(meshes[g][1]) // 3 for g in loaded)
         n_segs = sum(len(curves[g][2]) for g in loaded_curves)
@@ -506,7 +538,9 @@ class RTXAccessor:
             parts.append(f"{n_tris:,} triangles")
         if loaded_curves:
             parts.append(f"{n_segs:,} curve segments")
-        total = len(loaded) + len(loaded_curves)
+        if loaded_spheres:
+            parts.append(f"{total_sphere_pts:,} sphere points")
+        total = len(loaded) + len(loaded_curves) + len(loaded_spheres)
         print(f"Loaded {total} mesh geometries ({', '.join(parts)}) "
               f"from {zarr_path}")
 
@@ -816,6 +850,7 @@ class RTXAccessor:
                          point_size=1.0, color='elevation',
                          classification=None, returns=None,
                          bounds=None, subsample=1, max_points=None,
+                         thin=None,
                          snap_to_terrain=False, colormap=None):
         """
         Place a lidar point cloud in the scene as sphere primitives.
@@ -863,12 +898,17 @@ class RTXAccessor:
             bounds=bounds,
             subsample=subsample,
             max_points=max_points,
+            thin=thin,
         )
 
         if len(centers) == 0:
             return {'num_points': 0, 'geometry_id': geometry_id, 'bounds': None}
 
-        terrain = self._obj.values
+        terrain = self._obj.data
+        try:
+            terrain = terrain.get()  # cupy → numpy
+        except AttributeError:
+            terrain = np.asarray(terrain)
         H, W = terrain.shape
 
         # Convert coordinates to terrain pixel space if needed
@@ -886,24 +926,28 @@ class RTXAccessor:
             y_coords = self._obj.coords['y'].values
             psy = abs(float(y_coords[1] - y_coords[0]))
 
-        # If coords look like they're in a projected CRS (large values),
-        # convert to pixel space
+        # Convert projected-CRS coordinates to the terrain mesh coordinate
+        # system.  triangulate() builds vertices at (col*psx, row*psy, elev)
+        # so we need world-offset coords, not pixel coords.
         if psx != 1.0 or psy != 1.0:
             x_origin = float(self._obj.coords['x'].values[0])
             y_origin = float(self._obj.coords['y'].values[0])
-            centers[:, 0] = (centers[:, 0] - x_origin) / psx
-            centers[:, 1] = (centers[:, 1] - y_origin) / psy
+            centers[:, 0] = centers[:, 0] - x_origin
+            # Y axis may be inverted (descending = north-up raster convention)
+            y_ascending = (self._obj.coords['y'].values[-1]
+                           > self._obj.coords['y'].values[0])
+            if y_ascending:
+                centers[:, 1] = centers[:, 1] - y_origin
+            else:
+                centers[:, 1] = y_origin - centers[:, 1]
+            # Z stays in raw meters — matches terrain mesh Z
 
         # Snap Z to terrain if requested
         if snap_to_terrain:
             for i in range(len(centers)):
                 vx, vy = centers[i, 0], centers[i, 1]
-                z = self._bilinear_terrain_z(terrain, vx, vy, 1.0, 1.0)
+                z = self._bilinear_terrain_z(terrain, vx, vy, psx, psy)
                 centers[i, 2] = z
-        else:
-            # Scale Z by pixel spacing to match terrain units
-            if psx != 1.0:
-                centers[:, 2] = centers[:, 2] / psx
 
         # Build per-point colors
         point_colors = build_colors(
@@ -926,9 +970,22 @@ class RTXAccessor:
         if result != 0:
             raise RuntimeError(f"Failed to add sphere geometry '{geometry_id}'")
 
-        # Set geometry color to a marker value so the render kernel
-        # knows to use per-point colors (alpha > 0 triggers solid color)
-        self._geometry_colors[geometry_id] = (0.5, 0.5, 0.5)
+        # Alpha=5.0 signals per-point color lookup in the shade kernel
+        self._geometry_colors[geometry_id] = (0.5, 0.5, 0.5, 5.0)
+
+        # Store attributes for interactive color mode cycling
+        self._pc_attributes[geometry_id] = (centers.copy(), attributes)
+
+        # Store baked data for zarr caching and VE rescaling
+        n_pts = len(centers)
+        radii_arr = (np.full(n_pts, radii, dtype=np.float32)
+                     if np.isscalar(radii)
+                     else np.asarray(radii, dtype=np.float32))
+        vx, vy = centers[:, 0], centers[:, 1]
+        base_z = self._bilinear_terrain_z(terrain, vx, vy, psx, psy)
+        self._baked_meshes[geometry_id] = (
+            centers.ravel().copy(), radii_arr.copy(),
+            point_colors.ravel().copy(), base_z)
 
         point_bounds = (
             float(centers[:, 0].min()), float(centers[:, 1].min()),
@@ -942,6 +999,166 @@ class RTXAccessor:
             'geometry_id': geometry_id,
             'bounds': point_bounds,
         }
+
+    def place_pointclouds(self, sources, geometry_id_prefix='lidar',
+                          point_size=1.0, color='elevation',
+                          classification=None, returns=None,
+                          bounds=None, subsample=1, max_points=None,
+                          thin=None,
+                          snap_to_terrain=False, colormap=None,
+                          workers=None):
+        """
+        Place multiple point cloud files in parallel.
+
+        Decompresses LAZ files concurrently using a process pool, then
+        adds each to the scene sequentially (GPU work is serial).
+
+        Args:
+            sources: List of file paths (str or Path) to LAS/LAZ files.
+            geometry_id_prefix: Prefix for geometry IDs. Each tile gets
+                ``'{prefix}_{i}'``.  Default ``'lidar'``.
+            point_size: Sphere radius in world units.
+            color: Color mode (see ``place_pointcloud``).
+            classification: ASPRS class filter (see ``place_pointcloud``).
+            returns: Return number filter.
+            bounds: Spatial crop (xmin, ymin, xmax, ymax).
+            subsample: Keep every Nth point.
+            max_points: Max points per tile.
+            snap_to_terrain: Replace Z with DEM elevation.
+            colormap: Custom color LUT.
+            workers: Number of parallel loader processes.
+                Default ``None`` uses ``min(len(sources), os.cpu_count())``.
+
+        Returns:
+            List of result dicts (same format as ``place_pointcloud``).
+        """
+        import os
+        from concurrent.futures import ProcessPoolExecutor, as_completed
+        from .pointcloud import load_pointcloud, build_colors
+
+        sources = [str(s) for s in sources]
+        if not sources:
+            return []
+
+        if workers is None:
+            workers = min(len(sources), os.cpu_count() or 4)
+
+        # --- Phase 1: Parallel LAZ decompression (CPU-bound) ---
+        load_kwargs = dict(
+            classification=classification,
+            returns=returns,
+            bounds=bounds,
+            subsample=subsample,
+            max_points=max_points,
+            thin=thin,
+        )
+
+        loaded = [None] * len(sources)
+        print(f"Loading {len(sources)} tiles with {workers} workers...")
+        with ProcessPoolExecutor(max_workers=workers) as pool:
+            futures = {pool.submit(load_pointcloud, s, **load_kwargs): i
+                       for i, s in enumerate(sources)}
+            done = 0
+            for future in as_completed(futures):
+                i = futures[future]
+                loaded[i] = future.result()
+                done += 1
+                if done % 10 == 0 or done == len(sources):
+                    print(f"  Loaded {done}/{len(sources)} tiles")
+
+        # --- Pre-compute coordinate transform params (once) ---
+        terrain = self._obj.data
+        try:
+            terrain = terrain.get()
+        except AttributeError:
+            terrain = np.asarray(terrain)
+
+        psx, psy = 1.0, 1.0
+        if 'x' in self._obj.coords and len(self._obj.coords['x']) > 1:
+            x_coords = self._obj.coords['x'].values
+            psx = abs(float(x_coords[1] - x_coords[0]))
+        if 'y' in self._obj.coords and len(self._obj.coords['y']) > 1:
+            y_coords = self._obj.coords['y'].values
+            psy = abs(float(y_coords[1] - y_coords[0]))
+
+        has_proj = psx != 1.0 or psy != 1.0
+        if has_proj:
+            x_origin = float(self._obj.coords['x'].values[0])
+            y_origin = float(self._obj.coords['y'].values[0])
+            y_ascending = (self._obj.coords['y'].values[-1]
+                           > self._obj.coords['y'].values[0])
+
+        # --- Phase 2: Sequential coord transform + GPU upload ---
+        results = []
+        total_points = 0
+        for i, (centers, attributes) in enumerate(loaded):
+            gid = f"{geometry_id_prefix}_{i}"
+
+            if len(centers) == 0:
+                results.append(
+                    {'num_points': 0, 'geometry_id': gid, 'bounds': None})
+                continue
+
+            # Coordinate conversion
+            if has_proj:
+                centers[:, 0] = centers[:, 0] - x_origin
+                if y_ascending:
+                    centers[:, 1] = centers[:, 1] - y_origin
+                else:
+                    centers[:, 1] = y_origin - centers[:, 1]
+
+            if snap_to_terrain:
+                for j in range(len(centers)):
+                    vx, vy = centers[j, 0], centers[j, 1]
+                    centers[j, 2] = self._bilinear_terrain_z(
+                        terrain, vx, vy, psx, psy)
+
+            point_colors = build_colors(
+                centers, attributes, color_mode=color, colormap=colormap)
+
+            radii = float(point_size) if np.isscalar(point_size) else \
+                np.asarray(point_size, dtype=np.float32)
+
+            res = self._rtx.add_sphere_geometry(
+                gid, centers.ravel(), radii,
+                colors=point_colors.ravel())
+            if res != 0:
+                raise RuntimeError(
+                    f"Failed to add sphere geometry '{gid}'")
+
+            self._geometry_colors[gid] = (0.5, 0.5, 0.5, 5.0)
+            self._geometry_colors_dirty = True
+
+            # Store attributes for interactive color mode cycling
+            self._pc_attributes[gid] = (centers.copy(), attributes)
+
+            # Store baked data for zarr caching and VE rescaling
+            n = len(centers)
+            radii_arr = (np.full(n, radii, dtype=np.float32)
+                         if np.isscalar(radii)
+                         else np.asarray(radii, dtype=np.float32))
+            vx, vy = centers[:, 0], centers[:, 1]
+            base_z = self._bilinear_terrain_z(terrain, vx, vy, psx, psy)
+            self._baked_meshes[gid] = (
+                centers.ravel().copy(), radii_arr.copy(),
+                point_colors.ravel().copy(), base_z)
+
+            total_points += n
+            results.append({
+                'num_points': n,
+                'geometry_id': gid,
+                'bounds': (
+                    float(centers[:, 0].min()),
+                    float(centers[:, 1].min()),
+                    float(centers[:, 2].min()),
+                    float(centers[:, 0].max()),
+                    float(centers[:, 1].max()),
+                    float(centers[:, 2].max()),
+                ),
+            })
+
+        print(f"Placed {total_points:,} points from {len(sources)} tiles")
+        return results
 
     _GEOJSON_PALETTE = [
         (0.90, 0.22, 0.20),  # red
@@ -1096,9 +1313,9 @@ class RTXAccessor:
         # Flat ribbon for LineStrings and Polygon outlines
         use_ribbon = not extrude
         if width is None:
-            width = (self._pixel_spacing_x + self._pixel_spacing_y) * 0.08
+            width = (self._pixel_spacing_x + self._pixel_spacing_y) * 0.04
         # Small hover above terrain; bilinear Z sampling keeps ribbons close
-        ribbon_hover = (self._pixel_spacing_x + self._pixel_spacing_y) * 0.01
+        ribbon_hover = (self._pixel_spacing_x + self._pixel_spacing_y) * 0.005
 
         # Fast path: load pre-computed merged mesh from cache
         if mesh_cache is not None and merge:
@@ -1550,11 +1767,8 @@ class RTXAccessor:
             GeoJSON FeatureCollection of building footprint polygons
             (e.g. from :func:`rtxpy.fetch_buildings`).
         elev_scale : float, optional
-            Factor applied to real-world heights so they match the scaled
-            terrain.  When *None* (default), auto-computed so that
-            ``default_height_m`` buildings are roughly 2× the pixel
-            spacing — ensuring they are always visible at the terrain's
-            native resolution.
+            Factor applied to real-world heights (metres).  Default is
+            1.0 (no scaling — heights match terrain z units directly).
         default_height_m : float, optional
             Height in metres used when a feature has no ``height`` property.
             Default is 8.0.
@@ -1573,10 +1787,7 @@ class RTXAccessor:
         from pathlib import Path as _CachePath
 
         if elev_scale is None:
-            avg_spacing = (self._pixel_spacing_x + self._pixel_spacing_y) / 2
-            # Buildings should be ~2× pixel spacing for visibility
-            target_height = avg_spacing * 1
-            elev_scale = max(1.0, target_height / default_height_m)
+            elev_scale = 1.0
 
         # Invalidate mesh cache if height parameters changed
         if mesh_cache is not None:
@@ -1661,7 +1872,7 @@ class RTXAccessor:
                 mesh_cache=mesh_cache,
             )
 
-    def place_water(self, geojson, body_height=0.5, mesh_cache_prefix=None):
+    def place_water(self, geojson, body_height=0.2, mesh_cache_prefix=None):
         """Classify and place water features as coloured geometry on terrain.
 
         Splits the GeoJSON into three categories based on the ``waterway``

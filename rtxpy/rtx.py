@@ -168,8 +168,10 @@ class _GeometryState:
         self.hf_tile_size = 32
         self.hf_num_tiles_x = 0
 
-        # Point cloud state
-        self.point_colors = None  # GPU buffer (cupy) for per-point RGBA colors
+        # Point cloud state — per-GAS colors keyed by geometry_id
+        self.point_colors_per_gas = {}  # {geometry_id: np.ndarray (N*4,)}
+        self.point_colors = None  # concatenated GPU buffer (built on demand)
+        self.point_color_offsets = None  # GPU int32 per-instance offsets
 
         # Device buffers for CPU->GPU transfers (per-instance)
         self.d_rays = None
@@ -202,7 +204,9 @@ class _GeometryState:
         self.hf_num_tiles_x = 0
 
         # Clear point cloud state
+        self.point_colors_per_gas = {}
         self.point_colors = None
+        self.point_color_offsets = None
 
         # Reset to single-GAS mode
         self.single_gas_mode = True
@@ -2408,10 +2412,13 @@ class RTX:
             is_sphere=True,
         )
 
-        # Store per-point colors if provided
+        # Store per-point colors for this GAS
         if colors is not None:
-            self._geom_state.point_colors = cupy.asarray(
-                colors, dtype=cupy.float32)
+            self._geom_state.point_colors_per_gas[geometry_id] = np.asarray(
+                colors, dtype=np.float32)
+            # Invalidate concatenated buffer so it gets rebuilt
+            self._geom_state.point_colors = None
+            self._geom_state.point_color_offsets = None
 
         self._geom_state.ias_dirty = True
         return 0
@@ -2477,6 +2484,46 @@ class RTX:
             Number of geometries (0 in single-GAS mode)
         """
         return len(self._geom_state.gas_entries)
+
+    def build_point_colors_gpu(self):
+        """Build concatenated per-point color buffer and per-instance offsets.
+
+        Returns (point_colors, point_color_offsets) as cupy arrays, or
+        (None, None) if no sphere geometries have per-point colors.
+
+        point_colors: (total_points * 4,) float32 — RGBA per point
+        point_color_offsets: (num_instances,) int32 — offset into
+            point_colors for each IAS instance (-1 = no per-point colors)
+        """
+        gs = self._geom_state
+        if not gs.point_colors_per_gas:
+            return None, None
+
+        # Return cached if still valid
+        if gs.point_colors is not None and gs.point_color_offsets is not None:
+            return gs.point_colors, gs.point_color_offsets
+
+        geom_ids = list(gs.gas_entries.keys())
+        n_instances = len(geom_ids)
+        offsets = np.full(n_instances, -1, dtype=np.int32)
+        parts = []
+        cumulative = 0
+
+        for i, gid in enumerate(geom_ids):
+            if gid in gs.point_colors_per_gas:
+                colors_flat = gs.point_colors_per_gas[gid]
+                n_points = len(colors_flat) // 4
+                offsets[i] = cumulative
+                parts.append(colors_flat)
+                cumulative += n_points
+
+        if not parts:
+            return None, None
+
+        all_colors = np.concatenate(parts)
+        gs.point_colors = cupy.asarray(all_colors, dtype=cupy.float32)
+        gs.point_color_offsets = cupy.asarray(offsets, dtype=cupy.int32)
+        return gs.point_colors, gs.point_color_offsets
 
     def has_geometry(self, geometry_id: str) -> bool:
         """

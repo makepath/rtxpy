@@ -33,7 +33,8 @@ CLASSIFICATION_COLORS = {
 
 
 def load_pointcloud(source, classification=None, returns=None,
-                    bounds=None, subsample=1, max_points=None):
+                    bounds=None, subsample=1, max_points=None,
+                    thin=None):
     """
     Load a point cloud from a file path or numpy array.
 
@@ -46,6 +47,9 @@ def load_pointcloud(source, classification=None, returns=None,
         returns: Optional 'first', 'last', or 'all' to filter by return number.
         bounds: Optional (xmin, ymin, xmax, ymax) spatial crop.
         subsample: Keep every Nth point (default 1 = all).
+        thin: Grid cell size for spatial thinning (in source CRS units,
+            typically metres). Keeps one point per XY grid cell, removing
+            density striations from overlapping flight lines. None disables.
         max_points: Maximum number of points to keep (random sample if exceeded).
 
     Returns:
@@ -103,6 +107,16 @@ def load_pointcloud(source, classification=None, returns=None,
     if subsample > 1:
         centers = centers[::subsample]
         attributes = {k: v[::subsample] for k, v in attributes.items()}
+
+    # Spatial grid thinning — one point per XY cell
+    if thin is not None and thin > 0 and len(centers) > 0:
+        cell_x = (centers[:, 0] / thin).astype(np.int64)
+        cell_y = (centers[:, 1] / thin).astype(np.int64)
+        cell_keys = cell_x + cell_y * 2_000_000_003  # large prime avoids collisions
+        _, keep = np.unique(cell_keys, return_index=True)
+        keep.sort()
+        centers = centers[keep]
+        attributes = {k: v[keep] for k, v in attributes.items()}
 
     # Cap total points
     if max_points is not None and len(centers) > max_points:

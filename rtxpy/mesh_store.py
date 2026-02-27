@@ -55,7 +55,7 @@ def chunks_for_pixel_window(yi0, yi1, xi0, xi1, chunk_h, chunk_w):
 
 def save_meshes_to_zarr(zarr_path, meshes, colors, pixel_spacing,
                         elevation_shape, elevation_chunks,
-                        curves=None):
+                        curves=None, spheres=None):
     """Save mesh geometries into a zarr store, spatially partitioned by chunk.
 
     Parameters
@@ -76,6 +76,9 @@ def save_meshes_to_zarr(zarr_path, meshes, colors, pixel_spacing,
     curves : dict, optional
         ``{geometry_id: (vertices_flat, widths_flat, indices_flat)}`` for
         B-spline curve tube geometries (roads, water features).
+    spheres : dict, optional
+        ``{geometry_id: (centers_flat, radii, colors_flat)}`` for sphere
+        primitive geometries (LiDAR point clouds).
     """
     store = zarr.open(str(zarr_path), mode='r+')
 
@@ -216,7 +219,38 @@ def save_meshes_to_zarr(zarr_path, meshes, colors, pixel_spacing,
                     chunks=(len(local_indices),),
                 )
 
-    total = len(meshes) + (len(curves) if curves else 0)
+    # --- Sphere geometries (point clouds) ---
+    if spheres:
+        for gid, (centers, radii, sph_colors) in spheres.items():
+            centers = np.asarray(centers, dtype=np.float32)
+            radii = np.asarray(radii, dtype=np.float32)
+            sph_colors = np.asarray(sph_colors, dtype=np.float32)
+
+            gg = mg.create_group(gid)
+            c = colors.get(gid, (0.5, 0.5, 0.5, 5.0))
+            gg.attrs['color'] = list(c)
+            gg.attrs['type'] = 'sphere'
+
+            if len(centers) == 0:
+                continue
+
+            # Single chunk per geometry (already spatially partitioned by tile)
+            chunk_grp = gg.create_group('0_0')
+            chunk_grp.create_array(
+                'centers', data=centers,
+                chunks=(len(centers),),
+            )
+            chunk_grp.create_array(
+                'radii', data=radii,
+                chunks=(len(radii),),
+            )
+            chunk_grp.create_array(
+                'colors', data=sph_colors,
+                chunks=(len(sph_colors),),
+            )
+
+    total = len(meshes) + (len(curves) if curves else 0) + \
+        (len(spheres) if spheres else 0)
     print(f"Saved {total} mesh geometries to {zarr_path}/meshes/")
 
 
@@ -242,6 +276,9 @@ def load_meshes_from_zarr(zarr_path, chunks=None):
     curves : dict
         ``{geometry_id: (vertices_flat, widths_flat, indices_flat)}`` for
         curve geometries.  Empty dict if none stored.
+    spheres : dict
+        ``{geometry_id: (centers_flat, radii, colors_flat)}`` for sphere
+        primitive geometries.  Empty dict if none stored.
     """
     store = zarr.open(str(zarr_path), mode='r', use_consolidated=False)
     mg = store['meshes']
@@ -259,6 +296,7 @@ def load_meshes_from_zarr(zarr_path, chunks=None):
 
     meshes = {}
     curves = {}
+    spheres = {}
     colors = {}
 
     for gid in mg:
@@ -266,7 +304,45 @@ def load_meshes_from_zarr(zarr_path, chunks=None):
         if not hasattr(gg, 'attrs'):
             continue
         colors[gid] = tuple(gg.attrs.get('color', (0.6, 0.6, 0.6)))
-        is_curve = gg.attrs.get('type', '') == 'curve'
+        geom_type = gg.attrs.get('type', '')
+        is_curve = geom_type == 'curve'
+        is_sphere = geom_type == 'sphere'
+
+        if is_sphere:
+            # Sphere geometry: concatenate centers/radii/colors across chunks
+            all_centers = []
+            all_radii = []
+            all_colors = []
+            for key in sorted(gg):
+                if key in ('centers', 'radii', 'colors'):
+                    continue
+                if chunk_set is not None and key not in chunk_set:
+                    continue
+                cg = gg[key]
+                if 'centers' in cg:
+                    all_centers.append(
+                        np.array(cg['centers'], dtype=np.float32))
+                if 'radii' in cg:
+                    all_radii.append(
+                        np.array(cg['radii'], dtype=np.float32))
+                if 'colors' in cg:
+                    all_colors.append(
+                        np.array(cg['colors'], dtype=np.float32))
+
+            if all_centers:
+                spheres[gid] = (
+                    np.concatenate(all_centers),
+                    np.concatenate(all_radii),
+                    np.concatenate(all_colors) if all_colors else
+                    np.empty(0, dtype=np.float32),
+                )
+            else:
+                spheres[gid] = (
+                    np.empty(0, dtype=np.float32),
+                    np.empty(0, dtype=np.float32),
+                    np.empty(0, dtype=np.float32),
+                )
+            continue
 
         all_verts = []
         all_widths = []
@@ -311,4 +387,4 @@ def load_meshes_from_zarr(zarr_path, chunks=None):
                 meshes[gid] = (np.empty(0, dtype=np.float32),
                                np.empty(0, dtype=np.int32))
 
-    return meshes, colors, meta, curves
+    return meshes, colors, meta, curves, spheres
