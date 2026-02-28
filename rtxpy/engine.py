@@ -19,6 +19,16 @@ if os.name != 'nt' and 'microsoft' in os.uname().release.lower():
 from typing import Optional, Tuple
 
 from .rtx import RTX, has_cupy
+from .viewer.input_state import InputState
+from .viewer.camera import CameraState
+from .viewer.render_settings import RenderSettings
+from .viewer.overlays import OverlayManager
+from .viewer.geometry_layers import GeometryLayerManager
+from .viewer.terrain import TerrainState
+from .viewer.observers import ObserverManager, Observer, OBSERVER_COLORS
+from .viewer.wind import WindState
+from .viewer.hud import HUDState
+from .viewer.keybindings import MOVEMENT_KEYS, SHIFT_BINDINGS, KEY_BINDINGS, SPECIAL_BINDINGS
 
 if has_cupy:
     import cupy as cp
@@ -200,62 +210,7 @@ def _glfw_to_key(glfw_key, mods):
     return '', ''
 
 
-# ---------------------------------------------------------------------------
-# Multi-observer system — up to 8 independent observers with drone/tour
-# ---------------------------------------------------------------------------
-
-OBSERVER_COLORS = [
-    (1.0, 0.2, 0.2),   # 1: red
-    (0.2, 0.6, 1.0),   # 2: blue
-    (0.2, 1.0, 0.3),   # 3: green
-    (1.0, 0.8, 0.1),   # 4: yellow
-    (1.0, 0.4, 0.0),   # 5: orange
-    (0.8, 0.2, 1.0),   # 6: purple
-    (0.0, 1.0, 0.9),   # 7: cyan
-    (1.0, 0.5, 0.7),   # 8: pink
-]
-
-
-class Observer:
-    """State for a single observer slot (1-8)."""
-
-    __slots__ = (
-        'slot', 'position', 'observer_elev', 'drone_mode', 'drone_placed',
-        'yaw', 'pitch', 'saved_camera', 'tour_thread', 'tour_stop',
-        'viewshed_enabled', 'viewshed_cache',
-    )
-
-    def __init__(self, slot, position, observer_elev=0.05):
-        self.slot = slot
-        self.position = position          # (x, y) world coords
-        self.observer_elev = observer_elev
-        self.drone_mode = 'off'           # 'off' | '3rd' | 'fpv'
-        self.drone_placed = False
-        self.yaw = 0.0
-        self.pitch = 0.0
-        self.saved_camera = None          # (position, yaw, pitch)
-        self.tour_thread = None
-        self.tour_stop = threading.Event()
-        self.viewshed_enabled = False
-        self.viewshed_cache = None
-
-    @property
-    def color(self):
-        return OBSERVER_COLORS[(self.slot - 1) % len(OBSERVER_COLORS)]
-
-    def geometry_id(self, part_idx):
-        """Unique geometry ID for a drone sub-mesh, e.g. '_observer3_2'."""
-        return f'_observer{self.slot}_{part_idx}'
-
-    def is_touring(self):
-        return (self.tour_thread is not None and self.tour_thread.is_alive())
-
-    def stop_tour(self):
-        self.tour_stop.set()
-        if self.tour_thread is not None:
-            self.tour_thread.join(timeout=2.0)
-            self.tour_thread = None
-        self.tour_stop.clear()
+# Observer and OBSERVER_COLORS imported from viewer.observers
 
 
 def _bilinear_terrain_z(terrain, vx, vy, psx, psy):
@@ -1171,7 +1126,13 @@ class InteractiveViewer:
                 "Install with: conda install -c conda-forge cupy"
             )
 
-        self.raster = raster
+        # Terrain state (raster, spacing, elevation stats, mesh caches)
+        self.terrain = TerrainState(
+            raster, pixel_spacing_x=pixel_spacing_x,
+            pixel_spacing_y=pixel_spacing_y, mesh_type=mesh_type,
+            subsample=subsample,
+        )
+
         self.rtx = rtx
         self.width = width
         self.height = height
@@ -1179,29 +1140,17 @@ class InteractiveViewer:
         self.render_width = int(width * self.render_scale)
         self.render_height = int(height * self.render_scale)
 
-        # Pixel spacing for coordinate conversion (world coords -> pixel indices)
-        self.pixel_spacing_x = pixel_spacing_x
-        self.pixel_spacing_y = pixel_spacing_y
-        self.mesh_type = mesh_type
-
-        # Dynamic resolution state — preserve originals for subsampling
-        self._base_raster = raster
-        self._base_pixel_spacing_x = pixel_spacing_x
-        self._base_pixel_spacing_y = pixel_spacing_y
-        self._base_overlay_layers = overlay_layers.copy() if overlay_layers else {}
-        self.subsample_factor = max(1, int(subsample))
-        self._terrain_mesh_cache = {}  # (factor, mesh_type) -> (verts_base, indices, terrain_np)
-        self._baked_mesh_cache = {}   # (factor, geom_id) -> (scaled_v, orig_idx)
-        self._chunk_manager = None    # set by explore() when scene_zarr provided
-
-        # GPU terrain cache for accelerated mesh Z re-snapping
-        self._gpu_terrain = None       # CuPy array of current (subsampled) terrain
-        self._gpu_base_terrain = None  # CuPy array of full-res terrain (stable)
-
         # Async readback: non-blocking stream + pinned host buffer
         self._readback_stream = cp.cuda.Stream(non_blocking=True)
         self._pinned_mem = None
         self._pinned_frame = None
+
+        # Overlay layers and basemap state (must be created before subsample code)
+        _base_ovl = overlay_layers.copy() if overlay_layers else {}
+        self.overlays = OverlayManager(
+            overlay_layers=overlay_layers,
+            base_overlay_layers=_base_ovl,
+        )
 
         # Apply initial subsample to the working raster
         if self.subsample_factor > 1:
@@ -1219,54 +1168,15 @@ class InteractiveViewer:
                 }
                 self._overlay_names = list(self._overlay_layers.keys())
 
-        # Color stretch cycling (Y key)
-        self._color_stretches = ['linear', 'sqrt', 'cbrt', 'log']
-        self._color_stretch_idx = 0
-
-        # Vertical exaggeration (Z / Shift+Z)
-        self.vertical_exaggeration = 1.0
-
-        # Overlay layers for Dataset variable cycling (G key)
-        # Dict of {name: 2D cupy/numpy array} — colormap data alternatives
-        self._overlay_layers = overlay_layers or {}
-        self._overlay_names = list(self._overlay_layers.keys())
-        self._active_color_data = None  # None = use elevation_data
-        self._active_overlay_data = None  # Transparent overlay on top of base
-        self._overlay_alpha = 0.7  # Overlay blending alpha (0=base only, 1=overlay only)
-        self._overlay_as_water = False  # True when flood layer renders as water
-
-        # Independent terrain color cycling (G key): elevation + overlay names
-        self._terrain_layer_order = ['elevation'] + list(self._overlay_names)
-        self._terrain_layer_idx = 0
-
-        # Independent basemap cycling (U key)
-        self._basemap_options = ['none', 'satellite', 'osm']
-        self._basemap_idx = 0
-
-        # Title / name for display
-        if title:
-            self._title = title
-        elif hasattr(raster, 'name') and raster.name:
-            self._title = str(raster.name)
-        else:
-            self._title = 'rtxpy'
-
-        # GAS layer visibility tracking
-        self._all_geometries = []
-        self._layer_positions = {}  # layer_name -> [(x, y, z, geometry_id), ...]
-        self._current_geom_idx = 0  # Current geometry index within active layer
-
-        # Independent geometry cycling (N key): none → all → sorted groups
-        self._geometry_layer_order = ['none', 'all']
+        # Geometry layer visibility tracking
+        self.geometry_layers = GeometryLayerManager()
 
         if rtx is not None:
             self._all_geometries = rtx.list_geometries()
-            # Group geometries by prefix (e.g., 'tower_0', 'tower_1' -> 'tower')
             groups = set()
-            layer_geoms = {}  # layer_name -> [geometry_ids]
+            layer_geoms = {}
 
             for g in self._all_geometries:
-                # Extract base name (before _N suffix if present)
                 parts = g.rsplit('_', 1)
                 if len(parts) == 2 and parts[1].isdigit():
                     base_name = parts[0]
@@ -1281,118 +1191,36 @@ class InteractiveViewer:
 
             self._geometry_layer_order.extend(sorted(groups))
 
-            # Extract positions from transforms for each layer
             for layer_name, geom_ids in layer_geoms.items():
                 positions = []
-                for geom_id in sorted(geom_ids):  # Sort for consistent ordering
+                for geom_id in sorted(geom_ids):
                     transform = rtx.get_geometry_transform(geom_id)
                     if transform:
-                        # Position is at indices 3, 7, 11 (Tx, Ty, Tz)
                         x, y, z = transform[3], transform[7], transform[11]
                         positions.append((x, y, z, geom_id))
                 self._layer_positions[layer_name] = positions
 
-        # Camera state
-        self.position = None
-        self.yaw = 90.0      # Degrees, 0 = +X, 90 = +Y
-        self.pitch = -15.0   # Degrees, negative = looking down
-        self.move_speed = None  # Set in run() based on terrain extent
-        self.look_speed = 5.0
+        # Camera state (position, orientation, FOV, speed, time presets)
+        self.camera = CameraState()
 
-        # Rendering settings
-        self.fov = 60.0
-        self._time_presets = [
-            ('Morning',     135.0, 25.0),
-            ('Midday',      180.0, 65.0),
-            ('Afternoon',   225.0, 35.0),
-            ('Golden Hour', 270.0, 12.0),
-            ('Sunset',      280.0,  3.0),
-        ]
-        self._time_preset_idx = 2  # Afternoon (default)
-        self.sun_azimuth = 225.0
-        self.sun_altitude = 35.0
-        self.shadows = True
-        self.ambient = 0.2
-        self.colormap = 'gray'
-        self.colormaps = ['gray', 'terrain', 'viridis', 'plasma', 'cividis']
-        self.colormap_idx = 0
-        self.color_stretch = 'linear'
+        # Rendering settings (lighting, colormap, AO, denoiser, DOF)
+        self.render_settings = RenderSettings()
 
-        # Ambient occlusion state
-        self.ao_enabled = True
-        self.ao_radius = None  # auto-computed from scene extent
-        self.gi_intensity = 2.0  # GI bounce intensity multiplier
-        self.gi_bounces = 1  # Number of GI bounces (1=single, 2-3=multi)
-        self._ao_samples_per_frame = 4  # AO rays per pixel per frame
-        self._ao_max_frames = 32  # stop accumulating after this many frames
-        self._ao_frame_count = 0
-        self._d_ao_accum = None  # GPU accumulation buffer (H, W, 3) float32
-        self._prev_cam_state = None  # (position_tuple, yaw, pitch, fov) for dirty detection
+        # Observer system (viewshed, drones, multi-observer)
+        self.observer_mgr = ObserverManager()
 
-        # Eye Dome Lighting state
-        self.edl_enabled = True
-
-        # Denoiser state
-        self.denoise_enabled = True
-        self._prev_cam_for_flow = None  # (pos, forward, right, up, aspect, fov_scale) from prev frame
-        self._d_flow = None  # (H, W, 2) float32 motion vectors
-
-        # Depth of field state
-        self.dof_enabled = False
-        self._dof_aperture = 20.0  # lens radius in scene units
-        self._dof_focal_distance = 1000.0  # focal plane distance (= look_at distance)
-
-        # Point cloud color mode cycling
-        self._pc_color_modes = ['elevation', 'intensity', 'classification', 'rgb']
-        self._pc_color_mode_idx = 0
-
-        # Tile overlay settings
-        self._tile_service = None
-        self._tiles_enabled = False
-        self._geometry_layer_idx = 1  # Start at 'all'
-
-        # Viewshed settings
-        self.viewshed_enabled = False
-        self.viewshed_observer_elev = 0.05  # Default ~2m at 0.025× scale
-        self.viewshed_target_elev = 0.0
-        self.viewshed_opacity = 0.35
-        self._viewshed_cache = None  # Cached viewshed result
-        self._viewshed_coverage = 0.0  # Percentage of terrain visible
-        self._viewshed_recalc_interval = 0.4  # Seconds between dynamic recalcs
-        self._last_viewshed_time = 0.0  # Timestamp of last viewshed calc
-        # Multi-observer system (up to 8 independent observers)
-        self._observers = {}              # dict[int, Observer] — slot 1-8
-        self._active_observer = None      # int (slot 1-8) or None
-        self._shared_drone_parts = None   # loaded once from drone.glb, shared by all
+        # HUD state (title, subtitle, legend, help, minimap)
+        _hud_title = title
+        if not _hud_title:
+            if hasattr(raster, 'name') and raster.name:
+                _hud_title = str(raster.name)
+            else:
+                _hud_title = 'rtxpy'
+        self.hud = HUDState(title=_hud_title, subtitle=subtitle, legend=legend)
 
         # State
         self.running = False
-        self._help_page_idx = 0  # -1 = off, 0..N-1 = page index
-        self.show_minimap = True
         self.frame_count = 0
-        self._last_title = None
-        self._last_subtitle = None
-
-        # Minimap state (initialized in run() via _compute_minimap_background)
-        self._minimap_background = None
-        self._minimap_scale_x = 1.0
-        self._minimap_scale_y = 1.0
-        self._minimap_has_tiles = False
-        self._minimap_rect = None  # (x0, y0, w, h) in frame coords
-        self._minimap_style = None  # 'cyberpunk' for neon edge outline
-        self._minimap_layer = None  # overlay layer name for minimap coloring
-        self._minimap_colors = None  # {value: (r,g,b)} categorical color map
-        self._drone_glow = False
-
-        # Help text cache (list of pre-rendered RGBA page arrays via PIL)
-        self._help_pages = []
-
-        # Title / subtitle overlay (pre-rendered RGBA numpy array via PIL)
-        self._subtitle = subtitle
-        self._legend_config = legend
-        self._info_text = None  # Optional info blurb (appended to help pages)
-        self._title_overlay_rgba = None
-        self._legend_rgba = None
 
         # FIRMS fire layer state
         self._accessor = None         # RTX accessor for place_geojson
@@ -1400,29 +1228,7 @@ class InteractiveViewer:
         self._firms_visible = False   # Current visibility state
 
         # Wind particle state
-        self._wind_data = None        # Raw wind dict from fetch_wind()
-        self._wind_enabled = False
-        self._wind_u_px = None        # (H, W) U component in pixels/tick
-        self._wind_v_px = None        # (H, W) V component in pixels/tick
-        self._wind_particles = None   # (N, 2) particle positions in pixel coords (row, col)
-        self._wind_ages = None        # (N,) age in ticks
-        self._wind_max_age = 80       # Max lifetime before respawn
-        self._wind_n_particles = 10000
-        self._wind_trail_len = 20     # Number of trail positions to keep
-        self._wind_trails = None      # (N, trail_len, 2) ring buffer of past positions
-        self._wind_speed_mult = 250.0  # Velocity exaggeration for visibility
-        self._wind_min_depth = 0.0    # Min camera distance to render (set in _init_wind)
-        self._wind_dot_radius = 2     # Radius of each particle dot in screen pixels
-        self._wind_alpha = 0.055      # Per-pixel alpha for particle dots
-        self._wind_min_visible_age = 6  # Ticks before particle becomes visible (builds trail first)
-        self._wind_terrain_np = None  # Cached CPU terrain for wind Z lookup
-
-        # GPU wind splatting buffers
-        self._d_wind_trails = None    # (N*T, 2) float32 GPU buffer
-        self._d_wind_alpha = None     # (N*T,) float32 GPU buffer
-        self._d_base_frame = None     # (H, W, 3) float32 — post-processed frame before wind
-        self._d_wind_scratch = None   # (H, W, 3) float32 — scratch for idle replay
-        self._wind_done_event = None  # CUDA event for stream sync
+        self.wind = WindState()
 
         # GTFS-RT realtime vehicle overlay state
         self._gtfs_rt_url = None
@@ -1436,8 +1242,8 @@ class InteractiveViewer:
         self._gtfs_rt_dot_radius = 4        # Screen pixels per vehicle dot
         self._gtfs_rt_alpha = 0.85          # Dot alpha
 
-        # Held keys tracking for smooth simultaneous input
-        self._held_keys = set()
+        # Input state (held keys, mouse drag)
+        self.input = InputState()
 
         # GLFW window handle (set in run())
         self._glfw_window = None
@@ -1458,19 +1264,7 @@ class InteractiveViewer:
         self._last_tick_time = 0.0  # set in run()
         self._dt_scale = 1.0  # multiplier: actual_dt / reference_dt(0.05)
 
-        # Mouse drag state for slippy-map panning
-        self._mouse_dragging = False
-        self._mouse_last_x = None
-        self._mouse_last_y = None
-
-        # Dynamic terrain loading (zarr streaming)
-        self._terrain_loader = None          # callback: (lon, lat) → xr.DataArray
-        self._coord_origin_x = 0.0           # lon of pixel (0,0) in current window
-        self._coord_origin_y = 0.0           # lat of pixel (0,0)
-        self._coord_step_x = 1.0             # lon step per pixel
-        self._coord_step_y = -1.0            # lat step per pixel (negative = southward)
-        self._reload_cooldown = 2.0          # min seconds between reloads
-        self._last_reload_time = 0.0
+        # Mouse drag state lives in self.input (InputState)
 
         # Derive coordinate metadata from raster coords if available
         if hasattr(raster, 'x') and hasattr(raster, 'y') and len(raster.x) > 1:
@@ -1607,52 +1401,1113 @@ class InteractiveViewer:
                 rtx.add_geometry('terrain', verts, idxs,
                                  grid_dims=(H, W))
 
+    # ------------------------------------------------------------------
+    # Delegation properties — InputState
+    # ------------------------------------------------------------------
+
+    @property
+    def _held_keys(self):
+        return self.input.held_keys
+
+    @_held_keys.setter
+    def _held_keys(self, value):
+        self.input.held_keys = value
+
+    @property
+    def _mouse_dragging(self):
+        return self.input.mouse_dragging
+
+    @_mouse_dragging.setter
+    def _mouse_dragging(self, value):
+        self.input.mouse_dragging = value
+
+    @property
+    def _mouse_last_x(self):
+        return self.input.mouse_last_x
+
+    @_mouse_last_x.setter
+    def _mouse_last_x(self, value):
+        self.input.mouse_last_x = value
+
+    @property
+    def _mouse_last_y(self):
+        return self.input.mouse_last_y
+
+    @_mouse_last_y.setter
+    def _mouse_last_y(self, value):
+        self.input.mouse_last_y = value
+
+    # ------------------------------------------------------------------
+    # Delegation properties — CameraState
+    # ------------------------------------------------------------------
+
+    @property
+    def position(self):
+        return self.camera.position
+
+    @position.setter
+    def position(self, value):
+        self.camera.position = value
+
+    @property
+    def yaw(self):
+        return self.camera.yaw
+
+    @yaw.setter
+    def yaw(self, value):
+        self.camera.yaw = value
+
+    @property
+    def pitch(self):
+        return self.camera.pitch
+
+    @pitch.setter
+    def pitch(self, value):
+        self.camera.pitch = value
+
+    @property
+    def fov(self):
+        return self.camera.fov
+
+    @fov.setter
+    def fov(self, value):
+        self.camera.fov = value
+
+    @property
+    def move_speed(self):
+        return self.camera.move_speed
+
+    @move_speed.setter
+    def move_speed(self, value):
+        self.camera.move_speed = value
+
+    @property
+    def look_speed(self):
+        return self.camera.look_speed
+
+    @look_speed.setter
+    def look_speed(self, value):
+        self.camera.look_speed = value
+
+    @property
+    def _time_presets(self):
+        return self.camera._time_presets
+
+    @property
+    def _time_preset_idx(self):
+        return self.camera._time_preset_idx
+
+    @_time_preset_idx.setter
+    def _time_preset_idx(self, value):
+        self.camera._time_preset_idx = value
+
+    # ------------------------------------------------------------------
+    # Delegation properties — RenderSettings
+    # ------------------------------------------------------------------
+
+    @property
+    def shadows(self):
+        return self.render_settings.shadows
+
+    @shadows.setter
+    def shadows(self, value):
+        self.render_settings.shadows = value
+
+    @property
+    def ambient(self):
+        return self.render_settings.ambient
+
+    @ambient.setter
+    def ambient(self, value):
+        self.render_settings.ambient = value
+
+    @property
+    def sun_azimuth(self):
+        return self.render_settings.sun_azimuth
+
+    @sun_azimuth.setter
+    def sun_azimuth(self, value):
+        self.render_settings.sun_azimuth = value
+
+    @property
+    def sun_altitude(self):
+        return self.render_settings.sun_altitude
+
+    @sun_altitude.setter
+    def sun_altitude(self, value):
+        self.render_settings.sun_altitude = value
+
+    @property
+    def colormap(self):
+        return self.render_settings.colormap
+
+    @colormap.setter
+    def colormap(self, value):
+        self.render_settings.colormap = value
+
+    @property
+    def colormaps(self):
+        return self.render_settings.colormaps
+
+    @property
+    def colormap_idx(self):
+        return self.render_settings.colormap_idx
+
+    @colormap_idx.setter
+    def colormap_idx(self, value):
+        self.render_settings.colormap_idx = value
+
+    @property
+    def color_stretch(self):
+        return self.render_settings.color_stretch
+
+    @color_stretch.setter
+    def color_stretch(self, value):
+        self.render_settings.color_stretch = value
+
+    @property
+    def _color_stretches(self):
+        return self.render_settings._color_stretches
+
+    @property
+    def _color_stretch_idx(self):
+        return self.render_settings._color_stretch_idx
+
+    @_color_stretch_idx.setter
+    def _color_stretch_idx(self, value):
+        self.render_settings._color_stretch_idx = value
+
+    @property
+    def ao_enabled(self):
+        return self.render_settings.ao_enabled
+
+    @ao_enabled.setter
+    def ao_enabled(self, value):
+        self.render_settings.ao_enabled = value
+
+    @property
+    def ao_radius(self):
+        return self.render_settings.ao_radius
+
+    @ao_radius.setter
+    def ao_radius(self, value):
+        self.render_settings.ao_radius = value
+
+    @property
+    def gi_intensity(self):
+        return self.render_settings.gi_intensity
+
+    @gi_intensity.setter
+    def gi_intensity(self, value):
+        self.render_settings.gi_intensity = value
+
+    @property
+    def gi_bounces(self):
+        return self.render_settings.gi_bounces
+
+    @gi_bounces.setter
+    def gi_bounces(self, value):
+        self.render_settings.gi_bounces = value
+
+    @property
+    def _ao_samples_per_frame(self):
+        return self.render_settings._ao_samples_per_frame
+
+    @property
+    def _ao_max_frames(self):
+        return self.render_settings._ao_max_frames
+
+    @property
+    def _ao_frame_count(self):
+        return self.render_settings._ao_frame_count
+
+    @_ao_frame_count.setter
+    def _ao_frame_count(self, value):
+        self.render_settings._ao_frame_count = value
+
+    @property
+    def _d_ao_accum(self):
+        return self.render_settings._d_ao_accum
+
+    @_d_ao_accum.setter
+    def _d_ao_accum(self, value):
+        self.render_settings._d_ao_accum = value
+
+    @property
+    def _prev_cam_state(self):
+        return self.render_settings._prev_cam_state
+
+    @_prev_cam_state.setter
+    def _prev_cam_state(self, value):
+        self.render_settings._prev_cam_state = value
+
+    @property
+    def edl_enabled(self):
+        return self.render_settings.edl_enabled
+
+    @edl_enabled.setter
+    def edl_enabled(self, value):
+        self.render_settings.edl_enabled = value
+
+    @property
+    def denoise_enabled(self):
+        return self.render_settings.denoise_enabled
+
+    @denoise_enabled.setter
+    def denoise_enabled(self, value):
+        self.render_settings.denoise_enabled = value
+
+    @property
+    def _prev_cam_for_flow(self):
+        return self.render_settings._prev_cam_for_flow
+
+    @_prev_cam_for_flow.setter
+    def _prev_cam_for_flow(self, value):
+        self.render_settings._prev_cam_for_flow = value
+
+    @property
+    def _d_flow(self):
+        return self.render_settings._d_flow
+
+    @_d_flow.setter
+    def _d_flow(self, value):
+        self.render_settings._d_flow = value
+
+    @property
+    def dof_enabled(self):
+        return self.render_settings.dof_enabled
+
+    @dof_enabled.setter
+    def dof_enabled(self, value):
+        self.render_settings.dof_enabled = value
+
+    @property
+    def _dof_aperture(self):
+        return self.render_settings._dof_aperture
+
+    @_dof_aperture.setter
+    def _dof_aperture(self, value):
+        self.render_settings._dof_aperture = value
+
+    @property
+    def _dof_focal_distance(self):
+        return self.render_settings._dof_focal_distance
+
+    @_dof_focal_distance.setter
+    def _dof_focal_distance(self, value):
+        self.render_settings._dof_focal_distance = value
+
+    # ------------------------------------------------------------------
+    # Delegation properties — OverlayManager
+    # ------------------------------------------------------------------
+
+    @property
+    def _overlay_layers(self):
+        return self.overlays.overlay_layers
+
+    @_overlay_layers.setter
+    def _overlay_layers(self, value):
+        self.overlays.overlay_layers = value
+
+    @property
+    def _overlay_names(self):
+        return self.overlays.overlay_names
+
+    @_overlay_names.setter
+    def _overlay_names(self, value):
+        self.overlays.overlay_names = value
+
+    @property
+    def _active_color_data(self):
+        return self.overlays.active_color_data
+
+    @_active_color_data.setter
+    def _active_color_data(self, value):
+        self.overlays.active_color_data = value
+
+    @property
+    def _active_overlay_data(self):
+        return self.overlays.active_overlay_data
+
+    @_active_overlay_data.setter
+    def _active_overlay_data(self, value):
+        self.overlays.active_overlay_data = value
+
+    @property
+    def _overlay_alpha(self):
+        return self.overlays.overlay_alpha
+
+    @_overlay_alpha.setter
+    def _overlay_alpha(self, value):
+        self.overlays.overlay_alpha = value
+
+    @property
+    def _overlay_as_water(self):
+        return self.overlays.overlay_as_water
+
+    @_overlay_as_water.setter
+    def _overlay_as_water(self, value):
+        self.overlays.overlay_as_water = value
+
+    @property
+    def _terrain_layer_order(self):
+        return self.overlays.terrain_layer_order
+
+    @_terrain_layer_order.setter
+    def _terrain_layer_order(self, value):
+        self.overlays.terrain_layer_order = value
+
+    @property
+    def _terrain_layer_idx(self):
+        return self.overlays.terrain_layer_idx
+
+    @_terrain_layer_idx.setter
+    def _terrain_layer_idx(self, value):
+        self.overlays.terrain_layer_idx = value
+
+    @property
+    def _base_overlay_layers(self):
+        return self.overlays.base_overlay_layers
+
+    @_base_overlay_layers.setter
+    def _base_overlay_layers(self, value):
+        self.overlays.base_overlay_layers = value
+
+    @property
+    def _tile_service(self):
+        return self.overlays.tile_service
+
+    @_tile_service.setter
+    def _tile_service(self, value):
+        self.overlays.tile_service = value
+
+    @property
+    def _tiles_enabled(self):
+        return self.overlays.tiles_enabled
+
+    @_tiles_enabled.setter
+    def _tiles_enabled(self, value):
+        self.overlays.tiles_enabled = value
+
+    @property
+    def _basemap_options(self):
+        return self.overlays.basemap_options
+
+    @property
+    def _basemap_idx(self):
+        return self.overlays.basemap_idx
+
+    @_basemap_idx.setter
+    def _basemap_idx(self, value):
+        self.overlays.basemap_idx = value
+
+    # ------------------------------------------------------------------
+    # Delegation properties — HUDState
+    # ------------------------------------------------------------------
+
+    @property
+    def _title(self):
+        return self.hud.title
+
+    @_title.setter
+    def _title(self, value):
+        self.hud.title = value
+
+    @property
+    def _subtitle(self):
+        return self.hud.subtitle
+
+    @_subtitle.setter
+    def _subtitle(self, value):
+        self.hud.subtitle = value
+
+    @property
+    def _legend_config(self):
+        return self.hud.legend_config
+
+    @_legend_config.setter
+    def _legend_config(self, value):
+        self.hud.legend_config = value
+
+    @property
+    def _info_text(self):
+        return self.hud.info_text
+
+    @_info_text.setter
+    def _info_text(self, value):
+        self.hud.info_text = value
+
+    @property
+    def _title_overlay_rgba(self):
+        return self.hud.title_overlay_rgba
+
+    @_title_overlay_rgba.setter
+    def _title_overlay_rgba(self, value):
+        self.hud.title_overlay_rgba = value
+
+    @property
+    def _legend_rgba(self):
+        return self.hud.legend_rgba
+
+    @_legend_rgba.setter
+    def _legend_rgba(self, value):
+        self.hud.legend_rgba = value
+
+    @property
+    def _help_page_idx(self):
+        return self.hud.help_page_idx
+
+    @_help_page_idx.setter
+    def _help_page_idx(self, value):
+        self.hud.help_page_idx = value
+
+    @property
+    def _help_pages(self):
+        return self.hud.help_pages
+
+    @_help_pages.setter
+    def _help_pages(self, value):
+        self.hud.help_pages = value
+
+    @property
+    def show_minimap(self):
+        return self.hud.show_minimap
+
+    @show_minimap.setter
+    def show_minimap(self, value):
+        self.hud.show_minimap = value
+
+    @property
+    def _last_title(self):
+        return self.hud.last_title
+
+    @_last_title.setter
+    def _last_title(self, value):
+        self.hud.last_title = value
+
+    @property
+    def _last_subtitle(self):
+        return self.hud.last_subtitle
+
+    @_last_subtitle.setter
+    def _last_subtitle(self, value):
+        self.hud.last_subtitle = value
+
+    @property
+    def _minimap_background(self):
+        return self.hud.minimap_background
+
+    @_minimap_background.setter
+    def _minimap_background(self, value):
+        self.hud.minimap_background = value
+
+    @property
+    def _minimap_scale_x(self):
+        return self.hud.minimap_scale_x
+
+    @_minimap_scale_x.setter
+    def _minimap_scale_x(self, value):
+        self.hud.minimap_scale_x = value
+
+    @property
+    def _minimap_scale_y(self):
+        return self.hud.minimap_scale_y
+
+    @_minimap_scale_y.setter
+    def _minimap_scale_y(self, value):
+        self.hud.minimap_scale_y = value
+
+    @property
+    def _minimap_has_tiles(self):
+        return self.hud.minimap_has_tiles
+
+    @_minimap_has_tiles.setter
+    def _minimap_has_tiles(self, value):
+        self.hud.minimap_has_tiles = value
+
+    @property
+    def _minimap_rect(self):
+        return self.hud.minimap_rect
+
+    @_minimap_rect.setter
+    def _minimap_rect(self, value):
+        self.hud.minimap_rect = value
+
+    @property
+    def _minimap_style(self):
+        return self.hud.minimap_style
+
+    @_minimap_style.setter
+    def _minimap_style(self, value):
+        self.hud.minimap_style = value
+
+    @property
+    def _minimap_layer(self):
+        return self.hud.minimap_layer
+
+    @_minimap_layer.setter
+    def _minimap_layer(self, value):
+        self.hud.minimap_layer = value
+
+    @property
+    def _minimap_colors(self):
+        return self.hud.minimap_colors
+
+    @_minimap_colors.setter
+    def _minimap_colors(self, value):
+        self.hud.minimap_colors = value
+
+    # ------------------------------------------------------------------
+    # Delegation properties — WindState
+    # ------------------------------------------------------------------
+
+    @property
+    def _wind_data(self):
+        return self.wind.wind_data
+
+    @_wind_data.setter
+    def _wind_data(self, value):
+        self.wind.wind_data = value
+
+    @property
+    def _wind_enabled(self):
+        return self.wind.wind_enabled
+
+    @_wind_enabled.setter
+    def _wind_enabled(self, value):
+        self.wind.wind_enabled = value
+
+    @property
+    def _wind_u_px(self):
+        return self.wind.wind_u_px
+
+    @_wind_u_px.setter
+    def _wind_u_px(self, value):
+        self.wind.wind_u_px = value
+
+    @property
+    def _wind_v_px(self):
+        return self.wind.wind_v_px
+
+    @_wind_v_px.setter
+    def _wind_v_px(self, value):
+        self.wind.wind_v_px = value
+
+    @property
+    def _wind_particles(self):
+        return self.wind.wind_particles
+
+    @_wind_particles.setter
+    def _wind_particles(self, value):
+        self.wind.wind_particles = value
+
+    @property
+    def _wind_ages(self):
+        return self.wind.wind_ages
+
+    @_wind_ages.setter
+    def _wind_ages(self, value):
+        self.wind.wind_ages = value
+
+    @property
+    def _wind_max_age(self):
+        return self.wind.wind_max_age
+
+    @property
+    def _wind_n_particles(self):
+        return self.wind.wind_n_particles
+
+    @property
+    def _wind_trail_len(self):
+        return self.wind.wind_trail_len
+
+    @property
+    def _wind_trails(self):
+        return self.wind.wind_trails
+
+    @_wind_trails.setter
+    def _wind_trails(self, value):
+        self.wind.wind_trails = value
+
+    @property
+    def _wind_speed_mult(self):
+        return self.wind.wind_speed_mult
+
+    @property
+    def _wind_min_depth(self):
+        return self.wind.wind_min_depth
+
+    @_wind_min_depth.setter
+    def _wind_min_depth(self, value):
+        self.wind.wind_min_depth = value
+
+    @property
+    def _wind_dot_radius(self):
+        return self.wind.wind_dot_radius
+
+    @property
+    def _wind_alpha(self):
+        return self.wind.wind_alpha
+
+    @property
+    def _wind_min_visible_age(self):
+        return self.wind.wind_min_visible_age
+
+    @property
+    def _wind_terrain_np(self):
+        return self.wind.wind_terrain_np
+
+    @_wind_terrain_np.setter
+    def _wind_terrain_np(self, value):
+        self.wind.wind_terrain_np = value
+
+    @property
+    def _d_wind_trails(self):
+        return self.wind.d_wind_trails
+
+    @_d_wind_trails.setter
+    def _d_wind_trails(self, value):
+        self.wind.d_wind_trails = value
+
+    @property
+    def _d_wind_alpha(self):
+        return self.wind.d_wind_alpha
+
+    @_d_wind_alpha.setter
+    def _d_wind_alpha(self, value):
+        self.wind.d_wind_alpha = value
+
+    @property
+    def _d_base_frame(self):
+        return self.wind.d_base_frame
+
+    @_d_base_frame.setter
+    def _d_base_frame(self, value):
+        self.wind.d_base_frame = value
+
+    @property
+    def _d_wind_scratch(self):
+        return self.wind.d_wind_scratch
+
+    @_d_wind_scratch.setter
+    def _d_wind_scratch(self, value):
+        self.wind.d_wind_scratch = value
+
+    @property
+    def _wind_done_event(self):
+        return self.wind.wind_done_event
+
+    @_wind_done_event.setter
+    def _wind_done_event(self, value):
+        self.wind.wind_done_event = value
+
+    # ------------------------------------------------------------------
+    # Delegation properties — ObserverManager
+    # ------------------------------------------------------------------
+
+    @property
+    def _observers(self):
+        return self.observer_mgr.observers
+
+    @_observers.setter
+    def _observers(self, value):
+        self.observer_mgr.observers = value
+
+    @property
+    def _active_observer(self):
+        return self.observer_mgr.active_observer
+
+    @_active_observer.setter
+    def _active_observer(self, value):
+        self.observer_mgr.active_observer = value
+
+    @property
+    def viewshed_enabled(self):
+        return self.observer_mgr.viewshed_enabled
+
+    @viewshed_enabled.setter
+    def viewshed_enabled(self, value):
+        self.observer_mgr.viewshed_enabled = value
+
+    @property
+    def viewshed_observer_elev(self):
+        return self.observer_mgr.viewshed_observer_elev
+
+    @viewshed_observer_elev.setter
+    def viewshed_observer_elev(self, value):
+        self.observer_mgr.viewshed_observer_elev = value
+
+    @property
+    def viewshed_target_elev(self):
+        return self.observer_mgr.viewshed_target_elev
+
+    @viewshed_target_elev.setter
+    def viewshed_target_elev(self, value):
+        self.observer_mgr.viewshed_target_elev = value
+
+    @property
+    def viewshed_opacity(self):
+        return self.observer_mgr.viewshed_opacity
+
+    @viewshed_opacity.setter
+    def viewshed_opacity(self, value):
+        self.observer_mgr.viewshed_opacity = value
+
+    @property
+    def _viewshed_cache(self):
+        return self.observer_mgr.viewshed_cache
+
+    @_viewshed_cache.setter
+    def _viewshed_cache(self, value):
+        self.observer_mgr.viewshed_cache = value
+
+    @property
+    def _viewshed_coverage(self):
+        return self.observer_mgr.viewshed_coverage
+
+    @_viewshed_coverage.setter
+    def _viewshed_coverage(self, value):
+        self.observer_mgr.viewshed_coverage = value
+
+    @property
+    def _viewshed_recalc_interval(self):
+        return self.observer_mgr.viewshed_recalc_interval
+
+    @property
+    def _last_viewshed_time(self):
+        return self.observer_mgr.last_viewshed_time
+
+    @_last_viewshed_time.setter
+    def _last_viewshed_time(self, value):
+        self.observer_mgr.last_viewshed_time = value
+
+    @property
+    def _shared_drone_parts(self):
+        return self.observer_mgr.shared_drone_parts
+
+    @_shared_drone_parts.setter
+    def _shared_drone_parts(self, value):
+        self.observer_mgr.shared_drone_parts = value
+
+    @property
+    def _drone_glow(self):
+        return self.observer_mgr.drone_glow
+
+    @_drone_glow.setter
+    def _drone_glow(self, value):
+        self.observer_mgr.drone_glow = value
+
+    # ------------------------------------------------------------------
+    # Delegation properties — TerrainState
+    # ------------------------------------------------------------------
+
+    @property
+    def raster(self):
+        return self.terrain.raster
+
+    @raster.setter
+    def raster(self, value):
+        self.terrain.raster = value
+
+    @property
+    def _base_raster(self):
+        return self.terrain._base_raster
+
+    @_base_raster.setter
+    def _base_raster(self, value):
+        self.terrain._base_raster = value
+
+    @property
+    def terrain_shape(self):
+        return self.terrain.terrain_shape
+
+    @terrain_shape.setter
+    def terrain_shape(self, value):
+        self.terrain.terrain_shape = value
+
+    @property
+    def elev_min(self):
+        return self.terrain.elev_min
+
+    @elev_min.setter
+    def elev_min(self, value):
+        self.terrain.elev_min = value
+
+    @property
+    def elev_max(self):
+        return self.terrain.elev_max
+
+    @elev_max.setter
+    def elev_max(self, value):
+        self.terrain.elev_max = value
+
+    @property
+    def elev_mean(self):
+        return self.terrain.elev_mean
+
+    @elev_mean.setter
+    def elev_mean(self, value):
+        self.terrain.elev_mean = value
+
+    @property
+    def pixel_spacing_x(self):
+        return self.terrain.pixel_spacing_x
+
+    @pixel_spacing_x.setter
+    def pixel_spacing_x(self, value):
+        self.terrain.pixel_spacing_x = value
+
+    @property
+    def pixel_spacing_y(self):
+        return self.terrain.pixel_spacing_y
+
+    @pixel_spacing_y.setter
+    def pixel_spacing_y(self, value):
+        self.terrain.pixel_spacing_y = value
+
+    @property
+    def _base_pixel_spacing_x(self):
+        return self.terrain._base_pixel_spacing_x
+
+    @_base_pixel_spacing_x.setter
+    def _base_pixel_spacing_x(self, value):
+        self.terrain._base_pixel_spacing_x = value
+
+    @property
+    def _base_pixel_spacing_y(self):
+        return self.terrain._base_pixel_spacing_y
+
+    @_base_pixel_spacing_y.setter
+    def _base_pixel_spacing_y(self, value):
+        self.terrain._base_pixel_spacing_y = value
+
+    @property
+    def subsample_factor(self):
+        return self.terrain.subsample_factor
+
+    @subsample_factor.setter
+    def subsample_factor(self, value):
+        self.terrain.subsample_factor = value
+
+    @property
+    def _terrain_mesh_cache(self):
+        return self.terrain._terrain_mesh_cache
+
+    @_terrain_mesh_cache.setter
+    def _terrain_mesh_cache(self, value):
+        self.terrain._terrain_mesh_cache = value
+
+    @property
+    def _baked_mesh_cache(self):
+        return self.terrain._baked_mesh_cache
+
+    @_baked_mesh_cache.setter
+    def _baked_mesh_cache(self, value):
+        self.terrain._baked_mesh_cache = value
+
+    @property
+    def _gpu_terrain(self):
+        return self.terrain._gpu_terrain
+
+    @_gpu_terrain.setter
+    def _gpu_terrain(self, value):
+        self.terrain._gpu_terrain = value
+
+    @property
+    def _gpu_base_terrain(self):
+        return self.terrain._gpu_base_terrain
+
+    @_gpu_base_terrain.setter
+    def _gpu_base_terrain(self, value):
+        self.terrain._gpu_base_terrain = value
+
+    @property
+    def mesh_type(self):
+        return self.terrain.mesh_type
+
+    @mesh_type.setter
+    def mesh_type(self, value):
+        self.terrain.mesh_type = value
+
+    @property
+    def _water_mask(self):
+        return self.terrain._water_mask
+
+    @_water_mask.setter
+    def _water_mask(self, value):
+        self.terrain._water_mask = value
+
+    @property
+    def vertical_exaggeration(self):
+        return self.terrain.vertical_exaggeration
+
+    @vertical_exaggeration.setter
+    def vertical_exaggeration(self, value):
+        self.terrain.vertical_exaggeration = value
+
+    @property
+    def _land_color_range(self):
+        return self.terrain._land_color_range
+
+    @_land_color_range.setter
+    def _land_color_range(self, value):
+        self.terrain._land_color_range = value
+
+    @property
+    def _terrain_loader(self):
+        return self.terrain._terrain_loader
+
+    @_terrain_loader.setter
+    def _terrain_loader(self, value):
+        self.terrain._terrain_loader = value
+
+    @property
+    def _coord_origin_x(self):
+        return self.terrain._coord_origin_x
+
+    @_coord_origin_x.setter
+    def _coord_origin_x(self, value):
+        self.terrain._coord_origin_x = value
+
+    @property
+    def _coord_origin_y(self):
+        return self.terrain._coord_origin_y
+
+    @_coord_origin_y.setter
+    def _coord_origin_y(self, value):
+        self.terrain._coord_origin_y = value
+
+    @property
+    def _coord_step_x(self):
+        return self.terrain._coord_step_x
+
+    @_coord_step_x.setter
+    def _coord_step_x(self, value):
+        self.terrain._coord_step_x = value
+
+    @property
+    def _coord_step_y(self):
+        return self.terrain._coord_step_y
+
+    @_coord_step_y.setter
+    def _coord_step_y(self, value):
+        self.terrain._coord_step_y = value
+
+    @property
+    def _reload_cooldown(self):
+        return self.terrain._reload_cooldown
+
+    @property
+    def _last_reload_time(self):
+        return self.terrain._last_reload_time
+
+    @_last_reload_time.setter
+    def _last_reload_time(self, value):
+        self.terrain._last_reload_time = value
+
+    # ------------------------------------------------------------------
+    # Delegation properties — GeometryLayerManager
+    # ------------------------------------------------------------------
+
+    @property
+    def _all_geometries(self):
+        return self.geometry_layers.all_geometries
+
+    @_all_geometries.setter
+    def _all_geometries(self, value):
+        self.geometry_layers.all_geometries = value
+
+    @property
+    def _geometry_layer_order(self):
+        return self.geometry_layers.geometry_layer_order
+
+    @_geometry_layer_order.setter
+    def _geometry_layer_order(self, value):
+        self.geometry_layers.geometry_layer_order = value
+
+    @property
+    def _geometry_layer_idx(self):
+        return self.geometry_layers.geometry_layer_idx
+
+    @_geometry_layer_idx.setter
+    def _geometry_layer_idx(self, value):
+        self.geometry_layers.geometry_layer_idx = value
+
+    @property
+    def _layer_positions(self):
+        return self.geometry_layers.layer_positions
+
+    @_layer_positions.setter
+    def _layer_positions(self, value):
+        self.geometry_layers.layer_positions = value
+
+    @property
+    def _current_geom_idx(self):
+        return self.geometry_layers.current_geom_idx
+
+    @_current_geom_idx.setter
+    def _current_geom_idx(self, value):
+        self.geometry_layers.current_geom_idx = value
+
+    @property
+    def _pc_color_modes(self):
+        return self.geometry_layers.pc_color_modes
+
+    @property
+    def _pc_color_mode_idx(self):
+        return self.geometry_layers.pc_color_mode_idx
+
+    @_pc_color_mode_idx.setter
+    def _pc_color_mode_idx(self, value):
+        self.geometry_layers.pc_color_mode_idx = value
+
+    @property
+    def _chunk_manager(self):
+        return self.geometry_layers.chunk_manager
+
+    @_chunk_manager.setter
+    def _chunk_manager(self, value):
+        self.geometry_layers.chunk_manager = value
+
+    @property
+    def _baked_meshes(self):
+        return self.geometry_layers.baked_meshes
+
+    @_baked_meshes.setter
+    def _baked_meshes(self, value):
+        self.geometry_layers.baked_meshes = value
+
+    @property
+    def _geometry_colors_builder(self):
+        return self.geometry_layers.geometry_colors_builder
+
+    @_geometry_colors_builder.setter
+    def _geometry_colors_builder(self, value):
+        self.geometry_layers.geometry_colors_builder = value
+
+    # ------------------------------------------------------------------
+    # Thin wrappers — camera methods
+    # ------------------------------------------------------------------
+
     def _get_front(self):
         """Get the forward direction vector."""
-        yaw_rad = np.radians(self.yaw)
-        pitch_rad = np.radians(self.pitch)
-        return np.array([
-            np.cos(yaw_rad) * np.cos(pitch_rad),
-            np.sin(yaw_rad) * np.cos(pitch_rad),
-            np.sin(pitch_rad)
-        ], dtype=np.float32)
+        return self.camera.get_front()
 
     def _get_right(self):
         """Get the right direction vector."""
-        front = self._get_front()
-        world_up = np.array([0, 0, 1], dtype=np.float32)
-        right = np.cross(world_up, front)
-        return right / (np.linalg.norm(right) + 1e-8)
+        return self.camera.get_right()
 
     def _screen_to_ray(self, screen_x, screen_y):
-        """Convert screen pixel coordinates to a world-space ray.
-
-        Returns (origin, direction) as numpy float32 arrays of shape (3,).
-        """
-        front = self._get_front()
-        world_up = np.array([0, 0, 1], dtype=np.float32)
-        right = np.cross(world_up, front)
-        rn = np.linalg.norm(right)
-        if rn > 1e-8:
-            right /= rn
-        else:
-            right = np.array([1, 0, 0], dtype=np.float32)
-        cam_up = np.cross(front, right)
-
-        fov_scale = np.tan(np.radians(self.fov) / 2.0)
-        aspect = self.render_width / max(1, self.render_height)
-
-        # Window coords → NDC  (-1..1)
-        nx = 2.0 * screen_x / max(1, self.width) - 1.0
-        ny = 1.0 - 2.0 * screen_y / max(1, self.height)
-
-        direction = front + nx * fov_scale * aspect * right + ny * fov_scale * cam_up
-        direction = direction / (np.linalg.norm(direction) + 1e-30)
-        return self.position.copy(), direction.astype(np.float32)
+        """Convert screen pixel coordinates to a world-space ray."""
+        return self.camera.screen_to_ray(
+            screen_x, screen_y,
+            self.render_width, self.render_height,
+            self.width, self.height,
+        )
 
     def _get_look_at(self):
         """Get the current look-at point."""
-        return self.position + self._get_front() * 1000.0
+        return self.camera.get_look_at()
 
     def _build_title(self):
         """Build a rich status title string for the viewer window."""
@@ -3398,8 +4253,225 @@ class InteractiveViewer:
             self._gtfs_rt_thread.join(timeout=2.0)
             self._gtfs_rt_thread = None
 
+    # ------------------------------------------------------------------
+    # Thin action methods for key-binding dispatch
+    # ------------------------------------------------------------------
+
+    def _action_shift_o(self):
+        obs = self._observers.get(self._active_observer) if self._active_observer else None
+        if obs is None:
+            print("No observer selected. Press 1-8 first.")
+        else:
+            self._cycle_drone_mode_for(obs)
+
+    def _action_shift_v(self):
+        obs = self._observers.get(self._active_observer) if self._active_observer else None
+        if obs is None:
+            print("No observer selected. Press 1-8 first.")
+        else:
+            self._snap_to_observer(obs)
+
+    def _action_clear_observers(self):
+        self._clear_all_observers()
+
+    def _action_toggle_firms(self):
+        self._toggle_firms()
+
+    def _action_toggle_wind(self):
+        self._toggle_wind()
+
+    def _action_toggle_terrain_vis(self):
+        entry = self.rtx._geom_state.gas_entries.get('terrain')
+        if entry is not None:
+            vis = not entry.visible
+            self.rtx.set_geometry_visible('terrain', vis)
+            print(f"Terrain {'shown' if vis else 'hidden'}")
+            self._needs_render = True
+
+    def _action_toggle_gtfs_rt(self):
+        self._toggle_gtfs_rt()
+
+    def _action_cycle_pc_colors(self):
+        self._cycle_pointcloud_colors()
+
+    def _action_toggle_denoiser(self):
+        self.denoise_enabled = not self.denoise_enabled
+        self.render_settings.reset_accumulation()
+        self._prev_cam_for_flow = None
+        print(f"Denoiser: {'ON' if self.denoise_enabled else 'OFF'}")
+        self._update_frame()
+
+    def _action_cycle_gi(self):
+        self.gi_bounces = self.gi_bounces % 3 + 1
+        self.render_settings.reset_accumulation()
+        print(f"GI bounces: {self.gi_bounces}")
+        self._update_frame()
+
+    def _action_prev_help_page(self):
+        if self._help_pages:
+            self._help_page_idx -= 1
+            if self._help_page_idx < -1:
+                self._help_page_idx = len(self._help_pages) - 1
+        self._update_frame()
+
+    def _action_toggle_drone_glow(self):
+        self._drone_glow = not self._drone_glow
+        self._apply_drone_glow()
+        print(f"Drone glow: {'ON' if self._drone_glow else 'OFF'}")
+
+    def _action_cycle_time(self):
+        self._time_preset_idx = (self._time_preset_idx + 1) % len(self._time_presets)
+        name, az, alt = self._time_presets[self._time_preset_idx]
+        self.sun_azimuth = az
+        self.sun_altitude = alt
+        self.render_settings.reset_accumulation()
+        print(f"Time of day: {name} (az={az:.0f}, alt={alt:.0f})")
+        self._update_frame()
+
+    def _action_toggle_shadows(self):
+        self.shadows = not self.shadows
+        print(f"Shadows: {'ON' if self.shadows else 'OFF'}")
+        self._update_frame()
+
+    def _action_cycle_colormap(self):
+        self.colormap_idx = (self.colormap_idx + 1) % len(self.colormaps)
+        self.colormap = self.colormaps[self.colormap_idx]
+        print(f"Colormap: {self.colormap}")
+        self._update_frame()
+
+    def _action_jump_prev_geom(self):
+        self._jump_to_geometry(-1)
+
+    def _action_next_help_page(self):
+        if self._help_pages:
+            self._help_page_idx += 1
+            if self._help_page_idx >= len(self._help_pages):
+                self._help_page_idx = -1
+        else:
+            self._help_page_idx = -1
+        self._update_frame()
+
+    def _action_toggle_minimap(self):
+        self.show_minimap = not self.show_minimap
+        self._update_frame()
+
+    def _action_place_observer(self):
+        obs = self._observers.get(self._active_observer) if self._active_observer else None
+        if obs is None:
+            print("No observer selected. Press 1-8 to create one.")
+        elif obs.drone_mode == 'off':
+            self._place_observer_at(obs)
+
+    def _action_observer_elev_down(self):
+        self._adjust_observer_elevation(-0.01)
+
+    def _action_observer_elev_up(self):
+        self._adjust_observer_elevation(0.01)
+
+    def _action_cycle_color_stretch(self):
+        self._color_stretch_idx = (self._color_stretch_idx + 1) % len(self._color_stretches)
+        self.color_stretch = self._color_stretches[self._color_stretch_idx]
+        print(f"Color stretch: {self.color_stretch}")
+        self._update_frame()
+
+    def _action_cycle_mesh_type(self):
+        cycle = {'tin': 'voxel', 'voxel': 'heightfield', 'heightfield': 'tin'}
+        self.mesh_type = cycle.get(self.mesh_type, 'tin')
+        self._rebuild_vertical_exaggeration(self.vertical_exaggeration)
+        print(f"Mesh type: {self.mesh_type}")
+
+    def _action_cycle_basemap_fwd(self):
+        self._cycle_basemap()
+
+    def _action_cycle_basemap_rev(self):
+        self._cycle_basemap(reverse=True)
+
+    def _action_overlay_alpha_down(self):
+        self._overlay_alpha = max(0.0, round(self._overlay_alpha - 0.1, 1))
+        print(f"Overlay alpha: {int(self._overlay_alpha * 100)}%")
+        self._update_frame()
+
+    def _action_overlay_alpha_up(self):
+        self._overlay_alpha = min(1.0, round(self._overlay_alpha + 0.1, 1))
+        print(f"Overlay alpha: {int(self._overlay_alpha * 100)}%")
+        self._update_frame()
+
+    def _action_speed_up(self):
+        H, W = self.terrain_shape
+        world_diag = np.sqrt((W * self.pixel_spacing_x)**2 + (H * self.pixel_spacing_y)**2)
+        max_speed = world_diag * 0.1
+        self.move_speed = min(max_speed, self.move_speed * 1.2)
+        print(f"Speed: {self.move_speed:.3f}")
+
+    def _action_speed_down(self):
+        self.move_speed = max(0.001, self.move_speed / 1.2)
+        print(f"Speed: {self.move_speed:.3f}")
+
+    def _action_resolution_coarser(self):
+        new_factor = min(8, self.subsample_factor * 2)
+        if new_factor != self.subsample_factor:
+            self._rebuild_at_resolution(new_factor)
+
+    def _action_resolution_finer(self):
+        new_factor = max(1, self.subsample_factor // 2)
+        if new_factor != self.subsample_factor:
+            self._rebuild_at_resolution(new_factor)
+
+    def _action_ve_down(self):
+        new_ve = max(0.1, round(self.vertical_exaggeration - 0.1, 1))
+        if new_ve != self.vertical_exaggeration:
+            self._rebuild_vertical_exaggeration(new_ve)
+
+    def _action_ve_up(self):
+        new_ve = min(10.0, round(self.vertical_exaggeration + 0.1, 1))
+        if new_ve != self.vertical_exaggeration:
+            self._rebuild_vertical_exaggeration(new_ve)
+
+    def _action_toggle_ao(self):
+        self.ao_enabled = not self.ao_enabled
+        self.render_settings.reset_accumulation()
+        print(f"Ambient Occlusion: {'ON' if self.ao_enabled else 'OFF'}")
+        self._update_frame()
+
+    def _action_toggle_dof(self):
+        self.dof_enabled = not self.dof_enabled
+        self.render_settings.reset_accumulation()
+        print(f"Depth of Field: {'ON' if self.dof_enabled else 'OFF'}")
+        self._update_frame()
+
+    def _action_dof_aperture_down(self):
+        self._dof_aperture = max(1.0, self._dof_aperture * 0.7)
+        self.render_settings.reset_accumulation()
+        print(f"DOF aperture: {self._dof_aperture:.1f}")
+        self._update_frame()
+
+    def _action_dof_aperture_up(self):
+        self._dof_aperture = min(200.0, self._dof_aperture * 1.4)
+        self.render_settings.reset_accumulation()
+        print(f"DOF aperture: {self._dof_aperture:.1f}")
+        self._update_frame()
+
+    def _action_dof_focal_down(self):
+        self._dof_focal_distance = max(10.0, self._dof_focal_distance * 0.7)
+        self.render_settings.reset_accumulation()
+        print(f"DOF focal distance: {self._dof_focal_distance:.0f}")
+        self._update_frame()
+
+    def _action_dof_focal_up(self):
+        self._dof_focal_distance = min(10000.0, self._dof_focal_distance * 1.4)
+        self.render_settings.reset_accumulation()
+        print(f"DOF focal distance: {self._dof_focal_distance:.0f}")
+        self._update_frame()
+
+    def _action_exit(self):
+        self.running = False
+
+    # ------------------------------------------------------------------
+    # Key dispatch
+    # ------------------------------------------------------------------
+
     def _handle_key_press(self, raw_key, key):
-        """Handle key press - add to held keys or handle instant actions.
+        """Handle key press — table-driven dispatch.
 
         Parameters
         ----------
@@ -3408,289 +4480,31 @@ class InteractiveViewer:
         key : str
             Lowercase version of the key.
         """
-
-        # Drone mode cycle: Shift+O (before other keys)
-        if raw_key == 'O':
-            obs = self._observers.get(self._active_observer) if self._active_observer else None
-            if obs is None:
-                print("No observer selected. Press 1-8 first.")
-            else:
-                self._cycle_drone_mode_for(obs)
+        # 1. Shift bindings (uppercase raw_key)
+        if raw_key in SHIFT_BINDINGS:
+            getattr(self, SHIFT_BINDINGS[raw_key])()
             return
 
-        # Snap camera to active observer: Shift+V
-        if raw_key == 'V':
-            obs = self._observers.get(self._active_observer) if self._active_observer else None
-            if obs is None:
-                print("No observer selected. Press 1-8 first.")
-            else:
-                self._snap_to_observer(obs)
-            return
-
-        # Kill all observers: Shift+K
-        if raw_key == 'K':
-            self._clear_all_observers()
-            return
-
-        # FIRMS fire layer: Shift+F (before 'f' screenshot)
-        if raw_key == 'F':
-            self._toggle_firms()
-            return
-
-        # Wind toggle: Shift+W (before movement keys capture 'w')
-        if raw_key == 'W':
-            self._toggle_wind()
-            return
-
-        # Toggle terrain visibility: Shift+E
-        if raw_key == 'E':
-            entry = self.rtx._geom_state.gas_entries.get('terrain')
-            if entry is not None:
-                vis = not entry.visible
-                self.rtx.set_geometry_visible('terrain', vis)
-                print(f"Terrain {'shown' if vis else 'hidden'}")
-                self._needs_render = True
-            return
-
-        # GTFS-RT realtime vehicle toggle: Shift+B
-        if raw_key == 'B':
-            self._toggle_gtfs_rt()
-            return
-
-        # Point cloud color mode cycle: Shift+C
-        if raw_key == 'C':
-            self._cycle_pointcloud_colors()
-            return
-
-        # Denoiser toggle: Shift+D (before movement keys capture 'd')
-        if raw_key == 'D':
-            self.denoise_enabled = not self.denoise_enabled
-            self._d_ao_accum = None
-            self._ao_frame_count = 0
-            self._prev_cam_state = None
-            self._prev_cam_for_flow = None
-            print(f"Denoiser: {'ON' if self.denoise_enabled else 'OFF'}")
-            self._update_frame()
-            return
-
-        # GI bounces cycle: Shift+G (1 → 2 → 3 → 1)
-        if raw_key == 'G':
-            self.gi_bounces = self.gi_bounces % 3 + 1
-            self._d_ao_accum = None
-            self._ao_frame_count = 0
-            self._prev_cam_state = None
-            print(f"GI bounces: {self.gi_bounces}")
-            self._update_frame()
-            return
-
-        # Previous help page: Shift+H
-        if raw_key == 'H':
-            if self._help_pages:
-                self._help_page_idx -= 1
-                if self._help_page_idx < -1:
-                    self._help_page_idx = len(self._help_pages) - 1
-            self._update_frame()
-            return
-
-        # Drone glow toggle: Shift+L
-        if raw_key == 'L':
-            self._drone_glow = not self._drone_glow
-            self._apply_drone_glow()
-            print(f"Drone glow: {'ON' if self._drone_glow else 'OFF'}")
-            return
-
-        # Time-of-day cycle: Shift+T (before 't' shadows toggle)
-        if raw_key == 'T':
-            self._time_preset_idx = (self._time_preset_idx + 1) % len(self._time_presets)
-            name, az, alt = self._time_presets[self._time_preset_idx]
-            self.sun_azimuth = az
-            self.sun_altitude = alt
-            self._d_ao_accum = None
-            self._ao_frame_count = 0
-            self._prev_cam_state = None
-            print(f"Time of day: {name} (az={az:.0f}, alt={alt:.0f})")
-            self._update_frame()
-            return
-
-        # Movement/look keys are tracked as held
-        movement_keys = {'w', 's', 'a', 'd', 'up', 'down', 'left', 'right',
-                         'q', 'e', 'pageup', 'pagedown', 'i', 'j', 'k', 'l'}
-
-        if key in movement_keys:
+        # 2. Movement keys → add to held set
+        if key in MOVEMENT_KEYS:
             self._held_keys.add(key)
             return
 
-        # Instant actions (not held)
-        # Speed (limits scale with terrain size in world units)
-        if key in ('+', '='):
-            H, W = self.terrain_shape
-            world_diag = np.sqrt((W * self.pixel_spacing_x)**2 + (H * self.pixel_spacing_y)**2)
-            max_speed = world_diag * 0.1  # Max 10% of terrain per keystroke
-            self.move_speed = min(max_speed, self.move_speed * 1.2)
-            print(f"Speed: {self.move_speed:.3f}")
-        elif key == '-':
-            H, W = self.terrain_shape
-            world_diag = np.sqrt((W * self.pixel_spacing_x)**2 + (H * self.pixel_spacing_y)**2)
-            min_speed = 0.001
-            self.move_speed = max(min_speed, self.move_speed / 1.2)
-            print(f"Speed: {self.move_speed:.3f}")
-
-        # Toggles
-        elif key == 't':
-            self.shadows = not self.shadows
-            print(f"Shadows: {'ON' if self.shadows else 'OFF'}")
-            self._update_frame()
-        elif key == 'c':
-            self.colormap_idx = (self.colormap_idx + 1) % len(self.colormaps)
-            self.colormap = self.colormaps[self.colormap_idx]
-            print(f"Colormap: {self.colormap}")
-            self._update_frame()
-        elif key == 'g':
-            self._cycle_terrain_layer()
-        elif key == 'n':
-            self._cycle_geometry_layer()
-        elif key == 'p':
-            self._jump_to_geometry(-1)  # Previous geometry in current group
-        elif key == 'h':
-            if self._help_pages:
-                self._help_page_idx += 1
-                if self._help_page_idx >= len(self._help_pages):
-                    self._help_page_idx = -1  # off
-            else:
-                self._help_page_idx = -1
-            self._update_frame()
-        elif key == 'm':
-            self.show_minimap = not self.show_minimap
-            self._update_frame()
-
-        # Observer slot selection: 1-8
-        elif key in ('1', '2', '3', '4', '5', '6', '7', '8'):
+        # 3. Observer slots 1-8
+        if key in ('1', '2', '3', '4', '5', '6', '7', '8'):
             self._select_or_create_observer(int(key))
+            return
 
-        # Move active observer to camera position
-        elif key == 'o':
-            obs = self._observers.get(self._active_observer) if self._active_observer else None
-            if obs is None:
-                print("No observer selected. Press 1-8 to create one.")
-            elif obs.drone_mode == 'off':
-                self._place_observer_at(obs)
-        elif key == 'v':
-            self._toggle_viewshed()
-        elif key == '[':
-            self._adjust_observer_elevation(-0.01)
-        elif key == ']':
-            self._adjust_observer_elevation(0.01)
+        # 4. Special bindings (need both raw_key and key)
+        pair = (raw_key, key)
+        if pair in SPECIAL_BINDINGS:
+            getattr(self, SPECIAL_BINDINGS[pair])()
+            return
 
-        # Screenshot
-        elif key == 'f':
-            self._save_screenshot()
-
-        # Terrain resolution: R = coarser, Shift+R = finer
-        elif key == 'r':
-            if raw_key == 'R':
-                # Shift+R → finer (halve factor, min 1)
-                new_factor = max(1, self.subsample_factor // 2)
-            else:
-                # r → coarser (double factor, max 8)
-                new_factor = min(8, self.subsample_factor * 2)
-            if new_factor != self.subsample_factor:
-                self._rebuild_at_resolution(new_factor)
-
-        # Color stretch cycling
-        elif key == 'y':
-            self._color_stretch_idx = (self._color_stretch_idx + 1) % len(self._color_stretches)
-            self.color_stretch = self._color_stretches[self._color_stretch_idx]
-            print(f"Color stretch: {self.color_stretch}")
-            self._update_frame()
-
-        # Cycle mesh type (tin → voxel → heightfield → tin)
-        elif key == 'b':
-            cycle = {'tin': 'voxel', 'voxel': 'heightfield', 'heightfield': 'tin'}
-            self.mesh_type = cycle.get(self.mesh_type, 'tin')
-            self._rebuild_vertical_exaggeration(self.vertical_exaggeration)
-            print(f"Mesh type: {self.mesh_type}")
-
-        # Basemap cycling: U = cycle forward, Shift+U = cycle backward
-        elif key == 'u':
-            self._cycle_basemap()
-        elif key == 'U':
-            self._cycle_basemap(reverse=True)
-
-        # Overlay alpha: , = decrease, . = increase
-        elif key == ',':
-            self._overlay_alpha = max(0.0, round(self._overlay_alpha - 0.1, 1))
-            print(f"Overlay alpha: {int(self._overlay_alpha * 100)}%")
-            self._update_frame()
-        elif key == '.':
-            self._overlay_alpha = min(1.0, round(self._overlay_alpha + 0.1, 1))
-            print(f"Overlay alpha: {int(self._overlay_alpha * 100)}%")
-            self._update_frame()
-
-        # Vertical exaggeration: Z = decrease, Shift+Z = increase (0.1 steps)
-        elif key == 'z':
-            if raw_key == 'Z':
-                new_ve = round(self.vertical_exaggeration + 0.1, 1)
-                new_ve = min(10.0, new_ve)
-            else:
-                new_ve = round(self.vertical_exaggeration - 0.1, 1)
-                new_ve = max(0.1, new_ve)
-            if new_ve != self.vertical_exaggeration:
-                self._rebuild_vertical_exaggeration(new_ve)
-
-        # Ambient occlusion toggle
-        elif key == '0':
-            self.ao_enabled = not self.ao_enabled
-            self._d_ao_accum = None
-            self._ao_frame_count = 0
-            self._prev_cam_state = None
-            print(f"Ambient Occlusion: {'ON' if self.ao_enabled else 'OFF'}")
-            self._update_frame()
-
-        # Depth of field toggle
-        elif key == '9':
-            self.dof_enabled = not self.dof_enabled
-            # Reset accumulation so DOF takes effect immediately
-            self._d_ao_accum = None
-            self._ao_frame_count = 0
-            self._prev_cam_state = None
-            print(f"Depth of Field: {'ON' if self.dof_enabled else 'OFF'}")
-            self._update_frame()
-
-        # DOF aperture: ; = decrease, ' = increase
-        elif key == ';':
-            self._dof_aperture = max(1.0, self._dof_aperture * 0.7)
-            self._d_ao_accum = None
-            self._ao_frame_count = 0
-            self._prev_cam_state = None
-            print(f"DOF aperture: {self._dof_aperture:.1f}")
-            self._update_frame()
-        elif key == "'":
-            self._dof_aperture = min(200.0, self._dof_aperture * 1.4)
-            self._d_ao_accum = None
-            self._ao_frame_count = 0
-            self._prev_cam_state = None
-            print(f"DOF aperture: {self._dof_aperture:.1f}")
-            self._update_frame()
-
-        # DOF focal distance: : = decrease, " = increase
-        elif key == ':':
-            self._dof_focal_distance = max(10.0, self._dof_focal_distance * 0.7)
-            self._d_ao_accum = None
-            self._ao_frame_count = 0
-            self._prev_cam_state = None
-            print(f"DOF focal distance: {self._dof_focal_distance:.0f}")
-            self._update_frame()
-        elif key == '"':
-            self._dof_focal_distance = min(10000.0, self._dof_focal_distance * 1.4)
-            self._d_ao_accum = None
-            self._ao_frame_count = 0
-            self._prev_cam_state = None
-            print(f"DOF focal distance: {self._dof_focal_distance:.0f}")
-            self._update_frame()
-
-        # Exit
-        elif key in ('escape', 'x'):
-            self.running = False
+        # 5. Regular key bindings (lowercase key)
+        if key in KEY_BINDINGS:
+            getattr(self, KEY_BINDINGS[key])()
+            return
 
     def _handle_key_release(self, key):
         """Handle key release - remove from held keys.
@@ -3927,19 +4741,17 @@ class InteractiveViewer:
               f"window {new_W}x{new_H}")
 
     def _tick(self):
-        """Continuous render loop — process held keys and redraw (called by timer)."""
+        """Per-frame tick: delta time → input/movement → simulation → render."""
         if not self.running:
             return
 
-        # Delta-time: scale movement relative to the old 20 Hz reference rate
+        # --- Delta time ---
         now = time.monotonic()
-        dt = now - self._last_tick_time
+        dt = min(now - self._last_tick_time, 0.1)
         self._last_tick_time = now
-        # Clamp to avoid huge jumps (e.g. after a stall or first frame)
-        dt = min(dt, 0.1)
         dt_scale = dt / 0.05  # 0.05 = 1/20 Hz reference
 
-        # Process held movement / look keys
+        # --- Input / movement ---
         if self._held_keys:
             speed = self.move_speed * dt_scale
             look = self.look_speed * dt_scale
@@ -4023,6 +4835,7 @@ class InteractiveViewer:
             self._render_needed = True
         self._dt_scale = dt_scale
 
+        # --- Simulation (terrain reload, chunk loading, AO accumulation) ---
         self._check_terrain_reload()
         if self._chunk_manager is not None:
             if self._chunk_manager.update(self.position[0], self.position[1], self):
@@ -4034,6 +4847,7 @@ class InteractiveViewer:
                 and self._ao_frame_count < self._ao_max_frames):
             self._render_needed = True
 
+        # --- Render ---
         if self._render_needed:
             self._update_frame()
             self._render_needed = False
@@ -5969,6 +6783,36 @@ class InteractiveViewer:
         region = img[y0:y0+bh, x0:x0+bw]
         region[:] = region * (1 - alpha) + rgb * alpha
 
+    def _drain_command_queue(self):
+        """Drain REPL command queue — execute pending callables (thread-safe)."""
+        while True:
+            try:
+                cmd = self._command_queue.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                cmd(self)
+            except Exception as exc:
+                import traceback
+                traceback.print_exc()
+            self._render_needed = True
+
+    def _present_if_dirty(self, frame_tex, ctx, vao, glfw, window, moderngl):
+        """Upload frame to GL texture and present if the frame changed."""
+        if self._frame_dirty and self._display_frame is not None:
+            tex_w, tex_h = frame_tex.size
+            fh, fw = self._display_frame.shape[:2]
+            if fw != tex_w or fh != tex_h:
+                frame_tex.release()
+                frame_tex = ctx.texture((fw, fh), 3, dtype='f4')
+                frame_tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
+            frame_tex.write(self._display_frame)
+            frame_tex.use()
+            ctx.clear()
+            vao.render(moderngl.TRIANGLE_STRIP)
+            glfw.swap_buffers(window)
+            self._frame_dirty = False
+
     def run(self, start_position: Optional[Tuple[float, float, float]] = None,
             look_at: Optional[Tuple[float, float, float]] = None):
         """
@@ -6201,37 +7045,13 @@ class InteractiveViewer:
         # --- Main loop ---
         try:
             while not glfw.window_should_close(window) and self.running:
-                self._tick()
-
-                # Drain REPL command queue (thread-safe)
-                while True:
-                    try:
-                        cmd = self._command_queue.get_nowait()
-                    except queue.Empty:
-                        break
-                    try:
-                        cmd(self)
-                    except Exception as exc:
-                        import traceback
-                        traceback.print_exc()
-                    self._render_needed = True
-
-                # Upload frame to texture and render only when dirty
-                if self._frame_dirty and self._display_frame is not None:
-                    tex_w, tex_h = frame_tex.size
-                    fh, fw = self._display_frame.shape[:2]
-                    if fw != tex_w or fh != tex_h:
-                        frame_tex.release()
-                        frame_tex = ctx.texture((fw, fh), 3, dtype='f4')
-                        frame_tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
-                    frame_tex.write(self._display_frame)
-                    frame_tex.use()
-                    ctx.clear()
-                    vao.render(moderngl.TRIANGLE_STRIP)
-                    glfw.swap_buffers(window)
-                    self._frame_dirty = False
-
+                # Poll input before tick to avoid one-frame input lag
                 glfw.poll_events()
+
+                self._drain_command_queue()
+                self._tick()
+                self._present_if_dirty(frame_tex, ctx, vao, glfw, window,
+                                       moderngl)
 
                 # Idle: yield CPU when nothing is happening (no movement,
                 # no pending render).  Keeps input polling responsive at
