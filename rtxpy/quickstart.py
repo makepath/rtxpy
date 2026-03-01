@@ -13,6 +13,7 @@ def quickstart(
     tiles='satellite',
     tile_zoom=None,
     wind=True,
+    hydro=False,
     cache_dir=None,
     **explore_kwargs,
 ):
@@ -50,6 +51,10 @@ def quickstart(
         Tile zoom level override.  ``None`` uses the provider default.
     wind : bool
         Fetch live wind data from Open-Meteo.  Default ``True``.
+    hydro : bool
+        Compute D8 flow direction and flow accumulation from the terrain
+        using xarray-spatial and enable hydro flow particle animation
+        (Shift+Y).  Default ``False``.
     cache_dir : str or Path, optional
         Directory for the zarr store and GeoJSON caches.  Defaults to
         the current working directory.
@@ -61,7 +66,6 @@ def quickstart(
     """
     import numpy as np
     import xarray as xr
-    from xrspatial import slope, aspect, quantile
 
     # -- paths ----------------------------------------------------------------
     if cache_dir is None:
@@ -79,12 +83,9 @@ def quickstart(
     terrain = terrain.rtx.to_cupy()
 
     # -- Dataset with analysis layers -----------------------------------------
-    print("Building Dataset with terrain analysis layers...")
+    print("Building Dataset...")
     ds = xr.Dataset({
         'elevation': terrain.rename(None),
-        'slope': slope(terrain),
-        'aspect': aspect(terrain),
-        'quantile': quantile(terrain),
     })
 
     # -- tiles ----------------------------------------------------------------
@@ -189,6 +190,133 @@ def quickstart(
         except Exception as e:
             print(f"Skipping wind: {e}")
 
+    # -- hydro ----------------------------------------------------------------
+    hydro_data = None
+    if hydro:
+        try:
+            from xrspatial import fill as _fill
+            from xrspatial import flow_direction as _flow_direction
+            from xrspatial import flow_accumulation as _flow_accumulation
+            from xrspatial import stream_order as _stream_order
+            from xrspatial import stream_link as _stream_link
+
+            print("Conditioning DEM for hydrological flow...")
+            from scipy.ndimage import uniform_filter as _uniform_filter
+
+            # 1. Prepare elevation: ocean (0-fill) → low sentinel so
+            #    fill() routes coastal depressions toward the sea.
+            _data = terrain.data
+            is_cupy = hasattr(_data, 'get')
+            elev_np = _data.get() if is_cupy else np.array(_data)
+            elev_np = elev_np.astype(np.float32)
+            ocean = (elev_np == 0.0) | np.isnan(elev_np)
+            elev_np[ocean] = -100.0
+
+            # 2. Smooth (15×15 ≈ 450 m at 30 m) to remove noise pits
+            #    that fragment the drainage network.
+            smoothed = _uniform_filter(elev_np, size=15, mode='nearest')
+            smoothed[ocean] = -100.0
+
+            # 3. Fill remaining depressions, then resolve flats:
+            #    add a tiny fraction of fill depth so flat areas
+            #    drain toward their pour points.
+            if is_cupy:
+                import cupy as _cp
+                _sm = _cp.asarray(smoothed)
+            else:
+                _sm = smoothed
+            filled = _fill(terrain.copy(data=_sm))
+            fill_depth = filled.data - _sm
+            resolved = filled.data + fill_depth * 0.01
+            if is_cupy:
+                _cp.random.seed(0)
+                resolved = resolved + _cp.random.uniform(
+                    0, 0.001, resolved.shape, dtype=_cp.float32)
+                resolved[_cp.asarray(ocean)] = -100.0
+            else:
+                np.random.seed(0)
+                resolved += np.random.uniform(
+                    0, 0.001, resolved.shape).astype(np.float32)
+                resolved[ocean] = -100.0
+
+            # 4. Compute D8 flow direction and accumulation.
+            fd = _flow_direction(terrain.copy(data=resolved))
+            fa = _flow_accumulation(fd)
+
+            # 5. Compute Strahler stream order — only stream cells
+            #    (accum >= threshold) get an order; rest are NaN.
+            so = _stream_order(fd, fa, threshold=50)
+
+            # 5b. Compute stream link — unique segment IDs per reach.
+            sl = _stream_link(fd, fa, threshold=50)
+
+            # 6. Mask ocean back to NaN/0 in the output grids.
+            fd_out = fd.data
+            fa_out = fa.data
+            so_out = so.data
+            if is_cupy:
+                ocean_gpu = _cp.asarray(ocean)
+                fd_out[ocean_gpu] = _cp.nan
+                fa_out[ocean_gpu] = _cp.nan
+                so_out[ocean_gpu] = _cp.nan
+            else:
+                fd_out[ocean] = np.nan
+                fa_out[ocean] = np.nan
+                so_out[ocean] = np.nan
+
+            # Add stream_link to the dataset so it shows up as an
+            # overlay layer (G key) with palette-matched colors.
+            _sl_out = sl.data
+            if is_cupy:
+                _sl_out[ocean_gpu] = _cp.nan
+            else:
+                _sl_out[ocean] = np.nan
+            _sl_np = _sl_out.get() if is_cupy else np.asarray(_sl_out)
+            _sl_clean = np.nan_to_num(_sl_np, nan=0.0).astype(np.float32)
+            if is_cupy:
+                _sl_clean = _cp.asarray(_sl_clean)
+            ds['stream_link'] = terrain.copy(data=_sl_clean).rename(None)
+
+            hydro_data = {
+                'flow_dir': fd_out,
+                'flow_accum': fa_out,
+                'stream_order': so_out,
+                'stream_link': _sl_out,
+                'accum_threshold': 50,
+            }
+            # Pass overrides from explore_kwargs if present
+            for key in ('n_particles', 'max_age', 'trail_len', 'speed',
+                        'accum_threshold', 'color', 'alpha', 'dot_radius'):
+                hydro_key = f'hydro_{key}'
+                if hydro_key in explore_kwargs:
+                    hydro_data[key] = explore_kwargs.pop(hydro_key)
+            # Load cached Overture waterway LineStrings for particle injection
+            if 'water' in feat:
+                water_cache = cache_dir / f"{name}_water.geojson"
+                if water_cache.exists():
+                    import json as _json
+                    try:
+                        with open(water_cache) as _wf:
+                            _ww = _json.load(_wf)
+                        ww_lines = [
+                            f for f in _ww.get('features', [])
+                            if f.get('geometry', {}).get('type') == 'LineString'
+                        ]
+                        if ww_lines:
+                            hydro_data['waterway_geojson'] = {
+                                'type': 'FeatureCollection',
+                                'features': ww_lines,
+                            }
+                            print(f"  Loaded {len(ww_lines)} waterway "
+                                  f"LineStrings for particle injection")
+                    except Exception:
+                        pass
+
+            print(f"  Flow direction + accumulation computed on "
+                  f"{terrain.shape[0]}x{terrain.shape[1]} grid")
+        except Exception as e:
+            print(f"Skipping hydro: {e}")
+
     # -- explore --------------------------------------------------------------
     defaults = dict(
         width=2048, height=1600, render_scale=0.5,
@@ -198,7 +326,8 @@ def quickstart(
 
     print("\nLaunching explore...\n")
     ds.rtx.explore(z='elevation', scene_zarr=zarr_path,
-                   wind_data=wind_data, gtfs_data=gtfs_data, **defaults)
+                   wind_data=wind_data, hydro_data=hydro_data,
+                   gtfs_data=gtfs_data, **defaults)
 
 
 # ---------------------------------------------------------------------------

@@ -1,4 +1,4 @@
-"""Trinidad and Tobago — GPU-accelerated terrain exploration."""
+"""Trinidad and Tobago — GPU-accelerated terrain exploration with hydro flow."""
 from rtxpy import quickstart
 
 quickstart(
@@ -7,6 +7,7 @@ quickstart(
     crs='EPSG:32620',
     features=['buildings', 'roads', 'water', 'fire', 'places',
               'infrastructure', 'land_use'],
+    hydro=True,
     ao_samples=1,
     denoise=True,
 )

@@ -27,6 +27,7 @@ from .viewer.geometry_layers import GeometryLayerManager
 from .viewer.terrain import TerrainState
 from .viewer.observers import ObserverManager, Observer, OBSERVER_COLORS
 from .viewer.wind import WindState
+from .viewer.hydro import HydroState
 from .viewer.hud import HUDState
 from .viewer.keybindings import MOVEMENT_KEYS, SHIFT_BINDINGS, KEY_BINDINGS, SPECIAL_BINDINGS
 
@@ -144,6 +145,151 @@ if has_cupy:
 
         # Circular stamp splat
         r = dot_radius
+        for offy in range(-r, r + 1):
+            for offx in range(-r, r + 1):
+                dist_sq = offx * offx + offy * offy
+                if dist_sq > r * r:
+                    continue
+                falloff = 1.0 - math.sqrt(dist_sq) / r
+                px = sx + offx
+                py = sy + offy
+                if px < 0 or px >= sw or py < 0 or py >= sh:
+                    continue
+                contrib = a * falloff
+                cuda.atomic.add(output, (py, px, 0), contrib * color_r)
+                cuda.atomic.add(output, (py, px, 1), contrib * color_g)
+                cuda.atomic.add(output, (py, px, 2), contrib * color_b)
+
+
+    @cuda.jit
+    def _hydro_splat_kernel(
+        trails,       # (N*T, 2) float32 — (row, col) per trail point
+        ages,         # (N,) int32 — per-particle age
+        lifetimes,    # (N,) int32 — per-particle lifetime
+        colors,       # (N, 3) float32 — per-particle (r, g, b)
+        radii,        # (N,) int32 — per-particle splat radius
+        trail_len,    # int32 scalar — trail points per particle
+        base_alpha,   # float32 scalar — base alpha intensity
+        min_vis_age,  # int32 scalar — minimum visible age
+        ref_depth,    # float32 scalar — depth-scaling reference distance
+        terrain,      # (tH, tW) float32 — terrain elevation
+        output,       # (sh, sw, 3) float32 — frame buffer (atomic add)
+        # Camera basis — scalar args to avoid tiny GPU allocations
+        cam_x, cam_y, cam_z,
+        fwd_x, fwd_y, fwd_z,
+        rgt_x, rgt_y, rgt_z,
+        up_x, up_y, up_z,
+        # Projection params
+        fov_scale, aspect_ratio,
+        # Terrain/world params
+        psx, psy, ve, subsample_f, min_depth,
+    ):
+        idx = cuda.grid(1)
+        if idx >= trails.shape[0]:
+            return
+
+        # Compute alpha on-GPU from per-particle ages/lifetimes
+        pidx = idx // trail_len
+        tidx = idx % trail_len
+        age = ages[pidx]
+        lifetime = lifetimes[pidx]
+
+        # Trail point not yet laid down
+        if age <= tidx:
+            return
+
+        # Fade in / fade out / trail decay
+        fade_in = (age - min_vis_age) * 0.1
+        if fade_in < 0.0:
+            fade_in = 0.0
+        elif fade_in > 1.0:
+            fade_in = 1.0
+        fade_out = (lifetime - age) * 0.05
+        if fade_out < 0.0:
+            fade_out = 0.0
+        elif fade_out > 1.0:
+            fade_out = 1.0
+        # Quadratic trail decay — comet-tail effect
+        t = float(tidx) / float(trail_len)
+        trail_fade = (1.0 - t) * (1.0 - t)
+        a = base_alpha * fade_in * fade_out * trail_fade
+
+        # Head glow: bright spark at particle position
+        if tidx == 0:
+            a = a * 1.5
+
+        if a < 1e-6:
+            return
+
+        row = trails[idx, 0]
+        col = trails[idx, 1]
+
+        # Terrain Z lookup (nearest-neighbor, clamped)
+        tH = terrain.shape[0]
+        tW = terrain.shape[1]
+        sr = int(row / subsample_f)
+        sc = int(col / subsample_f)
+        if sr < 0:
+            sr = 0
+        elif sr >= tH:
+            sr = tH - 1
+        if sc < 0:
+            sc = 0
+        elif sc >= tW:
+            sc = tW - 1
+        z_raw = terrain[sr, sc]
+        if z_raw != z_raw:  # NaN check
+            z_raw = 0.0
+        z_val = z_raw * ve + 3.0
+
+        # World position
+        wx = col * psx
+        wy = row * psy
+
+        # Camera-relative
+        dx = wx - cam_x
+        dy = wy - cam_y
+        dz = z_val - cam_z
+
+        # Depth along forward axis
+        depth = dx * fwd_x + dy * fwd_y + dz * fwd_z
+        if depth <= min_depth:
+            return
+
+        # Depth-scaled alpha: closer = brighter, farther = fainter.
+        # Prevents zoomed-out over-saturation from dense overlapping particles.
+        depth_scale = ref_depth / (depth + ref_depth)
+        a = a * depth_scale
+
+        if a < 1e-6:
+            return
+
+        inv_depth = 1.0 / (depth + 1e-10)
+        u_cam = dx * rgt_x + dy * rgt_y + dz * rgt_z
+        v_cam = dx * up_x + dy * up_y + dz * up_z
+        u_ndc = u_cam * inv_depth / (fov_scale * aspect_ratio)
+        v_ndc = v_cam * inv_depth / fov_scale
+
+        sh = output.shape[0]
+        sw = output.shape[1]
+        sx = int((u_ndc + 1.0) * 0.5 * sw)
+        sy = int((1.0 - v_ndc) * 0.5 * sh)
+
+        if sx < 0 or sx >= sw or sy < 0 or sy >= sh:
+            return
+
+        # Per-particle color and radius
+        color_r = colors[pidx, 0]
+        color_g = colors[pidx, 1]
+        color_b = colors[pidx, 2]
+        r = radii[pidx]
+        if r < 1:
+            r = 1
+        # Head glow: +1px radius halo at particle position
+        if tidx == 0:
+            r = r + 1
+
+        # Circular stamp splat
         for offy in range(-r, r + 1):
             for offx in range(-r, r + 1):
                 dist_sq = offx * offx + offy * offy
@@ -717,6 +863,53 @@ class ViewerProxy:
             _add_overlay(v, name, data)
         self._submit(fn)
 
+    def add_hydro(self, flow_dir, flow_accum, **kwargs):
+        """Add hydrological flow particle visualization.
+
+        The flow grids should be computed from a depression-filled DEM
+        (e.g. ``xrspatial.fill()``) so particles follow coherent drainage
+        paths instead of getting trapped in pits.
+
+        Parameters
+        ----------
+        flow_dir : array-like, shape (H, W)
+            D8 flow direction grid (1=E, 2=SE, 4=S, 8=SW, 16=W, 32=NW,
+            64=N, 128=NE).  Compute with ``xrspatial.flow_direction()``.
+        flow_accum : array-like, shape (H, W)
+            Flow accumulation grid (cell counts or area).  Compute with
+            ``xrspatial.flow_accumulation()``.
+        **kwargs
+            Optional overrides: n_particles, max_age, trail_len, speed,
+            accum_threshold, color, alpha, dot_radius, min_visible_age.
+        """
+        stream_order = kwargs.get('stream_order')
+        stream_link = kwargs.get('stream_link')
+        def fn(v):
+            v._init_hydro(flow_dir, flow_accum, **kwargs)
+            v._hydro_enabled = True
+            # Add stream link overlay with palette-matched colors
+            if stream_link is not None:
+                sl_np = stream_link.get() if hasattr(stream_link, 'get') else np.asarray(stream_link)
+                sl_np = np.asarray(sl_np, dtype=np.float32)
+                # Use stream order values for coloring, NaN where no stream
+                if stream_order is not None:
+                    so_for_sl = stream_order.get() if hasattr(stream_order, 'get') else np.asarray(stream_order)
+                    so_for_sl = np.asarray(so_for_sl, dtype=np.float32)
+                    max_order = int(np.nanmax(so_for_sl)) if np.any(~np.isnan(so_for_sl)) else 5
+                    palette_lut = InteractiveViewer._build_stream_palette_lut(
+                        max_order)
+                    sl_color = np.where(
+                        np.isnan(sl_np) | (sl_np <= 0) | np.isnan(so_for_sl) | (so_for_sl <= 0),
+                        np.float32(np.nan), so_for_sl)
+                    _add_overlay(v, 'stream_link', sl_color,
+                                 color_lut=palette_lut)
+                else:
+                    sl_np = np.where(np.isnan(sl_np) | (sl_np <= 0),
+                                     np.float32(np.nan), sl_np)
+                    _add_overlay(v, 'stream_link', sl_np)
+            v._update_frame()
+        self._submit(fn)
+
     def remove_layer(self, name):
         """Remove an overlay layer by name."""
         def fn(v):
@@ -724,6 +917,8 @@ class ViewerProxy:
                 del v._overlay_layers[name]
                 if name in v._base_overlay_layers:
                     del v._base_overlay_layers[name]
+                if name in v._overlay_color_luts:
+                    del v._overlay_color_luts[name]
                 v._overlay_names = list(v._overlay_layers.keys())
                 v._terrain_layer_order = (
                     ['elevation'] + list(v._overlay_names))
@@ -732,6 +927,7 @@ class ViewerProxy:
                     v._terrain_layer_idx = 0
                     v._active_overlay_data = None
                     v._overlay_as_water = False
+                    v._active_overlay_color_lut = None
                 v._update_frame()
                 print(f"Removed layer: {name}")
         self._submit(fn)
@@ -743,6 +939,7 @@ class ViewerProxy:
                 v._active_color_data = None
                 v._active_overlay_data = None
                 v._overlay_as_water = False
+                v._active_overlay_color_lut = None
                 v._terrain_layer_idx = 0
                 v._update_frame()
                 print("Terrain: elevation")
@@ -756,6 +953,7 @@ class ViewerProxy:
             v._active_color_data = None
             v._active_overlay_data = v._overlay_layers[name]
             v._overlay_as_water = name.startswith('flood_')
+            v._active_overlay_color_lut = v._overlay_color_luts.get(name)
             v._update_frame()
             print(f"Terrain: {name}")
         self._submit(fn)
@@ -1008,13 +1206,21 @@ class ViewerProxy:
                 f"shadows={v.shadows}{obs_info})")
 
 
-def _add_overlay(viewer, name, data):
+def _add_overlay(viewer, name, data, color_lut=None):
     """Add or replace an overlay layer on *viewer* and switch to it.
 
     Must be called on the main (render) thread.
+
+    Parameters
+    ----------
+    color_lut : np.ndarray, optional
+        (256, 3) float32 categorical palette LUT.  When provided, the
+        overlay bypasses the terrain colormap and color stretch.
     """
     viewer._overlay_layers[name] = data
     viewer._base_overlay_layers[name] = data
+    if color_lut is not None:
+        viewer._overlay_color_luts[name] = color_lut
     viewer._overlay_names = list(viewer._overlay_layers.keys())
     viewer._terrain_layer_order = (
         ['elevation'] + list(viewer._overlay_names))
@@ -1023,7 +1229,10 @@ def _add_overlay(viewer, name, data):
     viewer._active_color_data = None
     viewer._active_overlay_data = data
     viewer._overlay_as_water = name.startswith('flood_')
-    viewer._update_frame()
+    viewer._active_overlay_color_lut = color_lut
+    # Skip render if camera not yet initialized (overlays added before run())
+    if viewer.position is not None:
+        viewer._update_frame()
     print(f"Terrain: {name}")
 
 
@@ -1070,6 +1279,7 @@ class InteractiveViewer:
     - C: Cycle colormap
     - Shift+F: Fetch/toggle FIRMS fire layer (7d LANDSAT 30m)
     - Shift+W: Toggle wind particle animation
+    - Shift+Y: Toggle hydro flow particle animation
     - Shift+B: Toggle GTFS-RT realtime vehicle overlay
     - F: Save screenshot
     - M: Toggle minimap overlay
@@ -1229,6 +1439,9 @@ class InteractiveViewer:
 
         # Wind particle state
         self.wind = WindState()
+
+        # Hydro flow particle state
+        self.hydro = HydroState()
 
         # GTFS-RT realtime vehicle overlay state
         self._gtfs_rt_url = None
@@ -1750,6 +1963,22 @@ class InteractiveViewer:
         self.overlays.overlay_as_water = value
 
     @property
+    def _active_overlay_color_lut(self):
+        return self.overlays.active_overlay_color_lut
+
+    @_active_overlay_color_lut.setter
+    def _active_overlay_color_lut(self, value):
+        self.overlays.active_overlay_color_lut = value
+
+    @property
+    def _overlay_color_luts(self):
+        return self.overlays.overlay_color_luts
+
+    @_overlay_color_luts.setter
+    def _overlay_color_luts(self, value):
+        self.overlays.overlay_color_luts = value
+
+    @property
     def _terrain_layer_order(self):
         return self.overlays.terrain_layer_order
 
@@ -2100,6 +2329,306 @@ class InteractiveViewer:
     @_wind_done_event.setter
     def _wind_done_event(self, value):
         self.wind.wind_done_event = value
+
+    # ------------------------------------------------------------------
+    # Delegation properties — HydroState
+    # ------------------------------------------------------------------
+
+    @property
+    def _hydro_data(self):
+        return self.hydro.hydro_data
+
+    @_hydro_data.setter
+    def _hydro_data(self, value):
+        self.hydro.hydro_data = value
+
+    @property
+    def _hydro_enabled(self):
+        return self.hydro.hydro_enabled
+
+    @_hydro_enabled.setter
+    def _hydro_enabled(self, value):
+        self.hydro.hydro_enabled = value
+
+    @property
+    def _hydro_flow_u_px(self):
+        return self.hydro.hydro_flow_u_px
+
+    @_hydro_flow_u_px.setter
+    def _hydro_flow_u_px(self, value):
+        self.hydro.hydro_flow_u_px = value
+
+    @property
+    def _hydro_flow_v_px(self):
+        return self.hydro.hydro_flow_v_px
+
+    @_hydro_flow_v_px.setter
+    def _hydro_flow_v_px(self, value):
+        self.hydro.hydro_flow_v_px = value
+
+    @property
+    def _hydro_flow_accum_norm(self):
+        return self.hydro.hydro_flow_accum_norm
+
+    @_hydro_flow_accum_norm.setter
+    def _hydro_flow_accum_norm(self, value):
+        self.hydro.hydro_flow_accum_norm = value
+
+    @property
+    def _hydro_stream_order(self):
+        return self.hydro.hydro_stream_order
+
+    @_hydro_stream_order.setter
+    def _hydro_stream_order(self, value):
+        self.hydro.hydro_stream_order = value
+
+    @property
+    def _hydro_stream_order_raw(self):
+        return self.hydro.hydro_stream_order_raw
+
+    @_hydro_stream_order_raw.setter
+    def _hydro_stream_order_raw(self, value):
+        self.hydro.hydro_stream_order_raw = value
+
+    @property
+    def _hydro_stream_link(self):
+        return self.hydro.hydro_stream_link
+
+    @_hydro_stream_link.setter
+    def _hydro_stream_link(self, value):
+        self.hydro.hydro_stream_link = value
+
+    @property
+    def _hydro_particle_raw_order(self):
+        return self.hydro.hydro_particle_raw_order
+
+    @_hydro_particle_raw_order.setter
+    def _hydro_particle_raw_order(self, value):
+        self.hydro.hydro_particle_raw_order = value
+
+    @property
+    def _hydro_particles(self):
+        return self.hydro.hydro_particles
+
+    @_hydro_particles.setter
+    def _hydro_particles(self, value):
+        self.hydro.hydro_particles = value
+
+    @property
+    def _hydro_ages(self):
+        return self.hydro.hydro_ages
+
+    @_hydro_ages.setter
+    def _hydro_ages(self, value):
+        self.hydro.hydro_ages = value
+
+    @property
+    def _hydro_lifetimes(self):
+        return self.hydro.hydro_lifetimes
+
+    @_hydro_lifetimes.setter
+    def _hydro_lifetimes(self, value):
+        self.hydro.hydro_lifetimes = value
+
+    @property
+    def _hydro_max_age(self):
+        return self.hydro.hydro_max_age
+
+    @property
+    def _hydro_n_particles(self):
+        return self.hydro.hydro_n_particles
+
+    @_hydro_n_particles.setter
+    def _hydro_n_particles(self, value):
+        self.hydro.hydro_n_particles = value
+
+    @property
+    def _hydro_trail_len(self):
+        return self.hydro.hydro_trail_len
+
+    @_hydro_trail_len.setter
+    def _hydro_trail_len(self, value):
+        self.hydro.hydro_trail_len = value
+
+    @property
+    def _hydro_trails(self):
+        return self.hydro.hydro_trails
+
+    @_hydro_trails.setter
+    def _hydro_trails(self, value):
+        self.hydro.hydro_trails = value
+
+    @property
+    def _hydro_speed(self):
+        return self.hydro.hydro_speed
+
+    @_hydro_speed.setter
+    def _hydro_speed(self, value):
+        self.hydro.hydro_speed = value
+
+    @property
+    def _hydro_min_depth(self):
+        return self.hydro.hydro_min_depth
+
+    @_hydro_min_depth.setter
+    def _hydro_min_depth(self, value):
+        self.hydro.hydro_min_depth = value
+
+    @property
+    def _hydro_ref_depth(self):
+        return self.hydro.hydro_ref_depth
+
+    @_hydro_ref_depth.setter
+    def _hydro_ref_depth(self, value):
+        self.hydro.hydro_ref_depth = value
+
+    @property
+    def _hydro_dot_radius(self):
+        return self.hydro.hydro_dot_radius
+
+    @_hydro_dot_radius.setter
+    def _hydro_dot_radius(self, value):
+        self.hydro.hydro_dot_radius = value
+
+    @property
+    def _hydro_alpha(self):
+        return self.hydro.hydro_alpha
+
+    @_hydro_alpha.setter
+    def _hydro_alpha(self, value):
+        self.hydro.hydro_alpha = value
+
+    @property
+    def _hydro_min_visible_age(self):
+        return self.hydro.hydro_min_visible_age
+
+    @property
+    def _hydro_accum_threshold(self):
+        return self.hydro.hydro_accum_threshold
+
+    @_hydro_accum_threshold.setter
+    def _hydro_accum_threshold(self, value):
+        self.hydro.hydro_accum_threshold = value
+
+    @property
+    def _hydro_color(self):
+        return self.hydro.hydro_color
+
+    @_hydro_color.setter
+    def _hydro_color(self, value):
+        self.hydro.hydro_color = value
+
+    @property
+    def _hydro_terrain_np(self):
+        return self.hydro.hydro_terrain_np
+
+    @_hydro_terrain_np.setter
+    def _hydro_terrain_np(self, value):
+        self.hydro.hydro_terrain_np = value
+
+    @property
+    def _hydro_spawn_probs(self):
+        return self.hydro.hydro_spawn_probs
+
+    @_hydro_spawn_probs.setter
+    def _hydro_spawn_probs(self, value):
+        self.hydro.hydro_spawn_probs = value
+
+    @property
+    def _hydro_spawn_indices(self):
+        return self.hydro.hydro_spawn_indices
+
+    @_hydro_spawn_indices.setter
+    def _hydro_spawn_indices(self, value):
+        self.hydro.hydro_spawn_indices = value
+
+    @property
+    def _hydro_spawn_valid_probs(self):
+        return self.hydro.hydro_spawn_valid_probs
+
+    @_hydro_spawn_valid_probs.setter
+    def _hydro_spawn_valid_probs(self, value):
+        self.hydro.hydro_spawn_valid_probs = value
+
+    @property
+    def _d_hydro_trails(self):
+        return self.hydro.d_hydro_trails
+
+    @_d_hydro_trails.setter
+    def _d_hydro_trails(self, value):
+        self.hydro.d_hydro_trails = value
+
+    @property
+    def _d_hydro_ages(self):
+        return self.hydro.d_hydro_ages
+
+    @_d_hydro_ages.setter
+    def _d_hydro_ages(self, value):
+        self.hydro.d_hydro_ages = value
+
+    @property
+    def _d_hydro_lifetimes(self):
+        return self.hydro.d_hydro_lifetimes
+
+    @_d_hydro_lifetimes.setter
+    def _d_hydro_lifetimes(self, value):
+        self.hydro.d_hydro_lifetimes = value
+
+    @property
+    def _hydro_done_event(self):
+        return self.hydro.hydro_done_event
+
+    @_hydro_done_event.setter
+    def _hydro_done_event(self, value):
+        self.hydro.hydro_done_event = value
+
+    @property
+    def _hydro_slope_mag(self):
+        return self.hydro.hydro_slope_mag
+
+    @_hydro_slope_mag.setter
+    def _hydro_slope_mag(self, value):
+        self.hydro.hydro_slope_mag = value
+
+    @property
+    def _hydro_particle_accum(self):
+        return self.hydro.hydro_particle_accum
+
+    @_hydro_particle_accum.setter
+    def _hydro_particle_accum(self, value):
+        self.hydro.hydro_particle_accum = value
+
+    @property
+    def _d_hydro_colors(self):
+        return self.hydro.d_hydro_colors
+
+    @_d_hydro_colors.setter
+    def _d_hydro_colors(self, value):
+        self.hydro.d_hydro_colors = value
+
+    @property
+    def _d_hydro_radii(self):
+        return self.hydro.d_hydro_radii
+
+    @_d_hydro_radii.setter
+    def _d_hydro_radii(self, value):
+        self.hydro.d_hydro_radii = value
+
+    @property
+    def _hydro_particle_colors(self):
+        return self.hydro.hydro_particle_colors
+
+    @_hydro_particle_colors.setter
+    def _hydro_particle_colors(self, value):
+        self.hydro.hydro_particle_colors = value
+
+    @property
+    def _hydro_particle_radii(self):
+        return self.hydro.hydro_particle_radii
+
+    @_hydro_particle_radii.setter
+    def _hydro_particle_radii(self, value):
+        self.hydro.hydro_particle_radii = value
 
     # ------------------------------------------------------------------
     # Delegation properties — ObserverManager
@@ -2569,6 +3098,10 @@ class InteractiveViewer:
         if self._wind_enabled:
             parts.append('wind')
 
+        # Hydro
+        if self._hydro_enabled:
+            parts.append('hydro')
+
         # Active observer drone mode
         active_obs = (self._observers.get(self._active_observer)
                       if self._active_observer else None)
@@ -2809,7 +3342,8 @@ class InteractiveViewer:
 
         self.raster = sub
         self._wind_terrain_np = None  # invalidate cached terrain
-        self._d_base_frame = None     # invalidate GPU wind buffers
+        self._hydro_terrain_np = None
+        self._d_base_frame = None     # invalidate GPU wind/hydro buffers
         self._d_wind_scratch = None
         H, W = sub.shape
         self.terrain_shape = (H, W)
@@ -2924,6 +3458,8 @@ class InteractiveViewer:
             if terrain_name != 'elevation' and terrain_name in self._overlay_layers:
                 self._active_overlay_data = self._overlay_layers[terrain_name]
                 self._overlay_as_water = terrain_name.startswith('flood_')
+                self._active_overlay_color_lut = self._overlay_color_luts.get(
+                    terrain_name)
 
         # 6. Invalidate chunk manager cache (meshes need new Z coords)
         if self._chunk_manager is not None:
@@ -4055,6 +4591,681 @@ class InteractiveViewer:
         cp.clip(d_frame, 0, 1, out=d_frame)
 
     # ------------------------------------------------------------------
+    # Hydrological flow particles
+    # ------------------------------------------------------------------
+
+    def _toggle_hydro(self):
+        """Toggle hydro flow particle animation on/off."""
+        if self._hydro_data is None:
+            print("No hydro data. Use v.add_hydro(flow_dir, flow_accum).")
+            return
+        self._hydro_enabled = not self._hydro_enabled
+        print(f"Hydro flow: {'ON' if self._hydro_enabled else 'OFF'}")
+        self._update_frame()
+
+    def _action_toggle_hydro(self):
+        self._toggle_hydro()
+
+    _STREAM_ORDER_PALETTE = np.array([
+        [0.0,  0.0,  0.0 ],  # 0: unused
+        [0.55, 0.90, 0.40],  # 1: yellow-green (headwaters)
+        [0.20, 0.80, 0.60],  # 2: teal
+        [0.10, 0.55, 0.90],  # 3: blue
+        [0.30, 0.20, 0.85],  # 4: indigo
+        [0.70, 0.15, 0.80],  # 5: purple
+        [0.95, 0.25, 0.35],  # 6+: red-orange (major rivers)
+    ], dtype=np.float32)
+
+    @staticmethod
+    def _build_stream_palette_lut(max_order):
+        """Build a 256-entry color LUT for stream order overlay rendering.
+
+        Maps normalized [0,1] overlay values back to integer orders
+        and looks up the categorical palette color.
+        """
+        palette = InteractiveViewer._STREAM_ORDER_PALETTE
+        lut = np.zeros((256, 3), dtype=np.float32)
+        denom = max(max_order - 1, 1)
+        for i in range(256):
+            # Reverse the normalization: order = 1 + norm * (max_order - 1)
+            order = int(round(1 + (i / 255.0) * denom))
+            order = max(1, min(6, order))
+            lut[i] = palette[order]
+        return lut
+
+    @staticmethod
+    def _hydro_color_from_order(order_norm, raw_order=None):
+        """Map stream order → (R, G, B) per particle.
+
+        If *raw_order* is provided, uses categorical palette keyed by
+        integer Strahler order.  Otherwise falls back to continuous
+        blue gradient from normalized [0,1] order.
+        """
+        if raw_order is not None:
+            idx = np.clip(raw_order, 1, 6).astype(int)
+            colors = InteractiveViewer._STREAM_ORDER_PALETTE[idx].copy()
+        else:
+            colors = np.empty((len(order_norm), 3), dtype=np.float32)
+            colors[:, 0] = 0.05 + order_norm * 0.35   # R: 0.05 → 0.40
+            colors[:, 1] = 0.12 + order_norm * 0.78   # G: 0.12 → 0.90
+            colors[:, 2] = 0.45 + order_norm * 0.55   # B: 0.45 → 1.00
+        # Emissive boost — allow >1.0 for HDR glow via additive blending
+        colors = np.clip(colors * 1.3, 0.0, 1.5)
+        return colors
+
+    @staticmethod
+    def _hydro_radius_from_order(order_norm, raw_order=None):
+        """Map stream order → radius (2–5) per particle.
+
+        If *raw_order* is provided, uses integer order + 1 directly
+        (clamped 2–5).  Otherwise uses continuous mapping.
+        """
+        if raw_order is not None:
+            return np.clip(raw_order + 1, 2, 5).astype(np.int32)
+        return np.clip(2 + (order_norm * 3).astype(np.int32),
+                       2, 5).astype(np.int32)
+
+    def _init_hydro(self, flow_dir, flow_accum, **kwargs):
+        """Initialize hydro flow particles from D8 flow direction and accumulation grids.
+
+        Parameters
+        ----------
+        flow_dir : array-like, shape (H, W)
+            D8 flow direction grid (1=E, 2=SE, 4=S, 8=SW, 16=W, 32=NW,
+            64=N, 128=NE).
+        flow_accum : array-like, shape (H, W)
+            Flow accumulation grid (cell counts or area).
+        **kwargs
+            Optional overrides: n_particles, max_age, trail_len, speed,
+            accum_threshold, color, alpha, dot_radius, min_visible_age,
+            stream_order (array).
+        """
+        # Accept CuPy or NumPy arrays — particle advection runs on CPU
+        if hasattr(flow_dir, 'get'):
+            flow_dir = flow_dir.get()
+        if hasattr(flow_accum, 'get'):
+            flow_accum = flow_accum.get()
+        flow_dir = np.asarray(flow_dir, dtype=np.int32)
+        flow_accum = np.asarray(flow_accum, dtype=np.float64)
+        H, W = flow_dir.shape
+
+        # Stream order grid (optional but strongly recommended)
+        stream_order = kwargs.pop('stream_order', None)
+        if stream_order is not None:
+            if hasattr(stream_order, 'get'):
+                stream_order = stream_order.get()
+            stream_order = np.asarray(stream_order, dtype=np.float64)
+            # Replace NaN with 0 (non-stream cells)
+            stream_order = np.nan_to_num(stream_order, nan=0.0)
+        has_stream_order = stream_order is not None and (stream_order > 0).any()
+
+        self._hydro_data = (flow_dir, flow_accum)
+
+        # Apply optional overrides
+        for key, attr, conv in [
+            ('n_particles', '_hydro_n_particles', int),
+            ('max_age', None, int),
+            ('trail_len', '_hydro_trail_len', int),
+            ('speed', '_hydro_speed', float),
+            ('accum_threshold', '_hydro_accum_threshold', int),
+            ('color', '_hydro_color', tuple),
+            ('alpha', '_hydro_alpha', float),
+            ('dot_radius', '_hydro_dot_radius', int),
+            ('min_visible_age', None, int),
+        ]:
+            if key in kwargs:
+                val = conv(kwargs[key])
+                if attr:
+                    setattr(self, attr, val)
+                elif key == 'max_age':
+                    self.hydro.hydro_max_age = val
+                elif key == 'min_visible_age':
+                    self.hydro.hydro_min_visible_age = val
+
+        # D8 code → (drow, dcol) unit vectors
+        # Row increases downward (south), col increases rightward (east)
+        sqrt2_inv = 1.0 / np.sqrt(2.0)
+        d8_to_drow_dcol = {
+            1:   (0.0, 1.0),            # E
+            2:   (sqrt2_inv, sqrt2_inv), # SE
+            4:   (1.0, 0.0),            # S
+            8:   (sqrt2_inv, -sqrt2_inv),# SW
+            16:  (0.0, -1.0),           # W
+            32:  (-sqrt2_inv, -sqrt2_inv),# NW
+            64:  (-1.0, 0.0),           # N
+            128: (-sqrt2_inv, sqrt2_inv),# NE
+        }
+
+        flow_u = np.zeros((H, W), dtype=np.float32)  # col direction
+        flow_v = np.zeros((H, W), dtype=np.float32)  # row direction
+        for code, (dr, dc) in d8_to_drow_dcol.items():
+            mask = flow_dir == code
+            flow_v[mask] = dr
+            flow_u[mask] = dc
+
+        self._hydro_flow_u_px = flow_u
+        self._hydro_flow_v_px = flow_v
+
+        # Normalize accumulation: log10(clip(fa, 1)), scale to [0,1]
+        fa_clipped = np.clip(flow_accum, 1, None)
+        log_fa = np.log10(fa_clipped)
+        threshold = np.log10(max(self._hydro_accum_threshold, 1))
+        log_max = log_fa.max()
+        if log_max > threshold:
+            accum_norm = np.clip((log_fa - threshold) / (log_max - threshold), 0, 1)
+        else:
+            accum_norm = np.zeros_like(log_fa)
+        self._hydro_flow_accum_norm = accum_norm.astype(np.float32)
+
+        # Store stream order grids
+        if has_stream_order:
+            max_order = stream_order.max()
+            so_norm = (stream_order / max(max_order, 1)).astype(np.float32)
+            self._hydro_stream_order = so_norm
+            self._hydro_stream_order_raw = stream_order.astype(np.int32)
+            print(f"  Stream order: max {int(max_order)}, "
+                  f"{int((stream_order > 0).sum())} stream cells")
+        else:
+            self._hydro_stream_order = None
+            self._hydro_stream_order_raw = None
+
+        # Accept and store stream_link grid
+        stream_link_grid = kwargs.pop('stream_link', None)
+        if stream_link_grid is not None:
+            if hasattr(stream_link_grid, 'get'):
+                stream_link_grid = stream_link_grid.get()
+            self._hydro_stream_link = np.nan_to_num(
+                np.asarray(stream_link_grid, dtype=np.float64), nan=0.0
+            ).astype(np.int32)
+        else:
+            self._hydro_stream_link = None
+
+        # Build spawn probabilities — stream-order weighted if available
+        valid_d8 = np.isin(flow_dir, list(d8_to_drow_dcol.keys()))
+        if has_stream_order:
+            # Spawn on stream cells, weighted by sqrt(order) — much
+            # flatter than order^2, giving real coverage to headwaters
+            spawn_weights = np.where(stream_order > 0,
+                                     np.sqrt(stream_order), 0.0)
+            spawn_weights[~valid_d8] = 0.0
+        else:
+            spawn_weights = accum_norm.copy()
+            spawn_weights[~valid_d8] = 0.0
+
+        # Rasterize Overture waterway LineStrings into spawn pool
+        waterway_geojson = kwargs.pop('waterway_geojson', None)
+        if waterway_geojson is not None and has_stream_order:
+            _WATERWAY_ORDER = {
+                'river': (5, 3.0), 'canal': (4, 2.5),
+                'stream': (2, 1.5), 'drain': (1, 1.0), 'ditch': (1, 1.0),
+            }
+            so_raw = self._hydro_stream_order_raw
+            n_ww_cells = 0
+            for feat in waterway_geojson.get('features', []):
+                geom = feat.get('geometry', {})
+                if geom.get('type') != 'LineString':
+                    continue
+                coords = geom.get('coordinates', [])
+                if len(coords) < 2:
+                    continue
+                subtype = (feat.get('properties') or {}).get('subtype', '')
+                eq_order, eq_weight = _WATERWAY_ORDER.get(
+                    subtype, (2, 1.5))
+                # Convert lon/lat coords to pixel (col, row)
+                from .geojson import (
+                    _geojson_to_world_coords, _build_transformer,
+                )
+                terrain_data_np = self.raster.data
+                if hasattr(terrain_data_np, 'get'):
+                    terrain_data_np = terrain_data_np.get()
+                terrain_data_np = np.asarray(terrain_data_np, dtype=np.float32)
+                try:
+                    transformer = _build_transformer(self.raster)
+                except Exception:
+                    transformer = None
+                try:
+                    _, pixel_coords = _geojson_to_world_coords(
+                        coords, self.raster, terrain_data_np,
+                        self._base_pixel_spacing_x,
+                        self._base_pixel_spacing_y,
+                        transformer=transformer,
+                        return_pixel_coords=True)
+                except Exception:
+                    continue
+                if len(pixel_coords) < 2:
+                    continue
+                # Densify at 1-pixel steps between consecutive vertices
+                for i in range(len(pixel_coords) - 1):
+                    c0, r0 = pixel_coords[i]
+                    c1, r1 = pixel_coords[i + 1]
+                    dc, dr = c1 - c0, r1 - r0
+                    n_steps = max(int(max(abs(dr), abs(dc))), 1)
+                    for s in range(n_steps + 1):
+                        t = s / n_steps
+                        rr = int(round(r0 + dr * t))
+                        cc = int(round(c0 + dc * t))
+                        if 0 <= rr < H and 0 <= cc < W:
+                            if valid_d8[rr, cc]:
+                                # Upgrade raw order (don't downgrade)
+                                if so_raw[rr, cc] < eq_order:
+                                    so_raw[rr, cc] = eq_order
+                                # Upgrade spawn weight
+                                cur_w = spawn_weights[rr, cc]
+                                new_w = eq_weight
+                                if new_w > cur_w:
+                                    spawn_weights[rr, cc] = new_w
+                                n_ww_cells += 1
+            if n_ww_cells > 0:
+                print(f"  Waterway rasterization: {n_ww_cells} cells injected")
+
+        flat_weights = spawn_weights.ravel()
+        valid_mask = flat_weights > 0
+        valid_indices = np.nonzero(valid_mask)[0]
+        if len(valid_indices) > 0:
+            valid_probs = flat_weights[valid_indices].astype(np.float64)
+            valid_probs /= valid_probs.sum()
+        else:
+            valid_d8_flat = valid_d8.ravel()
+            valid_indices = np.nonzero(valid_d8_flat)[0]
+            if len(valid_indices) > 0:
+                valid_probs = np.ones(len(valid_indices), dtype=np.float64)
+                valid_probs /= valid_probs.sum()
+            else:
+                valid_indices = np.arange(H * W)
+                valid_probs = np.ones(H * W, dtype=np.float64) / (H * W)
+        self._hydro_spawn_indices = valid_indices
+        self._hydro_spawn_valid_probs = valid_probs
+
+        # Spawn initial particles
+        N = self._hydro_n_particles
+        chosen = np.random.choice(len(valid_indices), N, p=valid_probs)
+        indices = valid_indices[chosen]
+        rows = (indices // W).astype(np.float32) + np.random.uniform(-0.5, 0.5, N).astype(np.float32)
+        cols = (indices % W).astype(np.float32) + np.random.uniform(-0.5, 0.5, N).astype(np.float32)
+        rows = np.clip(rows, 0, H - 1)
+        cols = np.clip(cols, 0, W - 1)
+
+        self._hydro_particles = np.column_stack([rows, cols]).astype(np.float32)
+        self._hydro_ages = np.random.randint(0, self._hydro_max_age, N).astype(np.int32)
+        self._hydro_lifetimes = np.random.randint(
+            self._hydro_max_age // 2, self._hydro_max_age, N).astype(np.int32)
+        self._hydro_trails = np.zeros(
+            (N, self._hydro_trail_len, 2), dtype=np.float32)
+        for t in range(self._hydro_trail_len):
+            self._hydro_trails[:, t, :] = self._hydro_particles
+
+        # Compute terrain slope magnitude for speed modulation
+        terrain_data = self.raster.data
+        if hasattr(terrain_data, 'get'):
+            elev = terrain_data.get().astype(np.float64)
+        else:
+            elev = np.asarray(terrain_data, dtype=np.float64)
+        grad_row, grad_col = np.gradient(np.nan_to_num(elev, nan=0.0))
+        slope_mag = np.sqrt(grad_row**2 + grad_col**2).astype(np.float32)
+        p95 = np.percentile(slope_mag[slope_mag > 0], 95) if (slope_mag > 0).any() else 1.0
+        slope_norm = np.clip(slope_mag / max(p95, 1e-6), 0, 1).astype(np.float32)
+        self._hydro_slope_mag = slope_norm
+
+        # Per-particle visual properties from stream order (or accum fallback)
+        r_idx = np.clip(np.floor(rows).astype(int), 0, H - 1)
+        c_idx = np.clip(np.floor(cols).astype(int), 0, W - 1)
+        if has_stream_order:
+            order_val = so_norm[r_idx, c_idx].astype(np.float32)
+            raw_order = self._hydro_stream_order_raw[r_idx, c_idx]
+        else:
+            order_val = accum_norm[r_idx, c_idx].astype(np.float32)
+            raw_order = None
+        self._hydro_particle_accum = order_val
+        self._hydro_particle_raw_order = raw_order
+        self._hydro_particle_colors = self._hydro_color_from_order(
+            order_val, raw_order=raw_order)
+        self._hydro_particle_radii = self._hydro_radius_from_order(
+            order_val, raw_order=raw_order)
+
+        # Min render distance and depth-scaled alpha reference
+        world_diag = np.sqrt((W * self._base_pixel_spacing_x)**2 +
+                             (H * self._base_pixel_spacing_y)**2)
+        self._hydro_min_depth = world_diag * 0.02
+        self._hydro_ref_depth = world_diag * 0.15
+
+        print(f"  Hydro flow initialized on {H}x{W} grid "
+              f"({N} particles, threshold={self._hydro_accum_threshold})")
+
+    def _update_hydro_particles(self):
+        """Advect hydro particles one tick using D8 flow direction lookup."""
+        if self._hydro_flow_u_px is None or self._hydro_particles is None:
+            return
+
+        H, W = self._hydro_flow_u_px.shape
+        pts = self._hydro_particles  # (N, 2) — (row, col)
+
+        # Shift trail buffer (drop oldest, prepend current position)
+        self._hydro_trails[:, 1:, :] = self._hydro_trails[:, :-1, :]
+        self._hydro_trails[:, 0, :] = pts
+
+        # Nearest-neighbor D8 lookup (discrete — no interpolation)
+        rows = pts[:, 0]
+        cols = pts[:, 1]
+        r_idx = np.clip(np.floor(np.nan_to_num(rows, nan=0.0)).astype(int), 0, H - 1)
+        c_idx = np.clip(np.floor(np.nan_to_num(cols, nan=0.0)).astype(int), 0, W - 1)
+
+        u_val = self._hydro_flow_u_px[r_idx, c_idx]
+        v_val = self._hydro_flow_v_px[r_idx, c_idx]
+
+        # Max-track per-particle visual weight (stream order or accum).
+        # Particles only get brighter as they flow into bigger streams.
+        so = self._hydro_stream_order
+        so_raw = self._hydro_stream_order_raw
+        if so is not None:
+            current_val = so[r_idx, c_idx]
+        else:
+            current_val = self._hydro_flow_accum_norm[r_idx, c_idx]
+        old_val = self._hydro_particle_accum.copy()
+        np.maximum(old_val, current_val, out=self._hydro_particle_accum)
+        # Track raw integer order alongside normalized value
+        if so_raw is not None and self._hydro_particle_raw_order is not None:
+            current_raw = so_raw[r_idx, c_idx]
+            np.maximum(self._hydro_particle_raw_order, current_raw,
+                       out=self._hydro_particle_raw_order)
+        changed = self._hydro_particle_accum > old_val
+        if changed.any():
+            a = self._hydro_particle_accum[changed]
+            raw_o = (self._hydro_particle_raw_order[changed]
+                     if self._hydro_particle_raw_order is not None
+                     else None)
+            self._hydro_particle_colors[changed] = \
+                self._hydro_color_from_order(a, raw_order=raw_o)
+            self._hydro_particle_radii[changed] = \
+                self._hydro_radius_from_order(a, raw_order=raw_o)
+
+        # Small random jitter for visual variety
+        jitter = np.random.uniform(-0.1, 0.1, pts.shape).astype(np.float32)
+
+        # Slope-based speed: steeper terrain → faster flow
+        # Base speed 0.3 + 0.7 * slope so even flat areas move
+        slope_factor = np.ones(len(r_idx), dtype=np.float32)
+        if self._hydro_slope_mag is not None:
+            slope_factor = 0.3 + 0.7 * self._hydro_slope_mag[r_idx, c_idx]
+
+        # Advect
+        speed = self._hydro_speed
+        dt_scale = getattr(self, '_dt_scale', 1.0)
+        pts[:, 0] += (v_val + jitter[:, 0]) * speed * dt_scale * slope_factor
+        pts[:, 1] += (u_val + jitter[:, 1]) * speed * dt_scale * slope_factor
+
+        # Age particles
+        self._hydro_ages += 1
+
+        # Respawn: OOB, aged-out, or stuck (zero velocity = pit/sink)
+        nan_pos = np.isnan(pts[:, 0]) | np.isnan(pts[:, 1])
+        oob = nan_pos | (pts[:, 0] < 0) | (pts[:, 0] >= H) | (pts[:, 1] < 0) | (pts[:, 1] >= W)
+        old = self._hydro_ages >= self._hydro_lifetimes
+        stuck = (u_val == 0) & (v_val == 0)
+        respawn = oob | old | stuck
+
+        n_respawn = int(respawn.sum())
+        if n_respawn > 0:
+            chosen = np.random.choice(
+                len(self._hydro_spawn_indices), n_respawn,
+                p=self._hydro_spawn_valid_probs)
+            indices = self._hydro_spawn_indices[chosen]
+            pts[respawn, 0] = (indices // W).astype(np.float32) + np.random.uniform(-0.5, 0.5, n_respawn).astype(np.float32)
+            pts[respawn, 1] = (indices % W).astype(np.float32) + np.random.uniform(-0.5, 0.5, n_respawn).astype(np.float32)
+            pts[respawn, 0] = np.clip(pts[respawn, 0], 0, H - 1)
+            pts[respawn, 1] = np.clip(pts[respawn, 1], 0, W - 1)
+            self._hydro_ages[respawn] = 0
+            self._hydro_lifetimes[respawn] = np.random.randint(
+                self._hydro_max_age // 2, self._hydro_max_age, n_respawn)
+            for t in range(self._hydro_trail_len):
+                self._hydro_trails[respawn, t, :] = pts[respawn]
+            # Reset visual weight, color, radius for respawned particles
+            r_new = np.clip(np.floor(pts[respawn, 0]).astype(int), 0, H - 1)
+            c_new = np.clip(np.floor(pts[respawn, 1]).astype(int), 0, W - 1)
+            so = self._hydro_stream_order
+            so_raw = self._hydro_stream_order_raw
+            if so is not None:
+                new_val = so[r_new, c_new]
+            else:
+                new_val = self._hydro_flow_accum_norm[r_new, c_new]
+            self._hydro_particle_accum[respawn] = new_val
+            # Reset raw order for respawned particles
+            if so_raw is not None and self._hydro_particle_raw_order is not None:
+                self._hydro_particle_raw_order[respawn] = so_raw[r_new, c_new]
+                raw_o = self._hydro_particle_raw_order[respawn]
+            else:
+                raw_o = None
+            self._hydro_particle_colors[respawn] = \
+                self._hydro_color_from_order(new_val, raw_order=raw_o)
+            self._hydro_particle_radii[respawn] = \
+                self._hydro_radius_from_order(new_val, raw_order=raw_o)
+
+    def _draw_hydro_on_frame(self, img):
+        """Project hydro particles to screen space and draw on rendered frame.
+
+        CPU fallback with per-particle accumulation-scaled color and radius.
+
+        Parameters
+        ----------
+        img : ndarray, shape (H_screen, W_screen, 3)
+            Rendered frame (float32 0-1). Modified in-place.
+        """
+        if self._hydro_particles is None:
+            return
+
+        from .analysis.render import _compute_camera_basis
+
+        sh, sw = img.shape[:2]
+        N = self._hydro_particles.shape[0]
+        trail_len = self._hydro_trail_len
+
+        cam_pos = self.position
+        look_at = self._get_look_at()
+        forward, right, cam_up = _compute_camera_basis(
+            tuple(cam_pos), tuple(look_at), (0, 0, 1),
+        )
+        fov_scale = math.tan(math.radians(self.fov) / 2.0)
+        aspect_ratio = sw / sh
+
+        if self._hydro_terrain_np is None:
+            terrain_data = self.raster.data
+            if hasattr(terrain_data, 'get'):
+                self._hydro_terrain_np = terrain_data.get()
+            else:
+                self._hydro_terrain_np = np.asarray(terrain_data)
+        terrain_np = self._hydro_terrain_np
+        tH, tW = terrain_np.shape
+
+        f = self.subsample_factor
+        psx = self._base_pixel_spacing_x
+        psy = self._base_pixel_spacing_y
+        ve = self.vertical_exaggeration
+        min_depth = self._hydro_min_depth
+
+        all_pts = self._hydro_trails.reshape(-1, 2)
+        rows_all = all_pts[:, 0]
+        cols_all = all_pts[:, 1]
+
+        sr = np.clip(np.nan_to_num(rows_all / f, nan=0.0).astype(np.int32), 0, tH - 1)
+        sc = np.clip(np.nan_to_num(cols_all / f, nan=0.0).astype(np.int32), 0, tW - 1)
+        z_vals = np.nan_to_num(terrain_np[sr, sc], nan=0.0) * ve + 3.0
+
+        wx = cols_all * psx
+        wy = rows_all * psy
+
+        dx = wx - cam_pos[0]
+        dy = wy - cam_pos[1]
+        dz = z_vals - cam_pos[2]
+
+        depth = dx * forward[0] + dy * forward[1] + dz * forward[2]
+        valid = depth > min_depth
+
+        inv_depth = np.where(valid, 1.0 / (depth + 1e-10), 0.0)
+        u_cam = dx * right[0] + dy * right[1] + dz * right[2]
+        v_cam = dx * cam_up[0] + dy * cam_up[1] + dz * cam_up[2]
+        u_ndc = u_cam * inv_depth / (fov_scale * aspect_ratio)
+        v_ndc = v_cam * inv_depth / fov_scale
+
+        sx_all = np.nan_to_num(((u_ndc + 1.0) * 0.5 * sw), nan=-1.0).astype(np.int32)
+        sy_all = np.nan_to_num(((1.0 - v_ndc) * 0.5 * sh), nan=-1.0).astype(np.int32)
+
+        on_screen = valid & (sx_all >= 0) & (sx_all < sw) & (sy_all >= 0) & (sy_all < sh)
+
+        ages = self._hydro_ages
+        lifetimes = self._hydro_lifetimes
+
+        trail_idx = np.tile(np.arange(trail_len, dtype=np.float32), N)
+        ages_rep = np.repeat(ages, trail_len)
+        lifetimes_rep = np.repeat(lifetimes, trail_len)
+        age_ok = ages_rep > trail_idx
+
+        mva = self._hydro_min_visible_age
+        fade_in = np.clip((ages_rep - mva) / 10.0, 0, 1)
+        fade_out = np.clip((lifetimes_rep - ages_rep) / 20.0, 0, 1)
+        # Quadratic trail decay — comet-tail effect (matches GPU kernel)
+        trail_fade = (1.0 - trail_idx / trail_len) ** 2
+
+        ref_d = self._hydro_ref_depth
+        depth_scale = ref_d / (depth + ref_d)
+        alpha = self._hydro_alpha * fade_in * fade_out * trail_fade * depth_scale
+
+        # Head glow: bright spark at particle position (tidx == 0)
+        is_head = trail_idx == 0
+        alpha = np.where(is_head, alpha * 1.5, alpha)
+
+        mask = on_screen & age_ok & (alpha > 1e-6)
+        if not mask.any():
+            return img
+
+        sx_m = sx_all[mask]
+        sy_m = sy_all[mask]
+        alpha_m = alpha[mask].astype(np.float32)
+
+        # Per-particle color/radius → per-trail-point via particle index
+        particle_idx = np.arange(N * trail_len) // trail_len
+        pidx_m = particle_idx[mask]
+        color_m = self._hydro_particle_colors[pidx_m]  # (M, 3)
+        radii_m = self._hydro_particle_radii[pidx_m]    # (M,)
+
+        # Head glow: +1px radius at particle position
+        is_head_m = trail_idx[mask] == 0
+        radii_m = np.where(is_head_m, radii_m + 1, radii_m)
+
+        for r_val in range(1, 7):
+            r_mask = radii_m == r_val
+            if not r_mask.any():
+                continue
+            sxr = sx_m[r_mask]
+            syr = sy_m[r_mask]
+            ar = alpha_m[r_mask]
+            cr = color_m[r_mask]
+
+            for offy in range(-r_val, r_val + 1):
+                for offx in range(-r_val, r_val + 1):
+                    dist_sq = offx * offx + offy * offy
+                    if dist_sq > r_val * r_val:
+                        continue
+                    falloff = 1.0 - (dist_sq / (r_val * r_val)) ** 0.5
+
+                    px = sxr + offx
+                    py = syr + offy
+                    ok = (px >= 0) & (px < sw) & (py >= 0) & (py < sh)
+                    if not ok.any():
+                        continue
+
+                    contribution = ar[ok] * falloff
+                    for c in range(3):
+                        np.add.at(img[:, :, c], (py[ok], px[ok]),
+                                  contribution * cr[ok, c])
+
+        np.clip(img, 0, 1, out=img)
+        return img
+
+    def _splat_hydro_gpu(self, d_frame):
+        """Project and splat hydro particles on GPU via Numba CUDA kernel.
+
+        Alpha is computed entirely on GPU from per-particle ages/lifetimes —
+        no CPU tile/repeat/clip overhead. Colors/radii are N-sized
+        (per-particle). Only trails (N*T) need per-frame upload; everything
+        else is N-sized (~60KB).
+
+        Parameters
+        ----------
+        d_frame : cupy.ndarray, shape (H, W, 3)
+            GPU frame buffer (float32 0-1). Modified in-place via atomic add.
+        """
+        if self._hydro_particles is None or self._hydro_trails is None:
+            return
+
+        from .analysis.render import _compute_camera_basis
+
+        N = self._hydro_particles.shape[0]
+        trail_len = self._hydro_trail_len
+        total = N * trail_len
+
+        cam_pos = self.position
+        look_at = self._get_look_at()
+        forward, right, cam_up = _compute_camera_basis(
+            tuple(cam_pos), tuple(look_at), (0, 0, 1),
+        )
+        fov_scale = math.tan(math.radians(self.fov) / 2.0)
+        aspect_ratio = d_frame.shape[1] / d_frame.shape[0]
+
+        # Flatten trails: (N, T, 2) → (N*T, 2) — the only large upload
+        all_pts = self._hydro_trails.reshape(-1, 2)
+
+        # Allocate / resize GPU buffers
+        if self._d_hydro_trails is None or self._d_hydro_trails.shape[0] != total:
+            self._d_hydro_trails = cp.empty((total, 2), dtype=cp.float32)
+        if self._d_hydro_ages is None or self._d_hydro_ages.shape[0] != N:
+            self._d_hydro_ages = cp.empty(N, dtype=cp.int32)
+            self._d_hydro_lifetimes = cp.empty(N, dtype=cp.int32)
+            self._d_hydro_colors = cp.empty((N, 3), dtype=cp.float32)
+            self._d_hydro_radii = cp.empty(N, dtype=cp.int32)
+
+        # Upload — trails are N*T (~3MB), rest is N-sized (~60KB each)
+        self._d_hydro_trails.set(all_pts)
+        self._d_hydro_ages.set(self._hydro_ages)
+        self._d_hydro_lifetimes.set(self._hydro_lifetimes)
+        self._d_hydro_colors.set(self._hydro_particle_colors)
+        self._d_hydro_radii.set(self._hydro_particle_radii)
+
+        # GPU terrain
+        terrain_data = self.raster.data
+        if not isinstance(terrain_data, cp.ndarray):
+            terrain_data = cp.asarray(terrain_data)
+
+        # Single kernel launch — alpha computed on GPU
+        threadsperblock = 256
+        blockspergrid = (total + threadsperblock - 1) // threadsperblock
+
+        _hydro_splat_kernel[blockspergrid, threadsperblock](
+            self._d_hydro_trails,
+            self._d_hydro_ages,
+            self._d_hydro_lifetimes,
+            self._d_hydro_colors,
+            self._d_hydro_radii,
+            trail_len,
+            float(self._hydro_alpha),
+            int(self._hydro_min_visible_age),
+            float(self._hydro_ref_depth),
+            terrain_data,
+            d_frame,
+            float(cam_pos[0]), float(cam_pos[1]), float(cam_pos[2]),
+            float(forward[0]), float(forward[1]), float(forward[2]),
+            float(right[0]), float(right[1]), float(right[2]),
+            float(cam_up[0]), float(cam_up[1]), float(cam_up[2]),
+            float(fov_scale), float(aspect_ratio),
+            float(self._base_pixel_spacing_x),
+            float(self._base_pixel_spacing_y),
+            float(self.vertical_exaggeration),
+            float(self.subsample_factor),
+            float(self._hydro_min_depth),
+        )
+
+        # Clamp output
+        cp.clip(d_frame, 0, 1, out=d_frame)
+
+    # ------------------------------------------------------------------
     # GTFS-RT realtime vehicle overlay
     # ------------------------------------------------------------------
 
@@ -4621,7 +5832,8 @@ class InteractiveViewer:
         self._base_raster = new_raster
         self.raster = new_raster
         self._wind_terrain_np = None  # invalidate cached terrain
-        self._d_base_frame = None     # invalidate GPU wind buffers
+        self._hydro_terrain_np = None
+        self._d_base_frame = None     # invalidate GPU wind/hydro buffers
         self._d_wind_scratch = None
 
         # Update coordinate tracking
@@ -4851,12 +6063,16 @@ class InteractiveViewer:
         if self._render_needed:
             self._update_frame()
             self._render_needed = False
-        elif self._wind_enabled and self._wind_particles is not None and self._d_base_frame is not None:
-            # Wind is on but camera didn't move — skip the expensive ray
+        elif (self._wind_enabled or self._hydro_enabled) and self._d_base_frame is not None:
+            # Wind/hydro is on but camera didn't move — skip the expensive ray
             # trace and just re-advect particles + GPU splat on fresh copy.
-            self._update_wind_particles()
             cp.copyto(self._d_wind_scratch, self._d_base_frame)
-            self._splat_wind_gpu(self._d_wind_scratch)
+            if self._wind_enabled and self._wind_particles is not None:
+                self._update_wind_particles()
+                self._splat_wind_gpu(self._d_wind_scratch)
+            if self._hydro_enabled and self._hydro_particles is not None:
+                self._update_hydro_particles()
+                self._splat_hydro_gpu(self._d_wind_scratch)
             self._d_wind_scratch.get(out=self._pinned_frame)
             self._composite_overlays()
 
@@ -4876,11 +6092,14 @@ class InteractiveViewer:
             self._active_color_data = None
             self._active_overlay_data = None
             self._overlay_as_water = False
+            self._active_overlay_color_lut = None
             print(f"Terrain: elevation")
         else:
             self._active_color_data = None
             self._active_overlay_data = self._overlay_layers[layer_name]
             self._overlay_as_water = layer_name.startswith('flood_')
+            self._active_overlay_color_lut = self._overlay_color_luts.get(
+                layer_name)
             if self._overlay_as_water:
                 print(f"Terrain: {layer_name} (water)")
             else:
@@ -5844,6 +7063,7 @@ class InteractiveViewer:
             overlay_data=self._active_overlay_data,
             overlay_alpha=self._overlay_alpha,
             overlay_as_water=self._overlay_as_water,
+            overlay_color_lut=self._active_overlay_color_lut,
             geometry_colors=geometry_colors,
         )
 
@@ -5993,6 +7213,7 @@ class InteractiveViewer:
             overlay_data=self._active_overlay_data,
             overlay_alpha=self._overlay_alpha,
             overlay_as_water=self._overlay_as_water,
+            overlay_color_lut=self._active_overlay_color_lut,
             geometry_colors=geometry_colors,
             ao_samples=ao_samples,
             ao_radius=self.ao_radius,
@@ -6112,8 +7333,8 @@ class InteractiveViewer:
                 self._pinned_mem, dtype=np.float32, count=d_display.size
             ).reshape(d_display.shape)
 
-        # Save clean post-processed frame for idle wind replay
-        if self._wind_enabled:
+        # Save clean post-processed frame for idle wind/hydro replay
+        if self._wind_enabled or self._hydro_enabled:
             if self._d_base_frame is None or self._d_base_frame.shape != d_display.shape:
                 self._d_base_frame = cp.empty_like(d_display)
                 self._d_wind_scratch = cp.empty_like(d_display)
@@ -6124,11 +7345,22 @@ class InteractiveViewer:
             self._update_wind_particles()
             self._splat_wind_gpu(d_display)
 
-            # Sync: wind kernel runs on stream 0, readback on non-blocking stream
-            if self._wind_done_event is None:
-                self._wind_done_event = cp.cuda.Event()
-            self._wind_done_event.record()
-            self._readback_stream.wait_event(self._wind_done_event)
+        # GPU hydro: advect on CPU, splat on GPU
+        if self._hydro_enabled and self._hydro_particles is not None:
+            self._update_hydro_particles()
+            self._splat_hydro_gpu(d_display)
+
+        # Sync: splat kernels run on stream 0, readback on non-blocking stream
+        if self._wind_enabled or self._hydro_enabled:
+            sync_event = self._wind_done_event or self._hydro_done_event
+            if sync_event is None:
+                sync_event = cp.cuda.Event()
+                if self._wind_enabled:
+                    self._wind_done_event = sync_event
+                else:
+                    self._hydro_done_event = sync_event
+            sync_event.record()
+            self._readback_stream.wait_event(sync_event)
 
         # Async D2H copy on non-blocking stream
         d_display.get(out=self._pinned_frame, stream=self._readback_stream)
@@ -6593,6 +7825,7 @@ class InteractiveViewer:
             ("DATA LAYERS", [
                 ("Shift+F", "FIRMS fire (7d)"),
                 ("Shift+W", "Toggle wind"),
+                ("Shift+Y", "Toggle hydro flow"),
             ]),
             ("RENDERING", [
                 ("0", "Toggle ambient occlusion"),
@@ -7106,6 +8339,7 @@ def explore(raster, width: int = 800, height: int = 600,
             baked_meshes=None,
             subsample: int = 1,
             wind_data=None,
+            hydro_data=None,
             gtfs_data=None,
             accessor=None,
             terrain_loader=None,
@@ -7164,6 +8398,12 @@ def explore(raster, width: int = 800, height: int = 600,
     wind_data : dict, optional
         Wind data from ``fetch_wind()``. If provided, Shift+W toggles
         wind particle animation.
+    hydro_data : dict, optional
+        Hydrological flow data with keys ``'flow_dir'`` (D8 direction
+        grid) and ``'flow_accum'`` (flow accumulation grid).  If provided,
+        Shift+Y toggles hydro flow particle animation.  Optional keys:
+        ``'n_particles'``, ``'max_age'``, ``'trail_len'``, ``'speed'``,
+        ``'accum_threshold'``, ``'color'``, ``'alpha'``, ``'dot_radius'``.
     gtfs_data : dict, optional
         GTFS data from ``fetch_gtfs()``. If the metadata contains a
         ``realtime_url``, Shift+B toggles realtime vehicle positions.
@@ -7216,6 +8456,7 @@ def explore(raster, width: int = 800, height: int = 600,
     - C: Cycle colormap
     - Shift+F: Fetch/toggle FIRMS fire layer (7d LANDSAT 30m)
     - Shift+W: Toggle wind particle animation
+    - Shift+Y: Toggle hydro flow particle animation
     - Shift+B: Toggle GTFS-RT realtime vehicle overlay
     - F: Save screenshot
     - M: Toggle minimap overlay
@@ -7282,6 +8523,31 @@ def explore(raster, width: int = 800, height: int = 600,
     # Wind data initialization
     if wind_data is not None:
         viewer._init_wind(wind_data)
+
+    # Hydro flow initialization
+    if hydro_data is not None:
+        flow_dir = hydro_data['flow_dir']
+        flow_accum = hydro_data['flow_accum']
+        hydro_opts = {k: v for k, v in hydro_data.items()
+                      if k not in ('flow_dir', 'flow_accum')}
+        viewer._init_hydro(flow_dir, flow_accum, **hydro_opts)
+        viewer._hydro_enabled = True
+        # Re-register stream_link overlay with NaN + palette coloring
+        if (viewer._hydro_stream_order_raw is not None
+                and 'stream_link' in viewer._overlay_layers):
+            max_order = int(viewer._hydro_stream_order_raw.max())
+            palette_lut = InteractiveViewer._build_stream_palette_lut(
+                max_order)
+            sl_data = viewer._base_overlay_layers['stream_link']
+            if hasattr(sl_data, 'get'):
+                sl_data = sl_data.get()
+            sl_data = np.asarray(sl_data, dtype=np.float32)
+            so_raw = viewer._hydro_stream_order_raw.astype(np.float32)
+            sl_color = np.where(
+                (sl_data <= 0) | (so_raw <= 0),
+                np.float32(np.nan), so_raw)
+            _add_overlay(viewer, 'stream_link', sl_color,
+                         color_lut=palette_lut)
 
     # GTFS-RT initialization
     if gtfs_data is not None:
