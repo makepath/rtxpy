@@ -952,7 +952,9 @@ class ViewerProxy:
             v._terrain_layer_idx = idx
             v._active_color_data = None
             v._active_overlay_data = v._overlay_layers[name]
-            v._overlay_as_water = name.startswith('flood_')
+            v._overlay_as_water = (
+                name.startswith('flood_')
+                or (name == 'stream_link' and v._hydro_enabled))
             v._active_overlay_color_lut = v._overlay_color_luts.get(name)
             v._update_frame()
             print(f"Terrain: {name}")
@@ -3457,7 +3459,10 @@ class InteractiveViewer:
             terrain_name = self._terrain_layer_order[self._terrain_layer_idx]
             if terrain_name != 'elevation' and terrain_name in self._overlay_layers:
                 self._active_overlay_data = self._overlay_layers[terrain_name]
-                self._overlay_as_water = terrain_name.startswith('flood_')
+                self._overlay_as_water = (
+                    terrain_name.startswith('flood_')
+                    or (terrain_name == 'stream_link'
+                        and self._hydro_enabled))
                 self._active_overlay_color_lut = self._overlay_color_luts.get(
                     terrain_name)
 
@@ -4595,12 +4600,44 @@ class InteractiveViewer:
     # ------------------------------------------------------------------
 
     def _toggle_hydro(self):
-        """Toggle hydro flow particle animation on/off."""
+        """Toggle hydro flow particles + stream_link water overlay together."""
         if self._hydro_data is None:
             print("No hydro data. Use v.add_hydro(flow_dir, flow_accum).")
             return
         self._hydro_enabled = not self._hydro_enabled
-        print(f"Hydro flow: {'ON' if self._hydro_enabled else 'OFF'}")
+
+        if self._hydro_enabled:
+            # Save current overlay state for restoration on OFF
+            self._hydro_prev_layer_idx = self._terrain_layer_idx
+            # Switch to stream_link overlay with water reflection shader
+            if 'stream_link' in self._overlay_layers:
+                idx = self._terrain_layer_order.index('stream_link')
+                self._terrain_layer_idx = idx
+                self._active_overlay_data = self._overlay_layers['stream_link']
+                self._overlay_as_water = True
+                self._active_overlay_color_lut = self._overlay_color_luts.get(
+                    'stream_link')
+                print("Hydro flow: ON  (stream overlay + water shader)")
+            else:
+                print("Hydro flow: ON")
+        else:
+            # Restore previous overlay state
+            prev = getattr(self, '_hydro_prev_layer_idx', 0)
+            if prev >= len(self._terrain_layer_order):
+                prev = 0
+            self._terrain_layer_idx = prev
+            layer = self._terrain_layer_order[prev]
+            if layer == 'elevation':
+                self._active_overlay_data = None
+                self._overlay_as_water = False
+                self._active_overlay_color_lut = None
+            else:
+                self._active_overlay_data = self._overlay_layers[layer]
+                self._overlay_as_water = layer.startswith('flood_')
+                self._active_overlay_color_lut = (
+                    self._overlay_color_luts.get(layer))
+            print("Hydro flow: OFF")
+
         self._update_frame()
 
     def _action_toggle_hydro(self):
@@ -4608,12 +4645,14 @@ class InteractiveViewer:
 
     _STREAM_ORDER_PALETTE = np.array([
         [0.0,  0.0,  0.0 ],  # 0: unused
-        [0.55, 0.90, 0.40],  # 1: yellow-green (headwaters)
-        [0.20, 0.80, 0.60],  # 2: teal
-        [0.10, 0.55, 0.90],  # 3: blue
-        [0.30, 0.20, 0.85],  # 4: indigo
-        [0.70, 0.15, 0.80],  # 5: purple
-        [0.95, 0.25, 0.35],  # 6+: red-orange (major rivers)
+        [0.50, 0.80, 1.00],  # 1: pale sky blue (headwaters)
+        [0.38, 0.68, 0.98],  # 2: light blue
+        [0.28, 0.55, 0.95],  # 3: sky blue
+        [0.18, 0.42, 0.90],  # 4: medium blue
+        [0.10, 0.30, 0.85],  # 5: royal blue
+        [0.06, 0.20, 0.78],  # 6: deep blue
+        [0.03, 0.12, 0.70],  # 7: dark blue
+        [0.01, 0.06, 0.60],  # 8: navy (major rivers)
     ], dtype=np.float32)
 
     @staticmethod
@@ -4629,7 +4668,7 @@ class InteractiveViewer:
         for i in range(256):
             # Reverse the normalization: order = 1 + norm * (max_order - 1)
             order = int(round(1 + (i / 255.0) * denom))
-            order = max(1, min(6, order))
+            order = max(1, min(8, order))
             lut[i] = palette[order]
         return lut
 
@@ -4642,15 +4681,14 @@ class InteractiveViewer:
         blue gradient from normalized [0,1] order.
         """
         if raw_order is not None:
-            idx = np.clip(raw_order, 1, 6).astype(int)
+            idx = np.clip(raw_order, 1, 8).astype(int)
             colors = InteractiveViewer._STREAM_ORDER_PALETTE[idx].copy()
         else:
             colors = np.empty((len(order_norm), 3), dtype=np.float32)
-            colors[:, 0] = 0.05 + order_norm * 0.35   # R: 0.05 → 0.40
-            colors[:, 1] = 0.12 + order_norm * 0.78   # G: 0.12 → 0.90
-            colors[:, 2] = 0.45 + order_norm * 0.55   # B: 0.45 → 1.00
-        # Emissive boost — allow >1.0 for HDR glow via additive blending
-        colors = np.clip(colors * 1.3, 0.0, 1.5)
+            colors[:, 0] = 0.02 + order_norm * 0.43   # R: 0.02 → 0.45
+            colors[:, 1] = 0.10 + order_norm * 0.65   # G: 0.10 → 0.75
+            colors[:, 2] = 0.55 + order_norm * 0.40   # B: 0.55 → 0.95
+        colors = np.clip(colors, 0.0, 1.0)
         return colors
 
     @staticmethod
@@ -4742,6 +4780,7 @@ class InteractiveViewer:
             mask = flow_dir == code
             flow_v[mask] = dr
             flow_u[mask] = dc
+        valid_flow = np.isin(flow_dir, list(d8_to_drow_dcol.keys()))
 
         self._hydro_flow_u_px = flow_u
         self._hydro_flow_v_px = flow_v
@@ -4781,18 +4820,18 @@ class InteractiveViewer:
             self._hydro_stream_link = None
 
         # Build spawn probabilities — stream-order weighted if available
-        valid_d8 = np.isin(flow_dir, list(d8_to_drow_dcol.keys()))
         if has_stream_order:
             # Spawn on stream cells, weighted by sqrt(order) — much
             # flatter than order^2, giving real coverage to headwaters
             spawn_weights = np.where(stream_order > 0,
                                      np.sqrt(stream_order), 0.0)
-            spawn_weights[~valid_d8] = 0.0
+            spawn_weights[~valid_flow] = 0.0
         else:
             spawn_weights = accum_norm.copy()
-            spawn_weights[~valid_d8] = 0.0
+            spawn_weights[~valid_flow] = 0.0
 
         # Rasterize Overture waterway LineStrings into spawn pool
+        # and stream_link overlay (for unified water shader rendering).
         waterway_geojson = kwargs.pop('waterway_geojson', None)
         if waterway_geojson is not None and has_stream_order:
             _WATERWAY_ORDER = {
@@ -4800,41 +4839,55 @@ class InteractiveViewer:
                 'stream': (2, 1.5), 'drain': (1, 1.0), 'ditch': (1, 1.0),
             }
             so_raw = self._hydro_stream_order_raw
+            sl_grid = self._hydro_stream_link
             n_ww_cells = 0
-            for feat in waterway_geojson.get('features', []):
-                geom = feat.get('geometry', {})
-                if geom.get('type') != 'LineString':
-                    continue
-                coords = geom.get('coordinates', [])
-                if len(coords) < 2:
-                    continue
-                subtype = (feat.get('properties') or {}).get('subtype', '')
-                eq_order, eq_weight = _WATERWAY_ORDER.get(
-                    subtype, (2, 1.5))
-                # Convert lon/lat coords to pixel (col, row)
-                from .geojson import (
-                    _geojson_to_world_coords, _build_transformer,
-                )
-                terrain_data_np = self.raster.data
-                if hasattr(terrain_data_np, 'get'):
-                    terrain_data_np = terrain_data_np.get()
-                terrain_data_np = np.asarray(terrain_data_np, dtype=np.float32)
+            # Use a synthetic link ID for waterway cells not already
+            # in the stream network.
+            _ww_link_id = (int(sl_grid.max()) + 1) if sl_grid is not None else 1
+            from .geojson import (
+                _geojson_to_world_coords, _build_transformer,
+            )
+            terrain_data_np = self.raster.data
+            if hasattr(terrain_data_np, 'get'):
+                terrain_data_np = terrain_data_np.get()
+            terrain_data_np = np.asarray(terrain_data_np, dtype=np.float32)
+            try:
+                transformer = _build_transformer(self.raster)
+            except Exception:
+                transformer = None
+
+            def _burn_pixels(rows, cols, eq_order, eq_weight):
+                """Burn a set of (row, col) pixels into hydro grids."""
+                nonlocal n_ww_cells
+                for rr, cc in zip(rows, cols):
+                    if 0 <= rr < H and 0 <= cc < W:
+                        # Upgrade raw order (don't downgrade)
+                        if so_raw[rr, cc] < eq_order:
+                            so_raw[rr, cc] = eq_order
+                        # Upgrade spawn weight
+                        if eq_weight > spawn_weights[rr, cc]:
+                            spawn_weights[rr, cc] = eq_weight
+                        # Ensure cell appears in stream_link overlay
+                        if sl_grid is not None and sl_grid[rr, cc] <= 0:
+                            sl_grid[rr, cc] = _ww_link_id
+                        n_ww_cells += 1
+
+            def _coords_to_pixels(coords):
+                """Convert lon/lat coords to (col, row) pixel pairs."""
                 try:
-                    transformer = _build_transformer(self.raster)
-                except Exception:
-                    transformer = None
-                try:
-                    _, pixel_coords = _geojson_to_world_coords(
+                    _, px = _geojson_to_world_coords(
                         coords, self.raster, terrain_data_np,
                         self._base_pixel_spacing_x,
                         self._base_pixel_spacing_y,
                         transformer=transformer,
                         return_pixel_coords=True)
+                    return px
                 except Exception:
-                    continue
-                if len(pixel_coords) < 2:
-                    continue
-                # Densify at 1-pixel steps between consecutive vertices
+                    return []
+
+            def _densify_line(pixel_coords):
+                """Walk a polyline at 1-pixel steps, return (rows, cols)."""
+                rows, cols = [], []
                 for i in range(len(pixel_coords) - 1):
                     c0, r0 = pixel_coords[i]
                     c1, r1 = pixel_coords[i + 1]
@@ -4842,19 +4895,72 @@ class InteractiveViewer:
                     n_steps = max(int(max(abs(dr), abs(dc))), 1)
                     for s in range(n_steps + 1):
                         t = s / n_steps
-                        rr = int(round(r0 + dr * t))
-                        cc = int(round(c0 + dc * t))
-                        if 0 <= rr < H and 0 <= cc < W:
-                            if valid_d8[rr, cc]:
-                                # Upgrade raw order (don't downgrade)
-                                if so_raw[rr, cc] < eq_order:
-                                    so_raw[rr, cc] = eq_order
-                                # Upgrade spawn weight
-                                cur_w = spawn_weights[rr, cc]
-                                new_w = eq_weight
-                                if new_w > cur_w:
-                                    spawn_weights[rr, cc] = new_w
-                                n_ww_cells += 1
+                        rows.append(int(round(r0 + dr * t)))
+                        cols.append(int(round(c0 + dc * t)))
+                return rows, cols
+
+            for feat in waterway_geojson.get('features', []):
+                geom = feat.get('geometry', {})
+                gtype = geom.get('type', '')
+                subtype = (feat.get('properties') or {}).get('subtype', '')
+                eq_order, eq_weight = _WATERWAY_ORDER.get(
+                    subtype, (2, 1.5))
+
+                if gtype == 'LineString':
+                    coords = geom.get('coordinates', [])
+                    if len(coords) < 2:
+                        continue
+                    px = _coords_to_pixels(coords)
+                    if len(px) < 2:
+                        continue
+                    rs, cs = _densify_line(px)
+                    _burn_pixels(rs, cs, eq_order, eq_weight)
+
+                elif gtype in ('Polygon', 'MultiPolygon'):
+                    # Water bodies: burn outline + filled interior
+                    rings = []
+                    if gtype == 'Polygon':
+                        rings = geom.get('coordinates', [])
+                    else:
+                        for poly in geom.get('coordinates', []):
+                            rings.extend(poly)
+                    # Lakes/reservoirs get high order
+                    poly_order = max(eq_order, 5)
+                    poly_weight = max(eq_weight, 3.0)
+                    for ring in rings:
+                        if len(ring) < 3:
+                            continue
+                        px = _coords_to_pixels(ring)
+                        if len(px) < 3:
+                            continue
+                        # Outline
+                        rs, cs = _densify_line(px)
+                        _burn_pixels(rs, cs, poly_order, poly_weight)
+                        # Fill interior via scanline
+                        pr = np.array([p[1] for p in px])
+                        pc = np.array([p[0] for p in px])
+                        r_min = max(int(pr.min()), 0)
+                        r_max = min(int(pr.max()), H - 1)
+                        for row in range(r_min, r_max + 1):
+                            # Find x-intersections of scanline with edges
+                            xings = []
+                            n_verts = len(pr)
+                            for j in range(n_verts):
+                                j1 = (j + 1) % n_verts
+                                r0, r1 = pr[j], pr[j1]
+                                if (r0 <= row < r1) or (r1 <= row < r0):
+                                    t = (row - r0) / (r1 - r0)
+                                    xings.append(pc[j] + t * (pc[j1] - pc[j]))
+                            xings.sort()
+                            # Fill between pairs
+                            for k in range(0, len(xings) - 1, 2):
+                                c_lo = max(int(round(xings[k])), 0)
+                                c_hi = min(int(round(xings[k + 1])), W - 1)
+                                if c_lo <= c_hi:
+                                    fill_rs = [row] * (c_hi - c_lo + 1)
+                                    fill_cs = list(range(c_lo, c_hi + 1))
+                                    _burn_pixels(fill_rs, fill_cs,
+                                                 poly_order, poly_weight)
             if n_ww_cells > 0:
                 print(f"  Waterway rasterization: {n_ww_cells} cells injected")
 
@@ -4865,8 +4971,8 @@ class InteractiveViewer:
             valid_probs = flat_weights[valid_indices].astype(np.float64)
             valid_probs /= valid_probs.sum()
         else:
-            valid_d8_flat = valid_d8.ravel()
-            valid_indices = np.nonzero(valid_d8_flat)[0]
+            valid_flow_flat = valid_flow.ravel()
+            valid_indices = np.nonzero(valid_flow_flat)[0]
             if len(valid_indices) > 0:
                 valid_probs = np.ones(len(valid_indices), dtype=np.float64)
                 valid_probs /= valid_probs.sum()
@@ -4925,7 +5031,7 @@ class InteractiveViewer:
         # Min render distance and depth-scaled alpha reference
         world_diag = np.sqrt((W * self._base_pixel_spacing_x)**2 +
                              (H * self._base_pixel_spacing_y)**2)
-        self._hydro_min_depth = world_diag * 0.02
+        self._hydro_min_depth = 1.0  # metres — allow building-level zoom
         self._hydro_ref_depth = world_diag * 0.15
 
         print(f"  Hydro flow initialized on {H}x{W} grid "
@@ -6097,7 +6203,9 @@ class InteractiveViewer:
         else:
             self._active_color_data = None
             self._active_overlay_data = self._overlay_layers[layer_name]
-            self._overlay_as_water = layer_name.startswith('flood_')
+            self._overlay_as_water = (
+                layer_name.startswith('flood_')
+                or (layer_name == 'stream_link' and self._hydro_enabled))
             self._active_overlay_color_lut = self._overlay_color_luts.get(
                 layer_name)
             if self._overlay_as_water:
@@ -8526,12 +8634,12 @@ def explore(raster, width: int = 800, height: int = 600,
 
     # Hydro flow initialization
     if hydro_data is not None:
+        hydro_start_enabled = hydro_data.get('enabled', True)
         flow_dir = hydro_data['flow_dir']
         flow_accum = hydro_data['flow_accum']
         hydro_opts = {k: v for k, v in hydro_data.items()
-                      if k not in ('flow_dir', 'flow_accum')}
+                      if k not in ('flow_dir', 'flow_accum', 'enabled')}
         viewer._init_hydro(flow_dir, flow_accum, **hydro_opts)
-        viewer._hydro_enabled = True
         # Re-register stream_link overlay with NaN + palette coloring
         if (viewer._hydro_stream_order_raw is not None
                 and 'stream_link' in viewer._overlay_layers):
@@ -8548,6 +8656,18 @@ def explore(raster, width: int = 800, height: int = 600,
                 np.float32(np.nan), so_raw)
             _add_overlay(viewer, 'stream_link', sl_color,
                          color_lut=palette_lut)
+        if hydro_start_enabled:
+            viewer._hydro_enabled = True
+            # Stream cells rendered with water reflection shader
+            if 'stream_link' in viewer._overlay_layers:
+                viewer._overlay_as_water = True
+        else:
+            viewer._hydro_enabled = False
+            # Switch back to elevation (don't leave stream_link active)
+            viewer._terrain_layer_idx = 0
+            viewer._active_overlay_data = None
+            viewer._overlay_as_water = False
+            viewer._active_overlay_color_lut = None
 
     # GTFS-RT initialization
     if gtfs_data is not None:

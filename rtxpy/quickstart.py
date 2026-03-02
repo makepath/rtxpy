@@ -4,6 +4,264 @@ import warnings
 from pathlib import Path
 
 
+def _rasterize_waterways_to_dem(water_geojson, terrain, elev_np, ocean):
+    """Rasterize Overture waterway features into a burn-depth grid.
+
+    Carves LineStrings (rivers/streams) and fills Polygons (lakes) into
+    the DEM so the D8 algorithm routes flow through known channels.
+
+    Returns a float32 array of burn depths (positive = carve down),
+    or None if no features were rasterized.
+    """
+    import numpy as np
+
+    features = water_geojson.get('features', [])
+    if not features:
+        return None
+
+    H, W = elev_np.shape
+    burn = np.zeros((H, W), dtype=np.float32)
+
+    # Build lon/lat → pixel transformer from the terrain's CRS + affine
+    try:
+        from pyproj import Transformer
+        terrain_crs = terrain.rio.crs
+        to_crs = Transformer.from_crs('EPSG:4326', terrain_crs,
+                                       always_xy=True)
+    except Exception:
+        return None
+
+    # Affine: pixel (col, row) ↔ projected (x, y)
+    x_coords = terrain.coords[terrain.dims[-1]].values
+    y_coords = terrain.coords[terrain.dims[-2]].values
+    x0, x1 = float(x_coords[0]), float(x_coords[-1])
+    y0, y1 = float(y_coords[0]), float(y_coords[-1])
+    dx = (x1 - x0) / max(W - 1, 1)
+    dy = (y1 - y0) / max(H - 1, 1)
+
+    def lonlat_to_pixel(lon, lat):
+        """Convert (lon, lat) → (col, row) in the DEM grid."""
+        px, py = to_crs.transform(lon, lat)
+        col = (px - x0) / dx
+        row = (py - y0) / dy
+        return col, row
+
+    def densify_line(pixel_coords):
+        """Walk polyline at 1-pixel steps → list of (row, col)."""
+        pts = []
+        for i in range(len(pixel_coords) - 1):
+            c0, r0 = pixel_coords[i]
+            c1, r1 = pixel_coords[i + 1]
+            dc, dr = c1 - c0, r1 - r0
+            n = max(int(max(abs(dr), abs(dc))), 1)
+            for s in range(n + 1):
+                t = s / n
+                pts.append((int(round(r0 + dr * t)),
+                            int(round(c0 + dc * t))))
+        return pts
+
+    # Burn depths by waterway type
+    _LINE_BURN = {
+        'river': 5.0, 'canal': 3.0,
+        'stream': 2.0, 'drain': 1.0, 'ditch': 0.5,
+    }
+    _POLY_BURN = 3.0  # lakes / reservoirs
+
+    n_burned = 0
+    for feat in features:
+        geom = feat.get('geometry', {})
+        gtype = geom.get('type', '')
+        subtype = (feat.get('properties') or {}).get('subtype', '')
+
+        if gtype == 'LineString':
+            coords = geom.get('coordinates', [])
+            if len(coords) < 2:
+                continue
+            depth = _LINE_BURN.get(subtype, 2.0)
+            px = [lonlat_to_pixel(c[0], c[1]) for c in coords]
+            for rr, cc in densify_line(px):
+                if 0 <= rr < H and 0 <= cc < W and not ocean[rr, cc]:
+                    if depth > burn[rr, cc]:
+                        burn[rr, cc] = depth
+            n_burned += 1
+
+        elif gtype in ('Polygon', 'MultiPolygon'):
+            all_rings = []
+            if gtype == 'Polygon':
+                all_rings = geom.get('coordinates', [])
+            else:
+                for poly in geom.get('coordinates', []):
+                    all_rings.extend(poly)
+            for ring in all_rings:
+                if len(ring) < 3:
+                    continue
+                px = [lonlat_to_pixel(c[0], c[1]) for c in ring]
+                # Outline
+                for rr, cc in densify_line(px):
+                    if 0 <= rr < H and 0 <= cc < W and not ocean[rr, cc]:
+                        if _POLY_BURN > burn[rr, cc]:
+                            burn[rr, cc] = _POLY_BURN
+                # Fill interior via scanline
+                pr = np.array([p[1] for p in px], dtype=np.float64)
+                pc = np.array([p[0] for p in px], dtype=np.float64)
+                r_min = max(int(pr.min()), 0)
+                r_max = min(int(pr.max()), H - 1)
+                n_verts = len(pr)
+                for row in range(r_min, r_max + 1):
+                    xings = []
+                    for j in range(n_verts):
+                        j1 = (j + 1) % n_verts
+                        r0, r1 = pr[j], pr[j1]
+                        if (r0 <= row < r1) or (r1 <= row < r0):
+                            t = (row - r0) / (r1 - r0)
+                            xings.append(pc[j] + t * (pc[j1] - pc[j]))
+                    xings.sort()
+                    for k in range(0, len(xings) - 1, 2):
+                        c_lo = max(int(round(xings[k])), 0)
+                        c_hi = min(int(round(xings[k + 1])), W - 1)
+                        for cc in range(c_lo, c_hi + 1):
+                            if not ocean[row, cc]:
+                                if _POLY_BURN > burn[row, cc]:
+                                    burn[row, cc] = _POLY_BURN
+            n_burned += 1
+
+    if n_burned > 0:
+        # Buffer the burn by a few pixels with tapered depth —
+        # widens channels so D8 catches more flow into them.
+        from scipy.ndimage import maximum_filter as _max_filt
+        from scipy.ndimage import gaussian_filter as _gauss_filt
+        # Expand burn mask by 3 px radius
+        buffered = _max_filt(burn, size=7)
+        # Taper edges: Gaussian blur gives smooth falloff
+        buffered = _gauss_filt(buffered, sigma=1.5).astype(np.float32)
+        # Keep the sharper original where it's deeper
+        burn = np.maximum(burn, buffered)
+        burn[ocean] = 0.0
+
+        n_cells = int((burn > 0).sum())
+        print(f"  Burned {n_burned} waterway features into DEM "
+              f"({n_cells} cells, max depth {burn.max():.1f} m)")
+        return burn
+    return None
+
+
+def _burn_waterways_to_grids(water_geojson, terrain, sl_grid, so_grid,
+                             ocean, next_link_id):
+    """Burn Overture waterway features into stream_link and stream_order grids.
+
+    Marks waterway cells in *sl_grid* (with *next_link_id* for cells not
+    already part of the D8 stream network) and upgrades *so_grid* with
+    equivalent Strahler orders.  Both arrays are modified in-place.
+
+    Returns the number of features burned.
+    """
+    import numpy as np
+
+    features = water_geojson.get('features', [])
+    if not features:
+        return 0
+
+    H, W = sl_grid.shape
+
+    try:
+        from pyproj import Transformer
+        terrain_crs = terrain.rio.crs
+        to_crs = Transformer.from_crs('EPSG:4326', terrain_crs,
+                                       always_xy=True)
+    except Exception:
+        return 0
+
+    x_coords = terrain.coords[terrain.dims[-1]].values
+    y_coords = terrain.coords[terrain.dims[-2]].values
+    x0, x1 = float(x_coords[0]), float(x_coords[-1])
+    y0, y1 = float(y_coords[0]), float(y_coords[-1])
+    dx = (x1 - x0) / max(W - 1, 1)
+    dy = (y1 - y0) / max(H - 1, 1)
+
+    def lonlat_to_pixel(lon, lat):
+        px, py = to_crs.transform(lon, lat)
+        return (px - x0) / dx, (py - y0) / dy
+
+    def densify_line(pixel_coords):
+        pts = []
+        for i in range(len(pixel_coords) - 1):
+            c0, r0 = pixel_coords[i]
+            c1, r1 = pixel_coords[i + 1]
+            dc, dr = c1 - c0, r1 - r0
+            n = max(int(max(abs(dr), abs(dc))), 1)
+            for s in range(n + 1):
+                t = s / n
+                pts.append((int(round(r0 + dr * t)),
+                            int(round(c0 + dc * t))))
+        return pts
+
+    _LINE_ORDER = {
+        'river': 5, 'canal': 4,
+        'stream': 2, 'drain': 1, 'ditch': 1,
+    }
+
+    def _mark(rr, cc, order):
+        if 0 <= rr < H and 0 <= cc < W and not ocean[rr, cc]:
+            if sl_grid[rr, cc] <= 0:
+                sl_grid[rr, cc] = next_link_id
+            if order > so_grid[rr, cc]:
+                so_grid[rr, cc] = order
+
+    n_burned = 0
+    for feat in features:
+        geom = feat.get('geometry', {})
+        gtype = geom.get('type', '')
+        subtype = (feat.get('properties') or {}).get('subtype', '')
+
+        if gtype == 'LineString':
+            coords = geom.get('coordinates', [])
+            if len(coords) < 2:
+                continue
+            order = _LINE_ORDER.get(subtype, 2)
+            px = [lonlat_to_pixel(c[0], c[1]) for c in coords]
+            for rr, cc in densify_line(px):
+                _mark(rr, cc, order)
+            n_burned += 1
+
+        elif gtype in ('Polygon', 'MultiPolygon'):
+            all_rings = []
+            if gtype == 'Polygon':
+                all_rings = geom.get('coordinates', [])
+            else:
+                for poly in geom.get('coordinates', []):
+                    all_rings.extend(poly)
+            poly_order = max(_LINE_ORDER.get(subtype, 2), 5)
+            for ring in all_rings:
+                if len(ring) < 3:
+                    continue
+                px = [lonlat_to_pixel(c[0], c[1]) for c in ring]
+                for rr, cc in densify_line(px):
+                    _mark(rr, cc, poly_order)
+                # Scanline fill
+                pr = np.array([p[1] for p in px], dtype=np.float64)
+                pc = np.array([p[0] for p in px], dtype=np.float64)
+                r_min = max(int(pr.min()), 0)
+                r_max = min(int(pr.max()), H - 1)
+                n_verts = len(pr)
+                for row in range(r_min, r_max + 1):
+                    xings = []
+                    for j in range(n_verts):
+                        j1 = (j + 1) % n_verts
+                        r0, r1 = pr[j], pr[j1]
+                        if (r0 <= row < r1) or (r1 <= row < r0):
+                            t = (row - r0) / (r1 - r0)
+                            xings.append(pc[j] + t * (pc[j1] - pc[j]))
+                    xings.sort()
+                    for k in range(0, len(xings) - 1, 2):
+                        c_lo = max(int(round(xings[k])), 0)
+                        c_hi = min(int(round(xings[k + 1])), W - 1)
+                        for cc in range(c_lo, c_hi + 1):
+                            _mark(row, cc, poly_order)
+            n_burned += 1
+
+    return n_burned
+
+
 def quickstart(
     name,
     bounds,
@@ -212,14 +470,29 @@ def quickstart(
             ocean = (elev_np == 0.0) | np.isnan(elev_np)
             elev_np[ocean] = -100.0
 
+            # 1b. Burn Overture waterways into the DEM — carve known
+            #     river/stream channels so D8 routes through them.
+            if 'water' in feat:
+                _wc = cache_dir / f"{name}_water.geojson"
+                if _wc.exists():
+                    import json as _json_ww
+                    try:
+                        with open(_wc) as _wf:
+                            _ww_data = _json_ww.load(_wf)
+                        _ww_burn = _rasterize_waterways_to_dem(
+                            _ww_data, terrain, elev_np, ocean)
+                        if _ww_burn is not None:
+                            elev_np -= _ww_burn
+                            elev_np[ocean] = -100.0
+                    except Exception as _e:
+                        print(f"  Waterway DEM burn skipped: {_e}")
+
             # 2. Smooth (15×15 ≈ 450 m at 30 m) to remove noise pits
             #    that fragment the drainage network.
             smoothed = _uniform_filter(elev_np, size=15, mode='nearest')
             smoothed[ocean] = -100.0
 
-            # 3. Fill remaining depressions, then resolve flats:
-            #    add a tiny fraction of fill depth so flat areas
-            #    drain toward their pour points.
+            # 3. Fill remaining depressions, then resolve flats.
             if is_cupy:
                 import cupy as _cp
                 _sm = _cp.asarray(smoothed)
@@ -228,18 +501,61 @@ def quickstart(
             filled = _fill(terrain.copy(data=_sm))
             fill_depth = filled.data - _sm
             resolved = filled.data + fill_depth * 0.01
+
+            # 3b. Distance-to-ocean gradient — ensures flat areas
+            #     drain coherently toward the coast.
+            from scipy.ndimage import distance_transform_edt as _dist_edt
+            dist_to_ocean = _dist_edt(~ocean).astype(np.float32)
+            ocean_gradient = dist_to_ocean * 0.0001
+
+            if is_cupy:
+                resolved = resolved + _cp.asarray(ocean_gradient)
+                resolved[_cp.asarray(ocean)] = -100.0
+            else:
+                resolved += ocean_gradient
+                resolved[ocean] = -100.0
+
+            # 3c. Channel burning — compute an initial flow
+            #     accumulation, then lower high-accumulation cells
+            #     to carve channels into the DEM. Re-fill and
+            #     re-compute so streams connect into a network.
+            _fd0 = _flow_direction(terrain.copy(data=resolved))
+            _fa0 = _flow_accumulation(_fd0)
+            _fa0_np = _fa0.data.get() if is_cupy else np.asarray(_fa0.data)
+            _fa0_np = np.nan_to_num(_fa0_np, nan=0.0)
+
+            # Burn proportional to log(accumulation): cells with
+            # more upstream area get carved deeper (up to ~2 m).
+            _log_acc = np.log10(np.clip(_fa0_np, 1, None))
+            _log_max = max(_log_acc.max(), 1.0)
+            _burn = (_log_acc / _log_max) * 2.0  # 0–2 m carve
+            _burn[ocean] = 0.0
+
+            if is_cupy:
+                resolved = resolved - _cp.asarray(_burn.astype(np.float32))
+                resolved[_cp.asarray(ocean)] = -100.0
+            else:
+                resolved -= _burn.astype(np.float32)
+                resolved[ocean] = -100.0
+
+            # Re-fill after burning to remove any new micro-pits
+            filled2 = _fill(terrain.copy(data=resolved))
+            fill_depth2 = filled2.data - resolved
+            resolved = filled2.data + fill_depth2 * 0.01
+
+            # Final jitter to break remaining ties
             if is_cupy:
                 _cp.random.seed(0)
                 resolved = resolved + _cp.random.uniform(
-                    0, 0.001, resolved.shape, dtype=_cp.float32)
+                    0, 0.0001, resolved.shape, dtype=_cp.float32)
                 resolved[_cp.asarray(ocean)] = -100.0
             else:
                 np.random.seed(0)
                 resolved += np.random.uniform(
-                    0, 0.001, resolved.shape).astype(np.float32)
+                    0, 0.0001, resolved.shape).astype(np.float32)
                 resolved[ocean] = -100.0
 
-            # 4. Compute D8 flow direction and accumulation.
+            # 4. Compute final D8 flow direction and accumulation.
             fd = _flow_direction(terrain.copy(data=resolved))
             fa = _flow_accumulation(fd)
 
@@ -275,6 +591,38 @@ def quickstart(
             _sl_clean = np.nan_to_num(_sl_np, nan=0.0).astype(np.float32)
             if is_cupy:
                 _sl_clean = _cp.asarray(_sl_clean)
+            # 6b. Burn Overture waterways into stream_link + stream_order
+            #     so they appear in the overlay with the water shader.
+            if 'water' in feat:
+                _wc2 = cache_dir / f"{name}_water.geojson"
+                if _wc2.exists():
+                    try:
+                        import json as _json2
+                        with open(_wc2) as _wf2:
+                            _ww2 = _json2.load(_wf2)
+                        _so_np = so_out.get() if is_cupy else np.asarray(so_out)
+                        _so_np = np.nan_to_num(_so_np, nan=0.0).astype(
+                            np.float32)
+                        _sl_np2 = _sl_clean.get() if is_cupy else np.asarray(
+                            _sl_clean)
+                        _sl_np2 = np.array(_sl_np2, dtype=np.float32)
+                        _max_link = int(_sl_np2.max()) + 1
+                        _n_ww = _burn_waterways_to_grids(
+                            _ww2, terrain, _sl_np2, _so_np,
+                            ocean, _max_link)
+                        if _n_ww > 0:
+                            if is_cupy:
+                                _sl_clean = _cp.asarray(_sl_np2)
+                                so_out = _cp.asarray(_so_np)
+                            else:
+                                _sl_clean = _sl_np2
+                                so_out = _so_np
+                            _sl_out = _sl_clean  # keep in sync
+                            print(f"  Burned {_n_ww} waterway features "
+                                  f"into stream_link overlay")
+                    except Exception as _e2:
+                        print(f"  Waterway overlay burn skipped: {_e2}")
+
             ds['stream_link'] = terrain.copy(data=_sl_clean).rename(None)
 
             hydro_data = {
@@ -290,7 +638,8 @@ def quickstart(
                 hydro_key = f'hydro_{key}'
                 if hydro_key in explore_kwargs:
                     hydro_data[key] = explore_kwargs.pop(hydro_key)
-            # Load cached Overture waterway LineStrings for particle injection
+            # Load cached Overture waterway features for particle
+            # injection and unified water-shader rendering.
             if 'water' in feat:
                 water_cache = cache_dir / f"{name}_water.geojson"
                 if water_cache.exists():
@@ -298,17 +647,27 @@ def quickstart(
                     try:
                         with open(water_cache) as _wf:
                             _ww = _json.load(_wf)
-                        ww_lines = [
+                        ww_feats = [
                             f for f in _ww.get('features', [])
-                            if f.get('geometry', {}).get('type') == 'LineString'
+                            if f.get('geometry', {}).get('type') in
+                               ('LineString', 'Polygon', 'MultiPolygon')
                         ]
-                        if ww_lines:
+                        if ww_feats:
                             hydro_data['waterway_geojson'] = {
                                 'type': 'FeatureCollection',
-                                'features': ww_lines,
+                                'features': ww_feats,
                             }
-                            print(f"  Loaded {len(ww_lines)} waterway "
-                                  f"LineStrings for particle injection")
+                            n_lines = sum(
+                                1 for f in ww_feats
+                                if f['geometry']['type'] == 'LineString')
+                            n_polys = len(ww_feats) - n_lines
+                            parts = []
+                            if n_lines:
+                                parts.append(f"{n_lines} LineStrings")
+                            if n_polys:
+                                parts.append(f"{n_polys} Polygons")
+                            print(f"  Loaded {' + '.join(parts)} "
+                                  f"for hydro overlay")
                     except Exception:
                         pass
 

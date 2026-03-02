@@ -52,7 +52,7 @@ class HydroState:
         self.hydro_ages = None
         self.hydro_lifetimes = None
         self.hydro_max_age = 200
-        self.hydro_n_particles = 25000
+        self.hydro_n_particles = 12000
         self.hydro_trail_len = 20
         self.hydro_trails = None
         self.hydro_speed = 0.75
