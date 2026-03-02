@@ -1,0 +1,33 @@
+name: rtxpy-dev
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12
+  - cupy>=12.0
+  - numba>=0.56
+  - zarr>=2.0
+  - numpy>=1.21,<3
+  - xarray
+  - rioxarray
+  - xarray-spatial
+  - pyproj
+  - pillow
+  - pyglfw
+  - moderngl
+  - libegl-devel
+  - scipy
+  - duckdb<1.4
+  - requests
+  - matplotlib
+  - pytest
+  - ruff
+  - pip
+  - cmake
+  - git
+
+# After creating this environment, install pyoptix-contrib and rtxpy:
+#
+#   conda activate rtxpy-dev
+#   git clone --depth 1 https://github.com/NVIDIA/optix-dev.git /tmp/optix-dev
+#   CMAKE_PREFIX_PATH=/tmp/optix-dev pip install pyoptix-contrib
+#   pip install -e ".[all]"

@@ -352,10 +352,13 @@ def _trace_tributaries_flow_path(fd, fa, water_geojson, terrain, ocean,
         return None, None
 
     ww_seeds_da = terrain.copy(data=ww_seeds)
+    del ww_seeds
     ww_traced = _flow_path(fd, ww_seeds_da)
+    del ww_seeds_da
     ww_traced_np = ww_traced.data.get() if hasattr(ww_traced.data, 'get') \
         else np.asarray(ww_traced.data)
     ww_net = np.isfinite(ww_traced_np)
+    del ww_traced, ww_traced_np
     n_channel = int(ww_net.sum())
 
     # -- Pass 2: headwater seeds → tributaries via flow_path -----------------
@@ -366,15 +369,20 @@ def _trace_tributaries_flow_path(fd, fa, water_geojson, terrain, ocean,
     hw_mask = (fa_np >= threshold) & (~ww_net) & (~ocean)
     hw_seeds[hw_mask] = 1.0
     n_hw = int(hw_mask.sum())
+    del fa_np, hw_mask
 
     if n_hw > 0:
         hw_seeds_da = terrain.copy(data=hw_seeds)
+        del hw_seeds
         hw_traced = _flow_path(fd, hw_seeds_da)
+        del hw_seeds_da
         hw_traced_np = hw_traced.data.get() if hasattr(hw_traced.data, 'get') \
             else np.asarray(hw_traced.data)
         trib_cells = np.isfinite(hw_traced_np) & (~ww_net)
+        del hw_traced, hw_traced_np
         n_trib = int(trib_cells.sum())
     else:
+        del hw_seeds
         trib_cells = np.zeros((H, W), dtype=bool)
         n_trib = 0
 
@@ -579,6 +587,7 @@ def quickstart(
     hydro_data = None
     if hydro:
         try:
+            import gc
             from xrspatial import fill as _fill
             from xrspatial import flow_direction as _flow_direction
             from xrspatial import flow_accumulation as _flow_accumulation
@@ -597,27 +606,37 @@ def quickstart(
             ocean = (elev_np == 0.0) | np.isnan(elev_np)
             elev_np[ocean] = -100.0
 
-            # 1b. Burn Overture waterways into the DEM — carve known
-            #     river/stream channels so D8 routes through them.
+            # Pre-load waterway GeoJSON once (used in steps 1b, 6b,
+            # 6c, and for hydro_data). Avoids 4× redundant file reads.
+            _water_geojson = None
             if 'water' in feat:
                 _wc = cache_dir / f"{name}_water.geojson"
                 if _wc.exists():
                     import json as _json_ww
                     try:
                         with open(_wc) as _wf:
-                            _ww_data = _json_ww.load(_wf)
-                        _ww_burn = _rasterize_waterways_to_dem(
-                            _ww_data, terrain, elev_np, ocean)
-                        if _ww_burn is not None:
-                            elev_np -= _ww_burn
-                            elev_np[ocean] = -100.0
+                            _water_geojson = _json_ww.load(_wf)
                     except Exception as _e:
-                        print(f"  Waterway DEM burn skipped: {_e}")
+                        print(f"  Waterway GeoJSON load failed: {_e}")
+
+            # 1b. Burn Overture waterways into the DEM — carve known
+            #     river/stream channels so D8 routes through them.
+            if _water_geojson is not None:
+                try:
+                    _ww_burn = _rasterize_waterways_to_dem(
+                        _water_geojson, terrain, elev_np, ocean)
+                    if _ww_burn is not None:
+                        elev_np -= _ww_burn
+                        elev_np[ocean] = -100.0
+                    del _ww_burn
+                except Exception as _e:
+                    print(f"  Waterway DEM burn skipped: {_e}")
 
             # 2. Smooth (15×15 ≈ 450 m at 30 m) to remove noise pits
             #    that fragment the drainage network.
             smoothed = _uniform_filter(elev_np, size=15, mode='nearest')
             smoothed[ocean] = -100.0
+            del elev_np
 
             # 3. Fill remaining depressions, then resolve flats.
             if is_cupy:
@@ -625,15 +644,18 @@ def quickstart(
                 _sm = _cp.asarray(smoothed)
             else:
                 _sm = smoothed
+            del smoothed
             filled = _fill(terrain.copy(data=_sm))
             fill_depth = filled.data - _sm
             resolved = filled.data + fill_depth * 0.01
+            del filled, fill_depth, _sm
 
             # 3b. Distance-to-ocean gradient — ensures flat areas
             #     drain coherently toward the coast.
             from scipy.ndimage import distance_transform_edt as _dist_edt
             dist_to_ocean = _dist_edt(~ocean).astype(np.float32)
             ocean_gradient = dist_to_ocean * 0.0001
+            del dist_to_ocean
 
             if is_cupy:
                 resolved = resolved + _cp.asarray(ocean_gradient)
@@ -641,6 +663,7 @@ def quickstart(
             else:
                 resolved += ocean_gradient
                 resolved[ocean] = -100.0
+            del ocean_gradient
 
             # 3c. Channel burning — compute an initial flow
             #     accumulation, then lower high-accumulation cells
@@ -648,8 +671,10 @@ def quickstart(
             #     re-compute so streams connect into a network.
             _fd0 = _flow_direction(terrain.copy(data=resolved))
             _fa0 = _flow_accumulation(_fd0)
+            del _fd0
             _fa0_np = _fa0.data.get() if is_cupy else np.asarray(_fa0.data)
             _fa0_np = np.nan_to_num(_fa0_np, nan=0.0)
+            del _fa0
 
             # Burn proportional to log(accumulation): cells with
             # more upstream area get carved deeper (up to ~2 m).
@@ -657,6 +682,7 @@ def quickstart(
             _log_max = max(_log_acc.max(), 1.0)
             _burn = (_log_acc / _log_max) * 2.0  # 0–2 m carve
             _burn[ocean] = 0.0
+            del _fa0_np, _log_acc
 
             if is_cupy:
                 resolved = resolved - _cp.asarray(_burn.astype(np.float32))
@@ -664,11 +690,13 @@ def quickstart(
             else:
                 resolved -= _burn.astype(np.float32)
                 resolved[ocean] = -100.0
+            del _burn
 
             # Re-fill after burning to remove any new micro-pits
             filled2 = _fill(terrain.copy(data=resolved))
             fill_depth2 = filled2.data - resolved
             resolved = filled2.data + fill_depth2 * 0.01
+            del filled2, fill_depth2
 
             # Final jitter to break remaining ties
             if is_cupy:
@@ -682,8 +710,14 @@ def quickstart(
                     0, 0.0001, resolved.shape).astype(np.float32)
                 resolved[ocean] = -100.0
 
+            # Free CuPy cached blocks before the next heavy step
+            if is_cupy:
+                _cp.get_default_memory_pool().free_all_blocks()
+            gc.collect()
+
             # 4. Compute final D8 flow direction and accumulation.
             fd = _flow_direction(terrain.copy(data=resolved))
+            del resolved
             fa = _flow_accumulation(fd)
 
             # 5. Compute Strahler stream order — only stream cells
@@ -718,79 +752,76 @@ def quickstart(
             _sl_clean = np.nan_to_num(_sl_np, nan=0.0).astype(np.float32)
             if is_cupy:
                 _sl_clean = _cp.asarray(_sl_clean)
+            del _sl_np
+
             # 6b. Burn Overture waterways into stream_link + stream_order
             #     so they appear in the overlay with the water shader.
-            if 'water' in feat:
-                _wc2 = cache_dir / f"{name}_water.geojson"
-                if _wc2.exists():
-                    try:
-                        import json as _json2
-                        with open(_wc2) as _wf2:
-                            _ww2 = _json2.load(_wf2)
-                        _so_np = so_out.get() if is_cupy else np.asarray(so_out)
-                        _so_np = np.nan_to_num(_so_np, nan=0.0).astype(
-                            np.float32)
-                        _sl_np2 = _sl_clean.get() if is_cupy else np.asarray(
-                            _sl_clean)
-                        _sl_np2 = np.array(_sl_np2, dtype=np.float32)
-                        _max_link = int(_sl_np2.max()) + 1
-                        _n_ww = _burn_waterways_to_grids(
-                            _ww2, terrain, _sl_np2, _so_np,
-                            ocean, _max_link)
-                        if _n_ww > 0:
-                            if is_cupy:
-                                _sl_clean = _cp.asarray(_sl_np2)
-                                so_out = _cp.asarray(_so_np)
-                            else:
-                                _sl_clean = _sl_np2
-                                so_out = _so_np
-                            _sl_out = _sl_clean  # keep in sync
-                            print(f"  Burned {_n_ww} waterway features "
-                                  f"into stream_link overlay")
-                    except Exception as _e2:
-                        print(f"  Waterway overlay burn skipped: {_e2}")
+            if _water_geojson is not None:
+                try:
+                    _so_np = so_out.get() if is_cupy else np.asarray(so_out)
+                    _so_np = np.nan_to_num(_so_np, nan=0.0).astype(
+                        np.float32)
+                    _sl_np2 = _sl_clean.get() if is_cupy else np.asarray(
+                        _sl_clean)
+                    _sl_np2 = np.array(_sl_np2, dtype=np.float32)
+                    _max_link = int(_sl_np2.max()) + 1
+                    _n_ww = _burn_waterways_to_grids(
+                        _water_geojson, terrain, _sl_np2, _so_np,
+                        ocean, _max_link)
+                    if _n_ww > 0:
+                        if is_cupy:
+                            _sl_clean = _cp.asarray(_sl_np2)
+                            so_out = _cp.asarray(_so_np)
+                        else:
+                            _sl_clean = _sl_np2
+                            so_out = _so_np
+                        _sl_out = _sl_clean  # keep in sync
+                        print(f"  Burned {_n_ww} waterway features "
+                              f"into stream_link overlay")
+                    del _so_np, _sl_np2
+                except Exception as _e2:
+                    print(f"  Waterway overlay burn skipped: {_e2}")
 
             # 6c. Trace tributary network via flow_path
-            if 'water' in feat:
-                _wc3 = cache_dir / f"{name}_water.geojson"
-                if _wc3.exists():
-                    try:
-                        import json as _json3
-                        with open(_wc3) as _wf3:
-                            _ww3 = _json3.load(_wf3)
-                        _trib, _ww_net = _trace_tributaries_flow_path(
-                            fd, fa, _ww3, terrain, ocean)
-                        if _trib is not None:
-                            _so_np3 = so_out.get() if is_cupy else np.asarray(so_out)
-                            _so_np3 = np.nan_to_num(_so_np3, nan=0.0).astype(
-                                np.float32)
-                            _sl_np3 = _sl_clean.get() if is_cupy else np.asarray(
-                                _sl_clean)
-                            _sl_np3 = np.array(_sl_np3, dtype=np.float32)
-                            _max_link3 = int(_sl_np3.max()) + 1
-                            # New waterway-channel cells → stream_order 3
-                            _new_ww = _ww_net & (_sl_np3 == 0) & (~ocean)
-                            _sl_np3[_new_ww] = _max_link3
-                            _so_np3[_new_ww] = np.maximum(
-                                _so_np3[_new_ww], 3.0)
-                            _max_link3 += 1
-                            # New tributary cells → stream_order 1
-                            _new_trib = _trib & (_sl_np3 == 0) & (~ocean)
-                            _sl_np3[_new_trib] = _max_link3
-                            _so_np3[_new_trib] = np.maximum(
-                                _so_np3[_new_trib], 1.0)
-                            if is_cupy:
-                                _sl_clean = _cp.asarray(_sl_np3)
-                                so_out = _cp.asarray(_so_np3)
-                            else:
-                                _sl_clean = _sl_np3
-                                so_out = _so_np3
-                            _sl_out = _sl_clean
-                    except ImportError:
-                        print("  flow_path tracing skipped "
-                              "(xrspatial.flow_path unavailable)")
-                    except Exception as _e3:
-                        print(f"  flow_path tracing skipped: {_e3}")
+            if _water_geojson is not None:
+                try:
+                    _trib, _ww_net = _trace_tributaries_flow_path(
+                        fd, fa, _water_geojson, terrain, ocean)
+                    if _trib is not None:
+                        _so_np3 = so_out.get() if is_cupy else np.asarray(so_out)
+                        _so_np3 = np.nan_to_num(_so_np3, nan=0.0).astype(
+                            np.float32)
+                        _sl_np3 = _sl_clean.get() if is_cupy else np.asarray(
+                            _sl_clean)
+                        _sl_np3 = np.array(_sl_np3, dtype=np.float32)
+                        _max_link3 = int(_sl_np3.max()) + 1
+                        # New waterway-channel cells → stream_order 3
+                        _new_ww = _ww_net & (_sl_np3 == 0) & (~ocean)
+                        _sl_np3[_new_ww] = _max_link3
+                        _so_np3[_new_ww] = np.maximum(
+                            _so_np3[_new_ww], 3.0)
+                        _max_link3 += 1
+                        # New tributary cells → stream_order 1
+                        _new_trib = _trib & (_sl_np3 == 0) & (~ocean)
+                        _sl_np3[_new_trib] = _max_link3
+                        _so_np3[_new_trib] = np.maximum(
+                            _so_np3[_new_trib], 1.0)
+                        if is_cupy:
+                            _sl_clean = _cp.asarray(_sl_np3)
+                            so_out = _cp.asarray(_so_np3)
+                        else:
+                            _sl_clean = _sl_np3
+                            so_out = _so_np3
+                        _sl_out = _sl_clean
+                        del _so_np3, _sl_np3, _trib, _ww_net
+                except ImportError:
+                    print("  flow_path tracing skipped "
+                          "(xrspatial.flow_path unavailable)")
+                except Exception as _e3:
+                    print(f"  flow_path tracing skipped: {_e3}")
+
+            # Drop xrspatial DataArray wrappers — we only need .data
+            del fd, fa, so, sl
 
             ds['stream_link'] = terrain.copy(data=_sl_clean).rename(None)
 
@@ -801,44 +832,43 @@ def quickstart(
                 'stream_link': _sl_out,
                 'accum_threshold': 50,
             }
+            del fd_out, fa_out, _sl_out
             # Pass overrides from explore_kwargs if present
             for key in ('n_particles', 'max_age', 'trail_len', 'speed',
                         'accum_threshold', 'color', 'alpha', 'dot_radius'):
                 hydro_key = f'hydro_{key}'
                 if hydro_key in explore_kwargs:
                     hydro_data[key] = explore_kwargs.pop(hydro_key)
-            # Load cached Overture waterway features for particle
+            # Attach cached Overture waterway features for particle
             # injection and unified water-shader rendering.
-            if 'water' in feat:
-                water_cache = cache_dir / f"{name}_water.geojson"
-                if water_cache.exists():
-                    import json as _json
-                    try:
-                        with open(water_cache) as _wf:
-                            _ww = _json.load(_wf)
-                        ww_feats = [
-                            f for f in _ww.get('features', [])
-                            if f.get('geometry', {}).get('type') in
-                               ('LineString', 'Polygon', 'MultiPolygon')
-                        ]
-                        if ww_feats:
-                            hydro_data['waterway_geojson'] = {
-                                'type': 'FeatureCollection',
-                                'features': ww_feats,
-                            }
-                            n_lines = sum(
-                                1 for f in ww_feats
-                                if f['geometry']['type'] == 'LineString')
-                            n_polys = len(ww_feats) - n_lines
-                            parts = []
-                            if n_lines:
-                                parts.append(f"{n_lines} LineStrings")
-                            if n_polys:
-                                parts.append(f"{n_polys} Polygons")
-                            print(f"  Loaded {' + '.join(parts)} "
-                                  f"for hydro overlay")
-                    except Exception:
-                        pass
+            if _water_geojson is not None:
+                ww_feats = [
+                    f for f in _water_geojson.get('features', [])
+                    if f.get('geometry', {}).get('type') in
+                       ('LineString', 'Polygon', 'MultiPolygon')
+                ]
+                if ww_feats:
+                    hydro_data['waterway_geojson'] = {
+                        'type': 'FeatureCollection',
+                        'features': ww_feats,
+                    }
+                    n_lines = sum(
+                        1 for f in ww_feats
+                        if f['geometry']['type'] == 'LineString')
+                    n_polys = len(ww_feats) - n_lines
+                    parts = []
+                    if n_lines:
+                        parts.append(f"{n_lines} LineStrings")
+                    if n_polys:
+                        parts.append(f"{n_polys} Polygons")
+                    print(f"  Loaded {' + '.join(parts)} "
+                          f"for hydro overlay")
+                del ww_feats
+
+            del _water_geojson, ocean, _sl_clean
+            if is_cupy:
+                _cp.get_default_memory_pool().free_all_blocks()
+            gc.collect()
 
             print(f"  Flow direction + accumulation computed on "
                   f"{terrain.shape[0]}x{terrain.shape[1]} grid")
@@ -848,6 +878,7 @@ def quickstart(
     # -- coast distance -------------------------------------------------------
     if coast_distance:
         try:
+            import gc as _gc_cd
             from xrspatial import surface_distance as _surface_distance
             from scipy.ndimage import binary_erosion as _binary_erosion
 
@@ -858,21 +889,27 @@ def quickstart(
 
             # Coast = land cells adjacent to ocean
             _coast = _land & ~_binary_erosion(_land)
+            del _land
 
             # Target raster: 1.0 at coast, 0.0 elsewhere
             _targets = np.zeros_like(_elev, dtype=np.float32)
             _targets[_coast] = 1.0
+            del _coast
 
             # Elevation with ocean as NaN barriers
             _elev_clean = _elev.astype(np.float32).copy()
             _elev_clean[_ocean] = np.nan
+            del _elev, _ocean
 
             _dist = _surface_distance(
-                raster=terrain.copy(data=_targets),
+                terrain.copy(data=_targets),
                 elevation=terrain.copy(data=_elev_clean),
                 method='planar',
             )
+            del _targets, _elev_clean
             ds['coast_distance'] = _dist.rename(None)
+            del _dist
+            _gc_cd.collect()
             print("Surface distance from coast computed")
         except Exception as e:
             print(f"Skipping coast distance: {e}")

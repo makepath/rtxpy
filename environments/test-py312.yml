@@ -1,0 +1,9 @@
+name: rtxpy-test-py312
+channels:
+  - makepath
+  - conda-forge
+dependencies:
+  - python=3.12
+  - rtxpy=0.0.6
+  - libegl-devel
+  - pytest

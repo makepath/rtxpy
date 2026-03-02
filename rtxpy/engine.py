@@ -1346,6 +1346,7 @@ class InteractiveViewer:
         )
 
         self.rtx = rtx
+        self._scene_diagonal = 1.0  # updated in run() with actual terrain extent
         self.width = width
         self.height = height
         self.render_scale = np.clip(render_scale, 0.25, 1.0)
@@ -1613,8 +1614,11 @@ class InteractiveViewer:
                     verts.copy(), idxs.copy(), terrain_np.copy(),
                 )
 
+                # Only pass grid_dims for TIN meshes — cluster GAS
+                # partitioning assumes regular grid triangle layout.
+                gd = (H, W) if mesh_type != 'voxel' else None
                 rtx.add_geometry('terrain', verts, idxs,
-                                 grid_dims=(H, W))
+                                 grid_dims=gd)
 
     # ------------------------------------------------------------------
     # Delegation properties — InputState
@@ -1751,6 +1755,22 @@ class InteractiveViewer:
     @sun_altitude.setter
     def sun_altitude(self, value):
         self.render_settings.sun_altitude = value
+
+    @property
+    def fog_density(self):
+        return self.render_settings.fog_density
+
+    @fog_density.setter
+    def fog_density(self, value):
+        self.render_settings.fog_density = value
+
+    @property
+    def fog_color(self):
+        return self.render_settings.fog_color
+
+    @fog_color.setter
+    def fog_color(self, value):
+        self.render_settings.fog_color = value
 
     @property
     def colormap(self):
@@ -2244,13 +2264,25 @@ class InteractiveViewer:
     def _wind_max_age(self):
         return self.wind.wind_max_age
 
+    @_wind_max_age.setter
+    def _wind_max_age(self, value):
+        self.wind.wind_max_age = value
+
     @property
     def _wind_n_particles(self):
         return self.wind.wind_n_particles
 
+    @_wind_n_particles.setter
+    def _wind_n_particles(self, value):
+        self.wind.wind_n_particles = value
+
     @property
     def _wind_trail_len(self):
         return self.wind.wind_trail_len
+
+    @_wind_trail_len.setter
+    def _wind_trail_len(self, value):
+        self.wind.wind_trail_len = value
 
     @property
     def _wind_trails(self):
@@ -2264,6 +2296,10 @@ class InteractiveViewer:
     def _wind_speed_mult(self):
         return self.wind.wind_speed_mult
 
+    @_wind_speed_mult.setter
+    def _wind_speed_mult(self, value):
+        self.wind.wind_speed_mult = value
+
     @property
     def _wind_min_depth(self):
         return self.wind.wind_min_depth
@@ -2276,13 +2312,25 @@ class InteractiveViewer:
     def _wind_dot_radius(self):
         return self.wind.wind_dot_radius
 
+    @_wind_dot_radius.setter
+    def _wind_dot_radius(self, value):
+        self.wind.wind_dot_radius = value
+
     @property
     def _wind_alpha(self):
         return self.wind.wind_alpha
 
+    @_wind_alpha.setter
+    def _wind_alpha(self, value):
+        self.wind.wind_alpha = value
+
     @property
     def _wind_min_visible_age(self):
         return self.wind.wind_min_visible_age
+
+    @_wind_min_visible_age.setter
+    def _wind_min_visible_age(self, value):
+        self.wind.wind_min_visible_age = value
 
     @property
     def _wind_terrain_np(self):
@@ -4737,7 +4785,9 @@ class InteractiveViewer:
             stream_order = np.nan_to_num(stream_order, nan=0.0)
         has_stream_order = stream_order is not None and (stream_order > 0).any()
 
-        self._hydro_data = (flow_dir, flow_accum)
+        # Mark hydro as initialised (don't hold the full grids —
+        # particle advection uses _hydro_flow_u_px / _hydro_flow_v_px).
+        self._hydro_data = True
 
         # Apply optional overrides
         for key, attr, conv in [
@@ -7148,6 +7198,8 @@ class InteractiveViewer:
         from .analysis import render as render_func
 
         # Common render kwargs
+        # fog_density is scene-relative; convert to absolute for the kernel
+        _fog = self.fog_density / self._scene_diagonal if self.fog_density > 0 else 0.0
         render_kwargs = dict(
             camera_position=tuple(self.position),
             look_at=tuple(self._get_look_at()),
@@ -7158,6 +7210,8 @@ class InteractiveViewer:
             sun_altitude=self.sun_altitude,
             shadows=self.shadows,
             ambient=self.ambient,
+            fog_density=_fog,
+            fog_color=self.fog_color,
             colormap=self.colormap,
             rtx=self.rtx,
             viewshed_data=viewshed_data,
@@ -7295,6 +7349,8 @@ class InteractiveViewer:
         # are non-linear operations that must act on the clean signal.
         defer_post = self.ao_enabled or self.denoise_enabled
 
+        # fog_density is scene-relative; convert to absolute for the kernel
+        _fog = self.fog_density / self._scene_diagonal if self.fog_density > 0 else 0.0
         d_output = render(
             self.raster,
             camera_position=tuple(self.position),
@@ -7306,6 +7362,8 @@ class InteractiveViewer:
             sun_altitude=self.sun_altitude,
             shadows=self.shadows,
             ambient=self.ambient,
+            fog_density=_fog,
+            fog_color=self.fog_color,
             colormap=self.colormap,
             rtx=self.rtx,
             viewshed_data=viewshed_data,
@@ -8176,6 +8234,7 @@ class InteractiveViewer:
         world_W = W * self.pixel_spacing_x
         world_H = H * self.pixel_spacing_y
         world_diag = np.sqrt(world_W**2 + world_H**2)
+        self._scene_diagonal = world_diag
 
         # Set initial move speed based on terrain extent (~1% of diagonal per keystroke)
         if self.move_speed is None:
@@ -8455,6 +8514,13 @@ def explore(raster, width: int = 800, height: int = 600,
             ao_samples: int = 0,
             gi_bounces: int = 1,
             denoise: bool = False,
+            fog_density: float = 0.0,
+            fog_color: tuple = (0.7, 0.8, 0.9),
+            colormap: str = None,
+            sun_azimuth: float = None,
+            sun_altitude: float = None,
+            shadows: bool = None,
+            ambient: float = None,
             minimap_style: str = None,
             minimap_layer: str = None,
             minimap_colors: dict = None,
@@ -8703,6 +8769,24 @@ def explore(raster, width: int = 800, height: int = 600,
     # Denoiser initialization
     if denoise:
         viewer.denoise_enabled = True
+
+    # Shared render params (fog, lighting, colormap)
+    if fog_density > 0:
+        viewer.fog_density = fog_density
+    if fog_color != (0.7, 0.8, 0.9):
+        viewer.fog_color = fog_color
+    if colormap is not None:
+        viewer.colormap = colormap
+        if colormap in viewer.colormaps:
+            viewer.colormap_idx = viewer.colormaps.index(colormap)
+    if sun_azimuth is not None:
+        viewer.sun_azimuth = sun_azimuth
+    if sun_altitude is not None:
+        viewer.sun_altitude = sun_altitude
+    if shadows is not None:
+        viewer.shadows = shadows
+    if ambient is not None:
+        viewer.ambient = ambient
 
     # Initial state: everything off except elevation
     viewer._tiles_enabled = False
