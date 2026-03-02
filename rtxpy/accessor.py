@@ -581,14 +581,16 @@ class RTXAccessor:
         """
         return self._rtx.trace(rays, hits, num_rays, primitive_ids, instance_ids)
 
-    def render(self, camera_position, look_at, fov=60.0, up=(0, 0, 1),
+    def render(self, camera_position=None, look_at=None, fov=60.0, up=(0, 0, 1),
                width=1920, height=1080, sun_azimuth=225, sun_altitude=45,
                shadows=True, ambient=0.15, fog_density=0.0,
                fog_color=(0.7, 0.8, 0.9), colormap='terrain',
-               color_range=None, output_path=None, alpha=False,
+               color_range=None, color_stretch='linear', output_path=None,
+               alpha=False, denoise=False,
                vertical_exaggeration=None, rtx=None,
                ao_samples=0, ao_radius=None, gi_bounces=1, sun_angle=0.0,
-               aperture=0.0, focal_distance=0.0):
+               aperture=0.0, focal_distance=0.0,
+               start_position=None):
         """Render terrain with a perspective camera for movie-quality visualization.
 
         Uses OptiX ray tracing to render terrain with realistic lighting, shadows,
@@ -660,6 +662,14 @@ class RTXAccessor:
             Distance to the focal plane. Objects at this distance are sharp.
             If 0, auto-computes from camera-to-lookat distance.
             Default is 0.0.
+        start_position : tuple of float, optional
+            Alias for ``camera_position`` (matches the explore() API).
+            If both are provided, ``camera_position`` takes precedence.
+        color_stretch : str, optional
+            Elevation color stretch: 'linear', 'sqrt', 'cbrt', or 'log'.
+            Default is 'linear'.
+        denoise : bool, optional
+            If True, apply OptiX AI Denoiser to the output. Default is False.
 
         Returns
         -------
@@ -676,6 +686,10 @@ class RTXAccessor:
         ...     output_path='terrain_render.png'
         ... )
         """
+        # start_position is an alias for camera_position (matches explore() API)
+        if camera_position is None:
+            camera_position = start_position
+
         from .analysis import render as _render
         return _render(
             self._obj,
@@ -693,8 +707,10 @@ class RTXAccessor:
             fog_color=fog_color,
             colormap=colormap,
             color_range=color_range,
+            color_stretch=color_stretch,
             output_path=output_path,
             alpha=alpha,
+            denoise=denoise,
             vertical_exaggeration=vertical_exaggeration,
             rtx=rtx,  # User can override, but default None creates fresh instance
             pixel_spacing_x=self._pixel_spacing_x,
@@ -2550,6 +2566,9 @@ class RTXAccessor:
                 subsample=1, wind_data=None, hydro_data=None, gtfs_data=None,
                 terrain_loader=None,
                 scene_zarr=None, ao_samples=0, gi_bounces=1, denoise=False,
+                fog_density=0.0, fog_color=(0.7, 0.8, 0.9),
+                colormap=None, sun_azimuth=None, sun_altitude=None,
+                shadows=None, ambient=None,
                 repl=False, tour=None):
         """Launch an interactive terrain viewer with keyboard controls.
 
@@ -2694,6 +2713,13 @@ class RTXAccessor:
             ao_samples=ao_samples,
             gi_bounces=gi_bounces,
             denoise=denoise,
+            fog_density=fog_density,
+            fog_color=fog_color,
+            colormap=colormap,
+            sun_azimuth=sun_azimuth,
+            sun_altitude=sun_altitude,
+            shadows=shadows,
+            ambient=ambient,
             repl=repl,
             tour=tour,
         )
@@ -3012,6 +3038,9 @@ class RTXDatasetAccessor:
                 gtfs_data=None,
                 scene_zarr=None,
                 ao_samples=0, gi_bounces=1, denoise=False,
+                fog_density=0.0, fog_color=(0.7, 0.8, 0.9),
+                colormap=None, sun_azimuth=None, sun_altitude=None,
+                shadows=None, ambient=None,
                 minimap_style=None, minimap_layer=None,
                 minimap_colors=None, info_text=None,
                 repl=False, tour=None):
@@ -3122,6 +3151,13 @@ class RTXDatasetAccessor:
             ao_samples=ao_samples,
             gi_bounces=gi_bounces,
             denoise=denoise,
+            fog_density=fog_density,
+            fog_color=fog_color,
+            colormap=colormap,
+            sun_azimuth=sun_azimuth,
+            sun_altitude=sun_altitude,
+            shadows=shadows,
+            ambient=ambient,
             minimap_style=minimap_style,
             minimap_layer=minimap_layer,
             minimap_colors=minimap_colors,

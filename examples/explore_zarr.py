@@ -239,13 +239,62 @@ if __name__ == "__main__":
 
     loader = make_terrain_loader(args.zarr, args.size, args.subsample, args.lon, args.lat)
 
-    print(f"\nLaunching explore...\n")
+    # --- Hydro flow data (off by default, Shift+Y to toggle) ---------------
+    hydro = None
+    try:
+        from xrspatial import fill as _fill
+        from xrspatial import flow_direction as _flow_direction
+        from xrspatial import flow_accumulation as _flow_accumulation
+        from xrspatial import stream_order as _stream_order
+        from scipy.ndimage import uniform_filter as _uniform_filter
+
+        print("Conditioning DEM for hydrological flow...")
+        _elev = cp.asnumpy(terrain.data).astype(np.float32)
+        _nodata = (_elev == 0.0) | np.isnan(_elev)
+        _elev[_nodata] = -100.0
+
+        _smoothed = _uniform_filter(_elev, size=15, mode='nearest')
+        _smoothed[_nodata] = -100.0
+
+        _sm = cp.asarray(_smoothed)
+        _filled = _fill(terrain.copy(data=_sm))
+        _fd = _filled.data - _sm
+        _resolved = _filled.data + _fd * 0.01
+        cp.random.seed(0)
+        _resolved += cp.random.uniform(0, 0.001, _resolved.shape,
+                                       dtype=cp.float32)
+        _resolved[cp.asarray(_nodata)] = -100.0
+
+        fd = _flow_direction(terrain.copy(data=_resolved))
+        fa = _flow_accumulation(fd)
+        so = _stream_order(fd, fa, threshold=50)
+
+        fd_out, fa_out, so_out = fd.data, fa.data, so.data
+        _nodata_gpu = cp.asarray(_nodata)
+        fd_out[_nodata_gpu] = cp.nan
+        fa_out[_nodata_gpu] = cp.nan
+        so_out[_nodata_gpu] = cp.nan
+
+        hydro = {
+            'flow_dir': fd_out,
+            'flow_accum': fa_out,
+            'stream_order': so_out,
+            'accum_threshold': 50,
+            'enabled': False,
+        }
+        print(f"  Flow direction + accumulation computed on "
+              f"{terrain.shape[0]}x{terrain.shape[1]} grid")
+    except Exception as e:
+        print(f"Skipping hydro: {e}")
+
+    print(f"\nLaunching explore (Shift+Y to toggle hydro)...\n")
     terrain.rtx.explore(
         width=2048,
         height=1600,
         render_scale=0.5,
         color_stretch='cbrt',
         terrain_loader=loader,
+        hydro_data=hydro,
         repl=True,
     )
 

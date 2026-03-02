@@ -1069,6 +1069,11 @@ def _build_gas_clustered(vertices, indices, grid_H, grid_W):
     # Upload args to GPU
     d_args = cupy.asarray(np.frombuffer(args_host, dtype=np.uint8))
 
+    # Compute actual totals across all clusters (boundary vertices are
+    # duplicated in per-cluster sub-buffers, so the sum exceeds num_vertices).
+    total_cluster_verts = sum(len(v) for v in verts_per_cluster)
+    total_cluster_tris = sum(len(a) // 3 for a in cluster_index_arrays)
+
     # -- Phase 1: Build clusters from triangles ----------------------------
     cluster_build_input = {
         'type': int(optix.CLUSTER_ACCEL_BUILD_TYPE_CLUSTERS_FROM_TRIANGLES),
@@ -1080,8 +1085,8 @@ def _build_gas_clustered(vertices, indices, grid_H, grid_W):
             'maxUniqueSbtIndexCountPerArg': 1,
             'maxTriangleCountPerArg': max_tri_per_cluster,
             'maxVertexCountPerArg': max_vert_per_cluster,
-            'maxTotalTriangleCount': num_triangles,
-            'maxTotalVertexCount': num_vertices,
+            'maxTotalTriangleCount': total_cluster_tris,
+            'maxTotalVertexCount': total_cluster_verts,
             'minPositionTruncateBitCount': 0,
         },
     }

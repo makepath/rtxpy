@@ -11,6 +11,7 @@ class RenderSettings:
     __slots__ = (
         'shadows', 'ambient',
         'sun_azimuth', 'sun_altitude',
+        'fog_density', 'fog_color',
         'colormap', 'colormaps', 'colormap_idx',
         'color_stretch', '_color_stretches', '_color_stretch_idx',
         'ao_enabled', 'ao_radius', 'gi_intensity', 'gi_bounces',
@@ -26,6 +27,8 @@ class RenderSettings:
         self.ambient = 0.2
         self.sun_azimuth = 225.0
         self.sun_altitude = 35.0
+        self.fog_density = 0.0
+        self.fog_color = (0.7, 0.8, 0.9)
         self.colormap = 'gray'
         self.colormaps = ['gray', 'terrain', 'viridis', 'plasma', 'cividis']
         self.colormap_idx = 0

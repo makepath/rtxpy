@@ -41,3 +41,7 @@ examples/.ipynb_checkpoints/
 *.png
 *.tif
 *.geojson
+*.zarr/
+conda-output/
+examples/cache/
+*gtfs.json
