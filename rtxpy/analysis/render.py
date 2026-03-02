@@ -1213,12 +1213,27 @@ def _shade_terrain_kernel(
                             color_g = color_g * (1.0 - alpha) + 0.9 * alpha
                             color_b = color_b * (1.0 - alpha) + 0.85 * alpha
 
-            # Fog
+            # Height-attenuated atmospheric fog
+            # Fog density decays exponentially with altitude:
+            #   rho(z) = fog_density * exp(-b * (z - elev_min))
+            # The optical depth along the ray is the analytic integral
+            # of rho over the camera-to-hit path, so valleys fill with
+            # haze while ridgelines stay crisp.
             if fog_density > 0:
-                fog_amount = 1.0 - math.exp(-fog_density * t)
-                color_r = color_r * (1 - fog_amount) + fog_color_r * fog_amount
-                color_g = color_g * (1 - fog_amount) + fog_color_g * fog_amount
-                color_b = color_b * (1 - fog_amount) + fog_color_b * fog_amount
+                b = 2.5 / (elev_range + 1e-6)
+                dz = hit_z - oz
+                if abs(dz) > 0.001:
+                    exp_cam = math.exp(-b * (oz - elev_min))
+                    exp_hit = math.exp(-b * (hit_z - elev_min))
+                    optical_depth = fog_density * t * (exp_cam - exp_hit) / (b * dz)
+                else:
+                    z_mid = (oz + hit_z) * 0.5
+                    optical_depth = fog_density * t * math.exp(-b * (z_mid - elev_min))
+                if optical_depth > 0.0:
+                    fog_amount = 1.0 - math.exp(-optical_depth)
+                    color_r = color_r * (1 - fog_amount) + fog_color_r * fog_amount
+                    color_g = color_g * (1 - fog_amount) + fog_color_g * fog_amount
+                    color_b = color_b * (1 - fog_amount) + fog_color_b * fog_amount
 
             output[py, px, 0] = color_r
             output[py, px, 1] = color_g

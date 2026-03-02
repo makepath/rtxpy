@@ -327,6 +327,7 @@ if __name__ == "__main__":
         render_scale=0.5,
         wind_data=wind,
         hydro_data=hydro,
+        fog_density=3.0,
         repl=True,
     )
 
