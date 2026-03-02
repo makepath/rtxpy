@@ -8,6 +8,7 @@ quickstart(
     features=['buildings', 'roads', 'water', 'fire', 'places',
               'infrastructure', 'land_use'],
     hydro=True,
+    coast_distance=True,
     ao_samples=1,
     denoise=True,
 )

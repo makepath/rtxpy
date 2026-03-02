@@ -262,6 +262,127 @@ def _burn_waterways_to_grids(water_geojson, terrain, sl_grid, so_grid,
     return n_burned
 
 
+def _trace_tributaries_flow_path(fd, fa, water_geojson, terrain, ocean,
+                                 threshold=50):
+    """Trace tributary network via xrspatial.flow_path.
+
+    Pass 1: rasterize Overture waterway vertices as seed points, trace
+    downstream through D8 → main channel mask.
+    Pass 2: seed from high-accumulation cells NOT on the main channel,
+    trace downstream → tributary mask.
+
+    Returns (trib_cells, ww_net) — both bool arrays (H, W).
+    """
+    import numpy as np
+    from xrspatial import flow_path as _flow_path
+
+    features = water_geojson.get('features', [])
+    H, W = ocean.shape
+
+    # -- coordinate transform (lon/lat → pixel) ------------------------------
+    try:
+        from pyproj import Transformer
+        terrain_crs = terrain.rio.crs
+        to_crs = Transformer.from_crs('EPSG:4326', terrain_crs,
+                                       always_xy=True)
+    except Exception:
+        return None, None
+
+    x_coords = terrain.coords[terrain.dims[-1]].values
+    y_coords = terrain.coords[terrain.dims[-2]].values
+    x0, x1 = float(x_coords[0]), float(x_coords[-1])
+    y0, y1 = float(y_coords[0]), float(y_coords[-1])
+    dx = (x1 - x0) / max(W - 1, 1)
+    dy = (y1 - y0) / max(H - 1, 1)
+
+    def lonlat_to_pixel(lon, lat):
+        px, py = to_crs.transform(lon, lat)
+        return (px - x0) / dx, (py - y0) / dy
+
+    def densify_line(pixel_coords):
+        pts = []
+        for i in range(len(pixel_coords) - 1):
+            c0, r0 = pixel_coords[i]
+            c1, r1 = pixel_coords[i + 1]
+            dc_, dr_ = c1 - c0, r1 - r0
+            n = max(int(max(abs(dr_), abs(dc_))), 1)
+            for s in range(n + 1):
+                t = s / n
+                pts.append((int(round(r0 + dr_ * t)),
+                            int(round(c0 + dc_ * t))))
+        return pts
+
+    # -- Pass 1: waterway seeds → main channel via flow_path -----------------
+    ww_seeds = np.full((H, W), np.nan, dtype=np.float32)
+    n_seed = 0
+    label = 1.0
+    for feat in features:
+        geom = feat.get('geometry', {})
+        gtype = geom.get('type', '')
+
+        if gtype == 'LineString':
+            coords = geom.get('coordinates', [])
+            if len(coords) < 2:
+                continue
+            px = [lonlat_to_pixel(c[0], c[1]) for c in coords]
+            for rr, cc in densify_line(px):
+                if 0 <= rr < H and 0 <= cc < W and not ocean[rr, cc]:
+                    ww_seeds[rr, cc] = label
+                    n_seed += 1
+            label += 1.0
+
+        elif gtype in ('Polygon', 'MultiPolygon'):
+            all_rings = []
+            if gtype == 'Polygon':
+                all_rings = geom.get('coordinates', [])
+            else:
+                for poly in geom.get('coordinates', []):
+                    all_rings.extend(poly)
+            for ring in all_rings:
+                if len(ring) < 3:
+                    continue
+                px = [lonlat_to_pixel(c[0], c[1]) for c in ring]
+                for rr, cc in densify_line(px):
+                    if 0 <= rr < H and 0 <= cc < W and not ocean[rr, cc]:
+                        ww_seeds[rr, cc] = label
+                        n_seed += 1
+            label += 1.0
+
+    if n_seed == 0:
+        return None, None
+
+    ww_seeds_da = terrain.copy(data=ww_seeds)
+    ww_traced = _flow_path(fd, ww_seeds_da)
+    ww_traced_np = ww_traced.data.get() if hasattr(ww_traced.data, 'get') \
+        else np.asarray(ww_traced.data)
+    ww_net = np.isfinite(ww_traced_np)
+    n_channel = int(ww_net.sum())
+
+    # -- Pass 2: headwater seeds → tributaries via flow_path -----------------
+    fa_np = fa.data.get() if hasattr(fa.data, 'get') else np.asarray(fa.data)
+    fa_np = np.nan_to_num(fa_np, nan=0.0)
+
+    hw_seeds = np.full((H, W), np.nan, dtype=np.float32)
+    hw_mask = (fa_np >= threshold) & (~ww_net) & (~ocean)
+    hw_seeds[hw_mask] = 1.0
+    n_hw = int(hw_mask.sum())
+
+    if n_hw > 0:
+        hw_seeds_da = terrain.copy(data=hw_seeds)
+        hw_traced = _flow_path(fd, hw_seeds_da)
+        hw_traced_np = hw_traced.data.get() if hasattr(hw_traced.data, 'get') \
+            else np.asarray(hw_traced.data)
+        trib_cells = np.isfinite(hw_traced_np) & (~ww_net)
+        n_trib = int(trib_cells.sum())
+    else:
+        trib_cells = np.zeros((H, W), dtype=bool)
+        n_trib = 0
+
+    print(f"  flow_path: {n_seed} waterway seeds → {n_channel} channel cells, "
+          f"{n_hw} headwaters → {n_trib} tributary cells")
+    return trib_cells, ww_net
+
+
 def quickstart(
     name,
     bounds,
@@ -272,6 +393,7 @@ def quickstart(
     tile_zoom=None,
     wind=True,
     hydro=False,
+    coast_distance=False,
     cache_dir=None,
     **explore_kwargs,
 ):
@@ -313,6 +435,11 @@ def quickstart(
         Compute D8 flow direction and flow accumulation from the terrain
         using xarray-spatial and enable hydro flow particle animation
         (Shift+Y).  Default ``False``.
+    coast_distance : bool
+        Compute terrain-aware surface distance from the coast using
+        xrspatial's ``surface_distance`` (3-D Dijkstra).  Adds a
+        ``coast_distance`` layer visible as a G-key overlay.
+        Default ``False``.
     cache_dir : str or Path, optional
         Directory for the zarr store and GeoJSON caches.  Defaults to
         the current working directory.
@@ -623,6 +750,48 @@ def quickstart(
                     except Exception as _e2:
                         print(f"  Waterway overlay burn skipped: {_e2}")
 
+            # 6c. Trace tributary network via flow_path
+            if 'water' in feat:
+                _wc3 = cache_dir / f"{name}_water.geojson"
+                if _wc3.exists():
+                    try:
+                        import json as _json3
+                        with open(_wc3) as _wf3:
+                            _ww3 = _json3.load(_wf3)
+                        _trib, _ww_net = _trace_tributaries_flow_path(
+                            fd, fa, _ww3, terrain, ocean)
+                        if _trib is not None:
+                            _so_np3 = so_out.get() if is_cupy else np.asarray(so_out)
+                            _so_np3 = np.nan_to_num(_so_np3, nan=0.0).astype(
+                                np.float32)
+                            _sl_np3 = _sl_clean.get() if is_cupy else np.asarray(
+                                _sl_clean)
+                            _sl_np3 = np.array(_sl_np3, dtype=np.float32)
+                            _max_link3 = int(_sl_np3.max()) + 1
+                            # New waterway-channel cells → stream_order 3
+                            _new_ww = _ww_net & (_sl_np3 == 0) & (~ocean)
+                            _sl_np3[_new_ww] = _max_link3
+                            _so_np3[_new_ww] = np.maximum(
+                                _so_np3[_new_ww], 3.0)
+                            _max_link3 += 1
+                            # New tributary cells → stream_order 1
+                            _new_trib = _trib & (_sl_np3 == 0) & (~ocean)
+                            _sl_np3[_new_trib] = _max_link3
+                            _so_np3[_new_trib] = np.maximum(
+                                _so_np3[_new_trib], 1.0)
+                            if is_cupy:
+                                _sl_clean = _cp.asarray(_sl_np3)
+                                so_out = _cp.asarray(_so_np3)
+                            else:
+                                _sl_clean = _sl_np3
+                                so_out = _so_np3
+                            _sl_out = _sl_clean
+                    except ImportError:
+                        print("  flow_path tracing skipped "
+                              "(xrspatial.flow_path unavailable)")
+                    except Exception as _e3:
+                        print(f"  flow_path tracing skipped: {_e3}")
+
             ds['stream_link'] = terrain.copy(data=_sl_clean).rename(None)
 
             hydro_data = {
@@ -675,6 +844,38 @@ def quickstart(
                   f"{terrain.shape[0]}x{terrain.shape[1]} grid")
         except Exception as e:
             print(f"Skipping hydro: {e}")
+
+    # -- coast distance -------------------------------------------------------
+    if coast_distance:
+        try:
+            from xrspatial import surface_distance as _surface_distance
+            from scipy.ndimage import binary_erosion as _binary_erosion
+
+            _data = terrain.data
+            _elev = _data.get() if hasattr(_data, 'get') else np.array(_data)
+            _ocean = (_elev == 0.0) | np.isnan(_elev)
+            _land = ~_ocean
+
+            # Coast = land cells adjacent to ocean
+            _coast = _land & ~_binary_erosion(_land)
+
+            # Target raster: 1.0 at coast, 0.0 elsewhere
+            _targets = np.zeros_like(_elev, dtype=np.float32)
+            _targets[_coast] = 1.0
+
+            # Elevation with ocean as NaN barriers
+            _elev_clean = _elev.astype(np.float32).copy()
+            _elev_clean[_ocean] = np.nan
+
+            _dist = _surface_distance(
+                raster=terrain.copy(data=_targets),
+                elevation=terrain.copy(data=_elev_clean),
+                method='planar',
+            )
+            ds['coast_distance'] = _dist.rename(None)
+            print("Surface distance from coast computed")
+        except Exception as e:
+            print(f"Skipping coast distance: {e}")
 
     # -- explore --------------------------------------------------------------
     defaults = dict(
