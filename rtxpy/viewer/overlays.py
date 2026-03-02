@@ -11,6 +11,8 @@ class OverlayManager:
     __slots__ = (
         'overlay_layers', 'overlay_names',
         'active_color_data', 'active_overlay_data',
+        'active_overlay_color_lut',
+        'overlay_color_luts',
         'overlay_alpha', 'overlay_as_water',
         'terrain_layer_order', 'terrain_layer_idx',
         'base_overlay_layers',
@@ -23,6 +25,8 @@ class OverlayManager:
         self.overlay_names = list(self.overlay_layers.keys())
         self.active_color_data = None
         self.active_overlay_data = None
+        self.active_overlay_color_lut = None
+        self.overlay_color_luts = {}
         self.overlay_alpha = 0.7
         self.overlay_as_water = False
 

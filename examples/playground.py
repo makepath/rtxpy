@@ -236,7 +236,88 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"Skipping wind: {e}")
 
-    print("\nLaunching explore (press G to cycle layers, Shift+W for wind)...\n")
+    # --- Hydro flow data (off by default, Shift+Y to toggle) ---------------
+    hydro = None
+    try:
+        from xrspatial import fill as _fill
+        from xrspatial import flow_direction as _flow_direction
+        from xrspatial import flow_accumulation as _flow_accumulation
+        from xrspatial import stream_order as _stream_order
+        from xrspatial import stream_link as _stream_link
+        from scipy.ndimage import uniform_filter as _uniform_filter
+
+        print("Conditioning DEM for hydrological flow...")
+        _data = terrain.data
+        _is_cupy = hasattr(_data, 'get')
+        _elev = _data.get() if _is_cupy else np.array(_data)
+        _elev = _elev.astype(np.float32)
+        _ocean = (_elev == 0.0) | np.isnan(_elev)
+        _elev[_ocean] = -100.0
+
+        _smoothed = _uniform_filter(_elev, size=15, mode='nearest')
+        _smoothed[_ocean] = -100.0
+
+        if _is_cupy:
+            import cupy as _cp
+            _sm = _cp.asarray(_smoothed)
+        else:
+            _sm = _smoothed
+        _filled = _fill(terrain.copy(data=_sm))
+        _fd = _filled.data - _sm
+        _resolved = _filled.data + _fd * 0.01
+        if _is_cupy:
+            _cp.random.seed(0)
+            _resolved += _cp.random.uniform(0, 0.001, _resolved.shape,
+                                            dtype=_cp.float32)
+            _resolved[_cp.asarray(_ocean)] = -100.0
+        else:
+            np.random.seed(0)
+            _resolved += np.random.uniform(
+                0, 0.001, _resolved.shape).astype(np.float32)
+            _resolved[_ocean] = -100.0
+
+        fd = _flow_direction(terrain.copy(data=_resolved))
+        fa = _flow_accumulation(fd)
+        so = _stream_order(fd, fa, threshold=50)
+        sl = _stream_link(fd, fa, threshold=50)
+
+        fd_out, fa_out, so_out = fd.data, fa.data, so.data
+        if _is_cupy:
+            _ocean_gpu = _cp.asarray(_ocean)
+            fd_out[_ocean_gpu] = _cp.nan
+            fa_out[_ocean_gpu] = _cp.nan
+            so_out[_ocean_gpu] = _cp.nan
+        else:
+            fd_out[_ocean] = np.nan
+            fa_out[_ocean] = np.nan
+            so_out[_ocean] = np.nan
+
+        _sl_out = sl.data
+        if _is_cupy:
+            _sl_out[_ocean_gpu] = _cp.nan
+        else:
+            _sl_out[_ocean] = np.nan
+        _sl_np = _sl_out.get() if _is_cupy else np.asarray(_sl_out)
+        _sl_clean = np.nan_to_num(_sl_np, nan=0.0).astype(np.float32)
+        if _is_cupy:
+            _sl_clean = _cp.asarray(_sl_clean)
+        ds['stream_link'] = terrain.copy(data=_sl_clean).rename(None)
+
+        hydro = {
+            'flow_dir': fd_out,
+            'flow_accum': fa_out,
+            'stream_order': so_out,
+            'stream_link': _sl_out,
+            'accum_threshold': 50,
+            'enabled': False,
+        }
+        print(f"  Flow direction + accumulation computed on "
+              f"{terrain.shape[0]}x{terrain.shape[1]} grid")
+    except Exception as e:
+        print(f"Skipping hydro: {e}")
+
+    print("\nLaunching explore (press G to cycle layers, "
+          "Shift+W for wind, Shift+Y for hydro)...\n")
     ds.rtx.explore(
         z='elevation',
         scene_zarr=ZARR,
@@ -245,6 +326,7 @@ if __name__ == "__main__":
         height=768,
         render_scale=0.5,
         wind_data=wind,
+        hydro_data=hydro,
         repl=True,
     )
 

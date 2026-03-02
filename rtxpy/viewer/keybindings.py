@@ -38,6 +38,7 @@ SHIFT_BINDINGS = {
     'H': '_action_prev_help_page',  # Previous help page
     'L': '_action_toggle_drone_glow',  # Drone glow
     'T': '_action_cycle_time',      # Time-of-day
+    'Y': '_action_toggle_hydro',    # Hydro flow particles
 }
 
 # Lowercase key bindings — checked after shift bindings
