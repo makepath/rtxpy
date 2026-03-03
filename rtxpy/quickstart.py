@@ -400,6 +400,7 @@ def quickstart(
     tiles='satellite',
     tile_zoom=None,
     wind=True,
+    weather=False,
     hydro=False,
     coast_distance=False,
     cache_dir=None,
@@ -573,6 +574,15 @@ def quickstart(
                 realtime_url=gtfs_opts.get('realtime_url'))
         except Exception as e:
             print(f"Skipping GTFS realtime: {e}")
+
+    # -- weather --------------------------------------------------------------
+    weather_data = None
+    if weather:
+        try:
+            from .remote_data import fetch_weather as _fetch_weather
+            weather_data = _fetch_weather(bounds, grid_size=15)
+        except Exception as e:
+            print(f"Skipping weather: {e}")
 
     # -- wind -----------------------------------------------------------------
     wind_data = None
@@ -923,7 +933,8 @@ def quickstart(
 
     print("\nLaunching explore...\n")
     ds.rtx.explore(z='elevation', scene_zarr=zarr_path,
-                   wind_data=wind_data, hydro_data=hydro_data,
+                   wind_data=wind_data, weather_data=weather_data,
+                   hydro_data=hydro_data,
                    gtfs_data=gtfs_data, **defaults)
 
 

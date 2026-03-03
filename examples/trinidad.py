@@ -7,6 +7,7 @@ quickstart(
     crs='EPSG:32620',
     features=['buildings', 'roads', 'water', 'fire', 'places',
               'infrastructure', 'land_use'],
+    weather=True,
     hydro=True,
     coast_distance=True,
     ao_samples=1,
