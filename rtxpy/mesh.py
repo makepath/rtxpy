@@ -133,6 +133,193 @@ def triangulate_terrain(verts, triangles, terrain, scale=1.0):
     return 0
 
 
+def add_terrain_skirt(vertices, indices, H, W, skirt_depth=None):
+    """Add a vertical skirt around the edges of a TIN terrain mesh.
+
+    Creates vertical wall faces dropping from the terrain perimeter down
+    to a base level, plus a flat bottom face, giving the terrain a solid
+    "slice of land" appearance.
+
+    Parameters
+    ----------
+    vertices : np.ndarray
+        Flat float32 vertex buffer from triangulate_terrain, shape (H*W*3,).
+    indices : np.ndarray
+        Flat int32 index buffer from triangulate_terrain.
+    H : int
+        Number of rows in the terrain grid.
+    W : int
+        Number of columns in the terrain grid.
+    skirt_depth : float, optional
+        Depth of the skirt below the minimum terrain elevation.
+        If None, defaults to 15% of the elevation range.
+
+    Returns
+    -------
+    new_vertices : np.ndarray
+        Extended vertex buffer with skirt vertices appended.
+    new_indices : np.ndarray
+        Extended index buffer with skirt triangles appended.
+    """
+    z_vals = vertices[2::3]
+    z_min = float(np.nanmin(z_vals))
+    z_max = float(np.nanmax(z_vals))
+
+    if skirt_depth is None:
+        z_range = z_max - z_min
+        skirt_depth = max(z_range * 0.15, 1.0)
+
+    skirt_z = z_min - skirt_depth
+
+    # Build perimeter vertex indices in clockwise order (viewed from above).
+    # Top row L→R, right col T→B, bottom row R→L, left col B→T.
+    top = np.arange(W, dtype=np.int32)
+    right = (np.arange(1, H, dtype=np.int32)) * W + (W - 1)
+    bottom = (H - 1) * W + np.arange(W - 2, -1, -1, dtype=np.int32)
+    left = np.arange(H - 2, 0, -1, dtype=np.int32) * W
+
+    perim = np.concatenate([top, right, bottom, left])
+    n_perim = len(perim)
+    n_orig_verts = H * W
+
+    # Skirt vertices: same x,y as perimeter, z = skirt_z
+    skirt_verts = np.empty(n_perim * 3, dtype=np.float32)
+    skirt_verts[0::3] = vertices[perim * 3]
+    skirt_verts[1::3] = vertices[perim * 3 + 1]
+    skirt_verts[2::3] = skirt_z
+
+    # Wall triangles — two per perimeter edge segment.
+    # CW perimeter traversal with this winding gives outward-facing normals:
+    #   tri1: top_a, bot_b, top_b
+    #   tri2: top_a, bot_a, bot_b
+    idx = np.arange(n_perim, dtype=np.int32)
+    idx_next = np.roll(idx, -1)
+
+    top_a = perim
+    top_b = perim[idx_next]
+    bot_a = (n_orig_verts + idx).astype(np.int32)
+    bot_b = (n_orig_verts + idx_next).astype(np.int32)
+
+    wall_tris = np.empty(n_perim * 6, dtype=np.int32)
+    wall_tris[0::6] = top_a
+    wall_tris[1::6] = bot_b
+    wall_tris[2::6] = top_b
+    wall_tris[3::6] = top_a
+    wall_tris[4::6] = bot_a
+    wall_tris[5::6] = bot_b
+
+    # Bottom face — two triangles using the four corner skirt vertices.
+    c00 = np.int32(n_orig_verts)
+    cW1 = np.int32(n_orig_verts + W - 1)
+    cHW = np.int32(n_orig_verts + W + H - 2)
+    cH0 = np.int32(n_orig_verts + 2 * W + H - 3)
+
+    bottom_tris = np.array([
+        c00, cHW, cW1,
+        c00, cH0, cHW,
+    ], dtype=np.int32)
+
+    new_vertices = np.concatenate([vertices, skirt_verts])
+    new_indices = np.concatenate([indices, wall_tris, bottom_tris])
+
+    return new_vertices, new_indices
+
+
+def build_terrain_skirt(terrain_data, H, W, scale=1.0, skirt_depth=None,
+                        pixel_spacing_x=1.0, pixel_spacing_y=1.0):
+    """Build standalone skirt geometry for a terrain grid.
+
+    Creates a triangle mesh of just the vertical walls and bottom face
+    around the terrain perimeter. Useful for adding a skirt alongside
+    heightfield terrain (which uses custom intersection, not triangles).
+
+    Parameters
+    ----------
+    terrain_data : np.ndarray
+        2D elevation array of shape (H, W).
+    H : int
+        Number of rows.
+    W : int
+        Number of columns.
+    scale : float, optional
+        Scale factor for elevation values. Default is 1.0.
+    skirt_depth : float, optional
+        Depth below minimum elevation. If None, defaults to 15% of range.
+    pixel_spacing_x : float, optional
+        X spacing in world units. Default is 1.0.
+    pixel_spacing_y : float, optional
+        Y spacing in world units. Default is 1.0.
+
+    Returns
+    -------
+    vertices : np.ndarray
+        Flat float32 vertex buffer.
+    indices : np.ndarray
+        Flat int32 index buffer.
+    """
+    # Build perimeter indices (clockwise from above)
+    top = np.arange(W, dtype=np.int32)
+    right = (np.arange(1, H, dtype=np.int32)) * W + (W - 1)
+    bottom = (H - 1) * W + np.arange(W - 2, -1, -1, dtype=np.int32)
+    left = np.arange(H - 2, 0, -1, dtype=np.int32) * W
+    perim = np.concatenate([top, right, bottom, left])
+    n_perim = len(perim)
+
+    perim_h = perim // W
+    perim_w = perim % W
+
+    # Elevation at perimeter vertices
+    perim_z = np.array(
+        [terrain_data[h, w] * scale for h, w in zip(perim_h, perim_w)],
+        dtype=np.float32)
+
+    z_min = float(np.nanmin(terrain_data * scale))
+    z_max = float(np.nanmax(terrain_data * scale))
+    if skirt_depth is None:
+        skirt_depth = max((z_max - z_min) * 0.15, 1.0)
+    skirt_z = z_min - skirt_depth
+
+    # Replace NaN edge elevations with skirt_z so walls still render
+    nan_mask = np.isnan(perim_z)
+    perim_z[nan_mask] = skirt_z
+
+    # Vertices: first n_perim = terrain edge, next n_perim = skirt base
+    vertices = np.empty(n_perim * 2 * 3, dtype=np.float32)
+    vertices[0:n_perim * 3:3] = perim_w.astype(np.float32) * pixel_spacing_x
+    vertices[1:n_perim * 3:3] = perim_h.astype(np.float32) * pixel_spacing_y
+    vertices[2:n_perim * 3:3] = perim_z
+    off = n_perim * 3
+    vertices[off + 0::3] = perim_w.astype(np.float32) * pixel_spacing_x
+    vertices[off + 1::3] = perim_h.astype(np.float32) * pixel_spacing_y
+    vertices[off + 2::3] = skirt_z
+
+    # Wall triangles
+    idx = np.arange(n_perim, dtype=np.int32)
+    idx_next = np.roll(idx, -1)
+    top_a = idx
+    top_b = idx_next
+    bot_a = (n_perim + idx).astype(np.int32)
+    bot_b = (n_perim + idx_next).astype(np.int32)
+
+    wall_tris = np.empty(n_perim * 6, dtype=np.int32)
+    wall_tris[0::6] = top_a
+    wall_tris[1::6] = bot_b
+    wall_tris[2::6] = top_b
+    wall_tris[3::6] = top_a
+    wall_tris[4::6] = bot_a
+    wall_tris[5::6] = bot_b
+
+    # Bottom face
+    c00 = np.int32(n_perim)
+    cW1 = np.int32(n_perim + W - 1)
+    cHW = np.int32(n_perim + W + H - 2)
+    cH0 = np.int32(n_perim + 2 * W + H - 3)
+    bottom_tris = np.array([c00, cHW, cW1, c00, cH0, cHW], dtype=np.int32)
+
+    indices = np.concatenate([wall_tris, bottom_tris])
+    return vertices, indices
+
+
 @cuda.jit
 def _voxelate_terrain_gpu(verts, triangles, data, H, W, scale, base_z, stride):
     """GPU kernel for terrain voxelation — one box-column per cell."""

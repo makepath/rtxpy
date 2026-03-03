@@ -1941,6 +1941,97 @@ def fetch_wind(bounds, grid_size=20):
     }
 
 
+def fetch_weather(bounds, grid_size=20):
+    """Fetch current weather conditions from Open-Meteo for a bounding box.
+
+    Queries the Open-Meteo forecast API for temperature, precipitation,
+    cloud cover, and surface pressure on a regular lat/lon grid.
+
+    Parameters
+    ----------
+    bounds : tuple of float
+        (west, south, east, north) in WGS84 degrees.
+    grid_size : int
+        Number of grid points along each axis (default 20).
+        Total API points = grid_size².  Open-Meteo allows up to
+        ~1 000 points per request.
+
+    Returns
+    -------
+    dict
+        ``'temperature'`` : ndarray (ny, nx) — 2 m temperature (°C).
+        ``'precipitation'`` : ndarray (ny, nx) — precipitation (mm).
+        ``'cloud_cover'`` : ndarray (ny, nx) — cloud cover (%).
+        ``'pressure'`` : ndarray (ny, nx) — surface pressure (hPa).
+        ``'lats'`` : ndarray (ny,) — latitude values.
+        ``'lons'`` : ndarray (nx,) — longitude values.
+
+    Examples
+    --------
+    >>> from rtxpy import fetch_weather
+    >>> wx = fetch_weather((-73.10, 40.92, -73.04, 40.97), grid_size=5)
+    >>> wx['temperature'].shape
+    (5, 5)
+    """
+    try:
+        import requests
+    except ImportError:
+        raise ImportError(
+            "requests is required for fetch_weather(). "
+            "Install it with: pip install requests"
+        )
+    import numpy as np
+
+    west, south, east, north = bounds
+
+    lons = np.linspace(west, east, grid_size)
+    lats = np.linspace(south, north, grid_size)
+    grid_lons, grid_lats = np.meshgrid(lons, lats)
+
+    lat_str = ",".join(f"{v:.4f}" for v in grid_lats.ravel())
+    lon_str = ",".join(f"{v:.4f}" for v in grid_lons.ravel())
+
+    print(f"Fetching weather data ({grid_size}x{grid_size} grid)...")
+    resp = requests.get(
+        _OPEN_METEO_URL,
+        params={
+            "latitude": lat_str,
+            "longitude": lon_str,
+            "current": "temperature_2m,precipitation,cloud_cover,surface_pressure",
+        },
+        timeout=30,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+
+    ny, nx = grid_size, grid_size
+    temperature = np.empty((ny, nx), dtype=np.float32)
+    precipitation = np.empty((ny, nx), dtype=np.float32)
+    cloud_cover = np.empty((ny, nx), dtype=np.float32)
+    pressure = np.empty((ny, nx), dtype=np.float32)
+
+    for i, point in enumerate(data):
+        row = i // nx
+        col = i % nx
+        current = point.get("current", point)
+        temperature[row, col] = current["temperature_2m"]
+        precipitation[row, col] = current["precipitation"]
+        cloud_cover[row, col] = current["cloud_cover"]
+        pressure[row, col] = current["surface_pressure"]
+
+    mean_temp = float(np.mean(temperature))
+    print(f"  Mean temperature: {mean_temp:.1f}°C")
+
+    return {
+        "temperature": temperature,
+        "precipitation": precipitation,
+        "cloud_cover": cloud_cover,
+        "pressure": pressure,
+        "lats": lats,
+        "lons": lons,
+    }
+
+
 # ---------------------------------------------------------------------------
 # NASA FIRMS fire detection footprints
 # ---------------------------------------------------------------------------

@@ -18,14 +18,16 @@ class TerrainState:
         '_gpu_terrain', '_gpu_base_terrain',
         'mesh_type', '_water_mask',
         'vertical_exaggeration', '_land_color_range',
+        'terrain_skirt',
         '_terrain_loader',
         '_coord_origin_x', '_coord_origin_y',
         '_coord_step_x', '_coord_step_y',
         '_reload_cooldown', '_last_reload_time',
+        '_terrain_reload_future', '_terrain_reload_pool',
     )
 
     def __init__(self, raster, pixel_spacing_x=1.0, pixel_spacing_y=1.0,
-                 mesh_type='heightfield', subsample=1):
+                 mesh_type='heightfield', subsample=1, skirt=True):
         self.raster = raster
         self._base_raster = raster
         self.pixel_spacing_x = pixel_spacing_x
@@ -35,6 +37,7 @@ class TerrainState:
         self.mesh_type = mesh_type
         self.subsample_factor = max(1, int(subsample))
         self.vertical_exaggeration = 1.0
+        self.terrain_skirt = skirt
 
         # Elevation stats (set by viewer __init__ after ocean-fill)
         self.terrain_shape = (0, 0)
@@ -58,3 +61,5 @@ class TerrainState:
         self._coord_step_y = -1.0
         self._reload_cooldown = 2.0
         self._last_reload_time = 0.0
+        self._terrain_reload_future = None
+        self._terrain_reload_pool = None

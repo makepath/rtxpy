@@ -173,6 +173,7 @@ if has_cupy:
         min_vis_age,  # int32 scalar — minimum visible age
         ref_depth,    # float32 scalar — depth-scaling reference distance
         terrain,      # (tH, tW) float32 — terrain elevation
+        depth_t,      # (sh, sw) float32 — ray-trace t-values for occlusion
         output,       # (sh, sw, 3) float32 — frame buffer (atomic add)
         # Camera basis — scalar args to avoid tiny GPU allocations
         cam_x, cam_y, cam_z,
@@ -277,6 +278,20 @@ if has_cupy:
 
         if sx < 0 or sx >= sw or sy < 0 or sy >= sh:
             return
+
+        # Depth test: cull particles occluded by terrain.
+        # Convert ray t-value at this pixel to forward depth, then compare
+        # to the particle's forward depth (already computed as `depth`).
+        if depth_t.shape[0] > 0:
+            t_val = depth_t[sy, sx]
+            if t_val > 0.0 and t_val < 1.0e20:
+                # Forward depth = t / sqrt(1 + u_cam^2 + v_cam^2)
+                u_px = (2.0 * float(sx) / float(sw) - 1.0) * fov_scale * aspect_ratio
+                v_px = (1.0 - 2.0 * float(sy) / float(sh)) * fov_scale
+                inv_cos = math.sqrt(1.0 + u_px * u_px + v_px * v_px)
+                terrain_fwd = t_val / inv_cos
+                if depth > terrain_fwd:
+                    return
 
         # Per-particle color and radius
         color_r = colors[pidx, 0]
@@ -1303,7 +1318,8 @@ class InteractiveViewer:
                  title: str = None,
                  subtitle: str = None,
                  legend: dict = None,
-                 subsample: int = 1):
+                 subsample: int = 1,
+                 skirt: bool = True):
         """
         Initialize the interactive viewer.
 
@@ -1342,7 +1358,7 @@ class InteractiveViewer:
         self.terrain = TerrainState(
             raster, pixel_spacing_x=pixel_spacing_x,
             pixel_spacing_y=pixel_spacing_y, mesh_type=mesh_type,
-            subsample=subsample,
+            subsample=subsample, skirt=skirt,
         )
 
         self.rtx = rtx
@@ -1585,6 +1601,12 @@ class InteractiveViewer:
                     spacing_y=self.pixel_spacing_y,
                     ve=1.0,
                 )
+                if self.terrain_skirt:
+                    sv, si = mesh_mod.build_terrain_skirt(
+                        terrain_np, H, W, scale=1.0,
+                        pixel_spacing_x=self.pixel_spacing_x,
+                        pixel_spacing_y=self.pixel_spacing_y)
+                    rtx.add_geometry('terrain_skirt', sv, si)
                 cache_key = (self.subsample_factor, mesh_type)
                 self._terrain_mesh_cache[cache_key] = (
                     None, None, terrain_np.copy(),
@@ -1605,6 +1627,11 @@ class InteractiveViewer:
                     idxs = np.zeros(nt * 3, dtype=np.int32)
                     mesh_mod.triangulate_terrain(verts, idxs, raster, scale=1.0)
 
+                    # Add skirt for TIN meshes
+                    if self.terrain_skirt:
+                        verts, idxs = mesh_mod.add_terrain_skirt(
+                            verts, idxs, H, W)
+
                 if self.pixel_spacing_x != 1.0 or self.pixel_spacing_y != 1.0:
                     verts[0::3] *= self.pixel_spacing_x
                     verts[1::3] *= self.pixel_spacing_y
@@ -1614,9 +1641,9 @@ class InteractiveViewer:
                     verts.copy(), idxs.copy(), terrain_np.copy(),
                 )
 
-                # Only pass grid_dims for TIN meshes — cluster GAS
-                # partitioning assumes regular grid triangle layout.
-                gd = (H, W) if mesh_type != 'voxel' else None
+                # Only pass grid_dims for TIN meshes without skirt —
+                # cluster GAS requires regular grid triangle layout.
+                gd = (H, W) if mesh_type != 'voxel' and not self.terrain_skirt else None
                 rtx.add_geometry('terrain', verts, idxs,
                                  grid_dims=gd)
 
@@ -2909,6 +2936,14 @@ class InteractiveViewer:
         self.terrain.mesh_type = value
 
     @property
+    def terrain_skirt(self):
+        return self.terrain.terrain_skirt
+
+    @terrain_skirt.setter
+    def terrain_skirt(self, value):
+        self.terrain.terrain_skirt = value
+
+    @property
     def _water_mask(self):
         return self.terrain._water_mask
 
@@ -3427,6 +3462,14 @@ class InteractiveViewer:
                     spacing_y=self.pixel_spacing_y,
                     ve=ve,
                 )
+                if self.terrain_skirt:
+                    sv, si = mesh_mod.build_terrain_skirt(
+                        terrain_np, H, W, scale=ve,
+                        pixel_spacing_x=self.pixel_spacing_x,
+                        pixel_spacing_y=self.pixel_spacing_y)
+                    self.rtx.add_geometry('terrain_skirt', sv, si)
+                elif self.rtx.has_geometry('terrain_skirt'):
+                    self.rtx.remove_geometry('terrain_skirt')
         else:
             if cache_key in self._terrain_mesh_cache:
                 # Cache hit — reuse pre-built mesh (stored at scale=1.0)
@@ -3457,6 +3500,10 @@ class InteractiveViewer:
                     indices = np.zeros(num_tris * 3, dtype=np.int32)
                     mesh_mod.triangulate_terrain(vertices, indices, sub, scale=1.0)
 
+                    if self.terrain_skirt:
+                        vertices, indices = mesh_mod.add_terrain_skirt(
+                            vertices, indices, H, W)
+
                 # Scale x,y to world units
                 if self.pixel_spacing_x != 1.0 or self.pixel_spacing_y != 1.0:
                     vertices[0::3] *= self.pixel_spacing_x
@@ -3474,7 +3521,7 @@ class InteractiveViewer:
             # 4. Replace terrain geometry (add_geometry overwrites existing key
             #    in-place, preserving dict insertion order and instance IDs)
             if self.rtx is not None:
-                gd = (H, W) if self.mesh_type != 'voxel' else None
+                gd = (H, W) if self.mesh_type != 'voxel' and not self.terrain_skirt else None
                 self.rtx.add_geometry('terrain', vertices, indices,
                                       grid_dims=gd)
 
@@ -3683,6 +3730,14 @@ class InteractiveViewer:
                     spacing_y=self.pixel_spacing_y,
                     ve=ve,
                 )
+                if self.terrain_skirt:
+                    sv, si = mesh_mod.build_terrain_skirt(
+                        terrain_np, H, W, scale=ve,
+                        pixel_spacing_x=self.pixel_spacing_x,
+                        pixel_spacing_y=self.pixel_spacing_y)
+                    self.rtx.add_geometry('terrain_skirt', sv, si)
+                elif self.rtx.has_geometry('terrain_skirt'):
+                    self.rtx.remove_geometry('terrain_skirt')
         else:
             if cache_key in self._terrain_mesh_cache:
                 verts_base, indices, terrain_np = self._terrain_mesh_cache[cache_key]
@@ -3712,6 +3767,10 @@ class InteractiveViewer:
                     mesh_mod.triangulate_terrain(vertices, indices, self.raster,
                                                  scale=1.0)
 
+                    if self.terrain_skirt:
+                        vertices, indices = mesh_mod.add_terrain_skirt(
+                            vertices, indices, H, W)
+
                 if self.pixel_spacing_x != 1.0 or self.pixel_spacing_y != 1.0:
                     vertices[0::3] *= self.pixel_spacing_x
                     vertices[1::3] *= self.pixel_spacing_y
@@ -3725,7 +3784,7 @@ class InteractiveViewer:
 
             # Replace terrain geometry (preserves dict insertion order)
             if self.rtx is not None:
-                gd = (H, W) if self.mesh_type != 'voxel' else None
+                gd = (H, W) if self.mesh_type != 'voxel' and not self.terrain_skirt else None
                 self.rtx.add_geometry('terrain', vertices, indices,
                                       grid_dims=gd)
 
@@ -4217,6 +4276,45 @@ class InteractiveViewer:
                         geom_id, self._firms_visible)
         print(f"FIRMS fire: {'ON' if self._firms_visible else 'OFF'}")
         self._update_frame()
+
+    def _init_weather(self, weather_data):
+        """Interpolate weather variables from lat/lon grid onto terrain pixels.
+
+        Registers each variable (temperature, precipitation, cloud_cover,
+        pressure) as an overlay layer accessible via G-key cycling.
+        """
+        from .tiles import _build_latlon_grids
+        from scipy.interpolate import RegularGridInterpolator
+
+        raster = self._base_raster
+        H, W = raster.shape
+
+        lats_grid, lons_grid = _build_latlon_grids(raster)
+        points = np.stack([lats_grid.ravel(), lons_grid.ravel()], axis=-1)
+
+        w_lats = weather_data['lats']   # (ny,)
+        w_lons = weather_data['lons']   # (nx,)
+
+        variables = ['temperature', 'precipitation', 'cloud_cover', 'pressure']
+        units = {'temperature': '°C', 'precipitation': 'mm',
+                 'cloud_cover': '%', 'pressure': 'hPa'}
+        added = []
+
+        for var in variables:
+            if var not in weather_data:
+                continue
+            grid = weather_data[var]  # (ny, nx)
+            interp = RegularGridInterpolator(
+                (w_lats, w_lons), grid,
+                method='linear', bounds_error=False, fill_value=np.nan,
+            )
+            layer = interp(points).reshape(H, W).astype(np.float32)
+            _add_overlay(self, var, layer)
+            mean_val = np.nanmean(layer)
+            added.append(f"{var} {mean_val:.1f}{units.get(var, '')}")
+
+        if added:
+            print(f"  Weather: {len(added)} layers added ({', '.join(added)})")
 
     def _init_wind(self, wind_data):
         """Interpolate wind U/V from lat/lon grid onto the terrain pixel grid.
@@ -5266,6 +5364,21 @@ class InteractiveViewer:
 
         on_screen = valid & (sx_all >= 0) & (sx_all < sw) & (sy_all >= 0) & (sy_all < sh)
 
+        # Depth test against ray-traced terrain
+        depth_t_np = None
+        if hasattr(self, '_d_depth_t') and self._d_depth_t is not None and self._d_depth_t.shape[0] > 0:
+            depth_t_np = cp.asnumpy(self._d_depth_t) if hasattr(self._d_depth_t, 'get') else np.asarray(self._d_depth_t)
+        if depth_t_np is not None:
+            sx_c = np.clip(sx_all, 0, sw - 1)
+            sy_c = np.clip(sy_all, 0, sh - 1)
+            t_vals = depth_t_np[sy_c, sx_c]
+            u_px = (2.0 * sx_c / sw - 1.0) * fov_scale * aspect_ratio
+            v_px = (1.0 - 2.0 * sy_c / sh) * fov_scale
+            inv_cos = np.sqrt(1.0 + u_px**2 + v_px**2)
+            terrain_fwd = t_vals / inv_cos
+            occluded = (t_vals > 0) & (t_vals < 1e20) & (depth > terrain_fwd)
+            on_screen = on_screen & ~occluded
+
         ages = self._hydro_ages
         lifetimes = self._hydro_lifetimes
 
@@ -5390,6 +5503,11 @@ class InteractiveViewer:
         if not isinstance(terrain_data, cp.ndarray):
             terrain_data = cp.asarray(terrain_data)
 
+        # Depth buffer for occlusion culling (populated by _update_frame)
+        depth_t = getattr(self, '_d_depth_t', None)
+        if depth_t is None:
+            depth_t = cp.empty((0, 0), dtype=cp.float32)
+
         # Single kernel launch — alpha computed on GPU
         threadsperblock = 256
         blockspergrid = (total + threadsperblock - 1) // threadsperblock
@@ -5405,6 +5523,7 @@ class InteractiveViewer:
             int(self._hydro_min_visible_age),
             float(self._hydro_ref_depth),
             terrain_data,
+            depth_t,
             d_frame,
             float(cam_pos[0]), float(cam_pos[1]), float(cam_pos[2]),
             float(forward[0]), float(forward[1]), float(forward[2]),
@@ -5939,10 +6058,36 @@ class InteractiveViewer:
                 self._calculate_viewshed(quiet=True)
 
     def _check_terrain_reload(self):
-        """Check if camera is near terrain edge and reload a new window if needed."""
+        """Check if camera is near terrain edge and reload a new window.
+
+        The terrain loader runs in a background thread so it doesn't block
+        the render loop (erosion/hydro can take many seconds).  Each tick
+        we either (a) submit a new loader job if near-edge, or (b) poll
+        for a completed result and swap in the new terrain.
+        """
         if self._terrain_loader is None:
             return
 
+        # --- Phase 2: check for completed background load ---
+        future = self.terrain._terrain_reload_future
+        if future is not None:
+            if not future.done():
+                return  # still computing — keep rendering
+            # Harvest result
+            self.terrain._terrain_reload_future = None
+            try:
+                result, cam_lon, cam_lat = future.result()
+            except Exception as e:
+                print(f"Terrain loader error: {e}")
+                self._last_reload_time = time.time()
+                return
+            if result is None:
+                self._last_reload_time = time.time()
+                return
+            self._apply_terrain_reload(result, cam_lon, cam_lat)
+            return
+
+        # --- Phase 1: decide whether to submit a new load ---
         now = time.time()
         if now - self._last_reload_time < self._reload_cooldown:
             return
@@ -5966,11 +6111,29 @@ class InteractiveViewer:
         cam_lon = self._coord_origin_x + cam_col * self._coord_step_x
         cam_lat = self._coord_origin_y + cam_row * self._coord_step_y
 
-        # Call the terrain loader
-        new_raster = self._terrain_loader(cam_lon, cam_lat)
-        if new_raster is None:
-            self._last_reload_time = now
-            return
+        # Submit loader to background thread
+        from concurrent.futures import ThreadPoolExecutor
+        pool = self.terrain._terrain_reload_pool
+        if pool is None:
+            pool = ThreadPoolExecutor(max_workers=1)
+            self.terrain._terrain_reload_pool = pool
+
+        loader = self._terrain_loader
+
+        def _bg_load(lon, lat):
+            return loader(lon, lat), lon, lat
+
+        self.terrain._terrain_reload_future = pool.submit(_bg_load, cam_lon, cam_lat)
+        # Prevent re-submission while the load is in progress
+        self._last_reload_time = now + 999999
+
+    def _apply_terrain_reload(self, result, cam_lon, cam_lat):
+        """Apply a completed terrain reload result (runs on main thread)."""
+        new_hydro = None
+        if isinstance(result, tuple):
+            new_raster, new_hydro = result
+        else:
+            new_raster = result
 
         cam_z = self.position[2]
 
@@ -5991,6 +6154,7 @@ class InteractiveViewer:
         self._hydro_terrain_np = None
         self._d_base_frame = None     # invalidate GPU wind/hydro buffers
         self._d_wind_scratch = None
+        self._d_depth_t = None        # invalidate depth buffer
 
         # Update coordinate tracking
         self._coord_origin_x = new_origin_x
@@ -6055,6 +6219,14 @@ class InteractiveViewer:
                     spacing_y=self.pixel_spacing_y,
                     ve=ve,
                 )
+                if self.terrain_skirt:
+                    sv, si = mesh_mod.build_terrain_skirt(
+                        terrain_np, H, W, scale=ve,
+                        pixel_spacing_x=self.pixel_spacing_x,
+                        pixel_spacing_y=self.pixel_spacing_y)
+                    self.rtx.add_geometry('terrain_skirt', sv, si)
+                elif self.rtx.has_geometry('terrain_skirt'):
+                    self.rtx.remove_geometry('terrain_skirt')
             self._terrain_mesh_cache[cache_key] = (None, None, terrain_np.copy())
         else:
             if self.mesh_type == 'voxel':
@@ -6071,6 +6243,10 @@ class InteractiveViewer:
                 vertices = np.zeros(num_verts * 3, dtype=np.float32)
                 indices = np.zeros(num_tris * 3, dtype=np.int32)
                 mesh_mod.triangulate_terrain(vertices, indices, new_raster, scale=1.0)
+
+                if self.terrain_skirt:
+                    vertices, indices = mesh_mod.add_terrain_skirt(
+                        vertices, indices, H, W)
 
             # Scale x,y to world units
             if self.pixel_spacing_x != 1.0 or self.pixel_spacing_y != 1.0:
@@ -6089,9 +6265,19 @@ class InteractiveViewer:
 
             # Replace terrain geometry
             if self.rtx is not None:
-                gd = (H, W) if self.mesh_type != 'voxel' else None
+                gd = (H, W) if self.mesh_type != 'voxel' and not self.terrain_skirt else None
                 self.rtx.add_geometry('terrain', vertices, indices,
                                       grid_dims=gd)
+
+        # Reinitialize hydro if the loader provided new flow data
+        if new_hydro is not None and self._hydro_data is not None:
+            was_enabled = self._hydro_enabled
+            flow_dir = new_hydro['flow_dir']
+            flow_accum = new_hydro['flow_accum']
+            hydro_opts = {k: v for k, v in new_hydro.items()
+                          if k not in ('flow_dir', 'flow_accum', 'enabled')}
+            self._init_hydro(flow_dir, flow_accum, **hydro_opts)
+            self._hydro_enabled = was_enabled
 
         # Reposition camera in new window
         self.position = np.array([
@@ -7409,6 +7595,18 @@ class InteractiveViewer:
         d_output = self._render_frame()
         self.frame_count += 1
 
+        # Extract depth buffer from primary hits for hydro occlusion culling.
+        # primary_hits[:, 0] holds ray t-values; persists until next render.
+        if self._hydro_enabled:
+            from .analysis.render import _render_buffers as _depth_bufs
+            if _depth_bufs.primary_hits is not None:
+                h, w = self.render_height, self.render_width
+                _ddt = getattr(self, '_d_depth_t', None)
+                if _ddt is None or _ddt.shape != (h, w):
+                    self._d_depth_t = cp.empty((h, w), dtype=cp.float32)
+                t_src = _depth_bufs.primary_hits.reshape(h * w, 4)[:, 0]
+                self._d_depth_t[:] = t_src.reshape(h, w)
+
         # Progressive accumulation (needed for AO convergence and/or DOF)
         needs_accum = self.ao_enabled or self.dof_enabled
         if needs_accum:
@@ -8478,6 +8676,12 @@ class InteractiveViewer:
             sys.stdout.write('\033[?25h')  # show cursor
             sys.stdout.flush()
 
+        # Clean up terrain reload thread pool
+        pool = self.terrain._terrain_reload_pool
+        if pool is not None:
+            pool.shutdown(wait=False)
+            self.terrain._terrain_reload_pool = None
+
         # Clean up tile service
         if self._tile_service is not None:
             self._tile_service.shutdown()
@@ -8506,6 +8710,7 @@ def explore(raster, width: int = 800, height: int = 600,
             baked_meshes=None,
             subsample: int = 1,
             wind_data=None,
+            weather_data=None,
             hydro_data=None,
             gtfs_data=None,
             accessor=None,
@@ -8525,6 +8730,7 @@ def explore(raster, width: int = 800, height: int = 600,
             minimap_layer: str = None,
             minimap_colors: dict = None,
             info_text: str = None,
+            skirt: bool = True,
             repl: bool = False,
             tour=None):
     """
@@ -8670,6 +8876,7 @@ def explore(raster, width: int = 800, height: int = 600,
         subtitle=subtitle,
         legend=legend,
         subsample=subsample,
+        skirt=skirt,
     )
     viewer._geometry_colors_builder = geometry_colors_builder
     viewer._baked_meshes = baked_meshes or {}
@@ -8697,6 +8904,10 @@ def explore(raster, width: int = 800, height: int = 600,
     # Wind data initialization
     if wind_data is not None:
         viewer._init_wind(wind_data)
+
+    # Weather overlay initialization
+    if weather_data is not None:
+        viewer._init_weather(weather_data)
 
     # Hydro flow initialization
     if hydro_data is not None:
