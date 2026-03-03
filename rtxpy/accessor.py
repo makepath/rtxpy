@@ -2147,7 +2147,8 @@ class RTXAccessor:
         return results
 
     def triangulate(self, geometry_id='terrain', scale=1.0,
-                     pixel_spacing_x=None, pixel_spacing_y=None):
+                     pixel_spacing_x=None, pixel_spacing_y=None,
+                     skirt=True, skirt_depth=None):
         """Triangulate the terrain and add it to the scene.
 
         Creates a triangle mesh from the raster elevation data and adds it
@@ -2165,6 +2166,13 @@ class RTXAccessor:
         pixel_spacing_y : float, optional
             Y spacing between pixels in world units. If None, uses the
             auto-computed value from the DataArray coordinates.
+        skirt : bool, optional
+            If True, add a vertical skirt around the terrain edges to
+            give it a solid "slice of land" appearance. Default is True.
+        skirt_depth : float, optional
+            Depth of the skirt below the minimum elevation (in raw
+            elevation units before scaling). If None, defaults to 15%
+            of the elevation range.
 
         Returns
         -------
@@ -2180,7 +2188,7 @@ class RTXAccessor:
         >>> # Triangulate with real-world spacing (e.g., 25m per pixel)
         >>> verts, indices = dem.rtx.triangulate(pixel_spacing_x=25.0, pixel_spacing_y=25.0)
         """
-        from .mesh import triangulate_terrain
+        from .mesh import triangulate_terrain, add_terrain_skirt
         import numpy as np
 
         # Fall back to auto-computed spacing from __init__
@@ -2200,6 +2208,11 @@ class RTXAccessor:
         # Triangulate the terrain (creates vertices in pixel coordinates)
         triangulate_terrain(vertices, indices, self._obj, scale=scale)
 
+        # Add skirt (vertical walls + bottom face around edges)
+        if skirt:
+            vertices, indices = add_terrain_skirt(
+                vertices, indices, H, W, skirt_depth=skirt_depth)
+
         # Scale x,y coordinates to world units if pixel spacing != 1.0
         if pixel_spacing_x != 1.0 or pixel_spacing_y != 1.0:
             # Vertices are stored as [x0,y0,z0, x1,y1,z1, ...]
@@ -2211,9 +2224,11 @@ class RTXAccessor:
         self._pixel_spacing_y = pixel_spacing_y
         self._terrain_mesh_type = 'tin'
 
-        # Add to scene (pass grid dims for cluster-accelerated BVH)
+        # Add to scene — skip cluster grid_dims when skirt is present
+        # (skirt breaks the regular grid topology clusters require)
+        gd = (H, W) if not skirt else None
         self._rtx.add_geometry(geometry_id, vertices, indices,
-                               grid_dims=(H, W))
+                               grid_dims=gd)
 
         return vertices, indices
 
@@ -2295,7 +2310,7 @@ class RTXAccessor:
 
     def heightfield(self, geometry_id='terrain', scale=1.0,
                     pixel_spacing_x=None, pixel_spacing_y=None,
-                    tile_size=32):
+                    tile_size=32, skirt=True, skirt_depth=None):
         """Add the terrain as a heightfield using custom intersection.
 
         Instead of materializing an explicit triangle mesh, this uploads
@@ -2319,6 +2334,12 @@ class RTXAccessor:
         tile_size : int, optional
             Number of cells per tile dimension for AABB grouping.
             Smaller tiles = tighter BVH but more AABBs. Default is 32.
+        skirt : bool, optional
+            If True, add a vertical skirt around the terrain edges to
+            give it a solid "slice of land" appearance. Default is True.
+        skirt_depth : float, optional
+            Depth of the skirt below the minimum elevation. If None,
+            defaults to 15% of the elevation range.
 
         Returns
         -------
@@ -2326,6 +2347,7 @@ class RTXAccessor:
             The 2-D elevation array that was uploaded to the GPU.
         """
         import numpy as np
+        from .mesh import build_terrain_skirt
 
         if pixel_spacing_x is None:
             pixel_spacing_x = self._pixel_spacing_x
@@ -2355,6 +2377,14 @@ class RTXAccessor:
             ve=1.0,
             tile_size=tile_size,
         )
+
+        # Add skirt as separate triangle geometry alongside the heightfield
+        if skirt:
+            sv, si = build_terrain_skirt(
+                elev, H, W, scale=1.0, skirt_depth=skirt_depth,
+                pixel_spacing_x=pixel_spacing_x,
+                pixel_spacing_y=pixel_spacing_y)
+            self._rtx.add_geometry('terrain_skirt', sv, si)
 
         self._pixel_spacing_x = pixel_spacing_x
         self._pixel_spacing_y = pixel_spacing_y
@@ -2563,7 +2593,8 @@ class RTXAccessor:
                 start_position=None, look_at=None, key_repeat_interval=0.05,
                 pixel_spacing_x=None, pixel_spacing_y=None,
                 mesh_type='heightfield', color_stretch='linear', title=None,
-                subsample=1, wind_data=None, hydro_data=None, gtfs_data=None,
+                subsample=1, wind_data=None, weather_data=None,
+                hydro_data=None, gtfs_data=None,
                 terrain_loader=None,
                 scene_zarr=None, ao_samples=0, gi_bounces=1, denoise=False,
                 fog_density=0.0, fog_color=(0.7, 0.8, 0.9),
@@ -2705,6 +2736,7 @@ class RTXAccessor:
             baked_meshes=self._baked_meshes if self._baked_meshes else None,
             subsample=subsample,
             wind_data=wind_data,
+            weather_data=weather_data,
             hydro_data=hydro_data,
             gtfs_data=gtfs_data,
             accessor=self,
@@ -3034,8 +3066,10 @@ class RTXDatasetAccessor:
                 pixel_spacing_x=None, pixel_spacing_y=None,
                 mesh_type='heightfield', color_stretch='linear', title=None,
                 subtitle=None, legend=None,
-                subsample=1, wind_data=None, hydro_data=None,
+                subsample=1, wind_data=None, weather_data=None,
+                hydro_data=None,
                 gtfs_data=None,
+                terrain_loader=None,
                 scene_zarr=None,
                 ao_samples=0, gi_bounces=1, denoise=False,
                 fog_density=0.0, fog_color=(0.7, 0.8, 0.9),
@@ -3144,9 +3178,11 @@ class RTXDatasetAccessor:
             baked_meshes=terrain_da.rtx._baked_meshes if terrain_da.rtx._baked_meshes else None,
             subsample=subsample,
             wind_data=wind_data,
+            weather_data=weather_data,
             hydro_data=hydro_data,
             gtfs_data=gtfs_data,
             accessor=terrain_da.rtx,
+            terrain_loader=terrain_loader,
             scene_zarr=scene_zarr,
             ao_samples=ao_samples,
             gi_bounces=gi_bounces,

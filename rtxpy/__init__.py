@@ -10,6 +10,8 @@ from .rtx import (
 from .mesh import (
     triangulate_terrain,
     voxelate_terrain,
+    add_terrain_skirt,
+    build_terrain_skirt,
     write_stl,
     load_glb,
     load_mesh,
@@ -28,7 +30,7 @@ __version__ = "0.1.0"
 
 # Optional convenience — network helpers with lazy dependency checks
 try:
-    from .remote_data import fetch_dem, fetch_lidar, fetch_osm, fetch_buildings, fetch_roads, fetch_water, fetch_wind, fetch_firms, fetch_places, fetch_infrastructure, fetch_land_use, fetch_restaurant_grades, fetch_gtfs
+    from .remote_data import fetch_dem, fetch_lidar, fetch_osm, fetch_buildings, fetch_roads, fetch_water, fetch_wind, fetch_weather, fetch_firms, fetch_places, fetch_infrastructure, fetch_land_use, fetch_restaurant_grades, fetch_gtfs
 except ImportError:
     pass
 
