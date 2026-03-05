@@ -25,6 +25,14 @@ from .mesh_store import (
 )
 from .analysis import viewshed, hillshade, render, flyover, view
 from .engine import explore
+from .render_graph import (
+    BufferDesc,
+    RenderPass,
+    RenderGraph,
+    CompiledGraph,
+    AllocationPlan,
+    GraphValidationError,
+)
 
 __version__ = "0.1.0"
 
