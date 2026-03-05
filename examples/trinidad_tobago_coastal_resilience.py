@@ -381,6 +381,14 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"Skipping wind: {e}")
 
+    # --- Weather (clouds + rain via Shift+N) -------------------------------
+    weather = None
+    try:
+        from rtxpy import fetch_weather
+        weather = fetch_weather(BOUNDS, grid_size=15)
+    except Exception as e:
+        print(f"Skipping weather: {e}")
+
     # --- Launch explorer ---------------------------------------------------
     print("\n" + "=" * 60)
     print("COASTAL RESILIENCE EXPLORER")
@@ -388,6 +396,7 @@ if __name__ == "__main__":
     print("  G        cycle layers (elevation → slope → surge_risk → flood maps)")
     print("  U        toggle satellite overlay")
     print("  Shift+W  toggle wind particles (storm simulation)")
+    print("  Shift+N  toggle clouds + rain")
     print("  O / V    set observer / toggle viewshed")
     print("  M        minimap")
     print("  H        full help overlay")
@@ -414,6 +423,7 @@ if __name__ == "__main__":
         color_stretch='cbrt',
         subsample=1,
         wind_data=wind,
+        weather_data=weather,
         minimap_style='cyberpunk',
         minimap_layer='surge_risk',
         minimap_colors=RISK_COLORS,

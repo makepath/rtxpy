@@ -39,6 +39,7 @@ SHIFT_BINDINGS = {
     'L': '_action_toggle_drone_glow',  # Drone glow
     'T': '_action_cycle_time',      # Time-of-day
     'Y': '_action_toggle_hydro',    # Hydro flow particles
+    'N': '_action_toggle_clouds',   # Cloud layer
 }
 
 # Lowercase key bindings — checked after shift bindings

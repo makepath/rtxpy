@@ -12,6 +12,7 @@ quickstart(
     bounds=(-74.26, 40.49, -73.70, 40.92),
     crs='EPSG:32618',
     features=['buildings', 'roads', 'water', 'fire', 'restaurant_grades', 'gtfs'],
+    weather=True,
     ao_samples=1,
     tour=tour,
 )

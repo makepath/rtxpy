@@ -27,6 +27,7 @@ from .viewer.geometry_layers import GeometryLayerManager
 from .viewer.terrain import TerrainState
 from .viewer.observers import ObserverManager, Observer, OBSERVER_COLORS
 from .viewer.wind import WindState
+from .viewer.cloud import CloudState
 from .viewer.hydro import HydroState
 from .viewer.hud import HUDState
 from .viewer.keybindings import MOVEMENT_KEYS, SHIFT_BINDINGS, KEY_BINDINGS, SPECIAL_BINDINGS
@@ -319,6 +320,94 @@ if has_cupy:
                 cuda.atomic.add(output, (py, px, 0), contrib * color_r)
                 cuda.atomic.add(output, (py, px, 1), contrib * color_g)
                 cuda.atomic.add(output, (py, px, 2), contrib * color_b)
+
+
+    @cuda.jit
+    def _rain_splat_kernel(
+        pts,          # (N, 2) float32 — (row, col) per rain particle
+        z_frac,       # (N,) float32 — altitude fraction (0=ground, 1=cloud)
+        alphas,       # (N,) float32 — pre-computed alpha
+        streak_lens,  # (N,) int32 — vertical streak length in pixels
+        terrain,      # (tH, tW) float32 — terrain elevation
+        output,       # (sh, sw, 3) float32 — frame buffer (atomic add)
+        # Camera basis
+        cam_x, cam_y, cam_z,
+        fwd_x, fwd_y, fwd_z,
+        rgt_x, rgt_y, rgt_z,
+        up_x, up_y, up_z,
+        # Projection
+        fov_scale, aspect_ratio,
+        # World params
+        psx, psy, ve, subsample_f, cloud_z, min_depth,
+        # Color
+        color_r, color_g, color_b,
+    ):
+        idx = cuda.grid(1)
+        if idx >= pts.shape[0]:
+            return
+
+        a = alphas[idx]
+        if a < 0.002:
+            return
+
+        row = pts[idx, 0]
+        col = pts[idx, 1]
+
+        # Terrain Z lookup
+        tH = terrain.shape[0]
+        tW = terrain.shape[1]
+        sr = int(row / subsample_f)
+        sc = int(col / subsample_f)
+        if sr < 0:
+            sr = 0
+        elif sr >= tH:
+            sr = tH - 1
+        if sc < 0:
+            sc = 0
+        elif sc >= tW:
+            sc = tW - 1
+        z_raw = terrain[sr, sc]
+        if z_raw != z_raw:
+            z_raw = 0.0
+        terrain_z = z_raw * ve
+        rain_z = terrain_z + z_frac[idx] * (cloud_z - terrain_z)
+
+        wx = col * psx
+        wy = row * psy
+
+        dx = wx - cam_x
+        dy = wy - cam_y
+        dz = rain_z - cam_z
+
+        depth = dx * fwd_x + dy * fwd_y + dz * fwd_z
+        if depth <= min_depth:
+            return
+
+        inv_depth = 1.0 / (depth + 1e-10)
+        u_cam = dx * rgt_x + dy * rgt_y + dz * rgt_z
+        v_cam = dx * up_x + dy * up_y + dz * up_z
+        u_ndc = u_cam * inv_depth / (fov_scale * aspect_ratio)
+        v_ndc = v_cam * inv_depth / fov_scale
+
+        sh = output.shape[0]
+        sw = output.shape[1]
+        sx = int((u_ndc + 1.0) * 0.5 * sw)
+        sy = int((1.0 - v_ndc) * 0.5 * sh)
+
+        if sx < 0 or sx >= sw or sy < 0 or sy >= sh:
+            return
+
+        # Vertical streak
+        sl = streak_lens[idx]
+        for dy_off in range(sl):
+            py = sy + dy_off
+            if py < 0 or py >= sh:
+                continue
+            t = float(dy_off) / float(sl) if sl > 0 else 0.0
+            streak_a = a * (1.0 - t * 0.6)
+            cuda.atomic.add(output, (py, sx, 0), streak_a * color_r)
+            cuda.atomic.add(output, (py, sx, 1), streak_a * color_g)
+            cuda.atomic.add(output, (py, sx, 2), streak_a * color_b)
 
 
 def _glfw_to_key(glfw_key, mods):
@@ -1459,6 +1548,9 @@ class InteractiveViewer:
         # Wind particle state
         self.wind = WindState()
 
+        # Cloud particle state
+        self.clouds = CloudState()
+
         # Hydro flow particle state
         self.hydro = HydroState()
 
@@ -2406,6 +2498,130 @@ class InteractiveViewer:
     @_wind_done_event.setter
     def _wind_done_event(self, value):
         self.wind.wind_done_event = value
+
+    # ------------------------------------------------------------------
+    # Delegation properties — CloudState
+    # ------------------------------------------------------------------
+
+    @property
+    def _clouds_enabled(self):
+        return self.clouds.clouds_enabled
+
+    @_clouds_enabled.setter
+    def _clouds_enabled(self, value):
+        self.clouds.clouds_enabled = value
+
+    @property
+    def _cloud_cover_grid(self):
+        return self.clouds.cloud_cover_grid
+
+    @_cloud_cover_grid.setter
+    def _cloud_cover_grid(self, value):
+        self.clouds.cloud_cover_grid = value
+
+    @property
+    def _cloud_particles(self):
+        return self.clouds.cloud_particles
+
+    @_cloud_particles.setter
+    def _cloud_particles(self, value):
+        self.clouds.cloud_particles = value
+
+    @property
+    def _cloud_sizes(self):
+        return self.clouds.cloud_sizes
+
+    @_cloud_sizes.setter
+    def _cloud_sizes(self, value):
+        self.clouds.cloud_sizes = value
+
+    @property
+    def _cloud_alphas(self):
+        return self.clouds.cloud_alphas
+
+    @_cloud_alphas.setter
+    def _cloud_alphas(self, value):
+        self.clouds.cloud_alphas = value
+
+    @property
+    def _cloud_ages(self):
+        return self.clouds.cloud_ages
+
+    @_cloud_ages.setter
+    def _cloud_ages(self, value):
+        self.clouds.cloud_ages = value
+
+    @property
+    def _cloud_lifetimes(self):
+        return self.clouds.cloud_lifetimes
+
+    @_cloud_lifetimes.setter
+    def _cloud_lifetimes(self, value):
+        self.clouds.cloud_lifetimes = value
+
+    @property
+    def _cloud_n_particles(self):
+        return self.clouds.cloud_n_particles
+
+    @_cloud_n_particles.setter
+    def _cloud_n_particles(self, value):
+        self.clouds.cloud_n_particles = value
+
+    @property
+    def _cloud_max_age(self):
+        return self.clouds.cloud_max_age
+
+    @_cloud_max_age.setter
+    def _cloud_max_age(self, value):
+        self.clouds.cloud_max_age = value
+
+    @property
+    def _cloud_altitude(self):
+        return self.clouds.cloud_altitude
+
+    @_cloud_altitude.setter
+    def _cloud_altitude(self, value):
+        self.clouds.cloud_altitude = value
+
+    @property
+    def _cloud_min_depth(self):
+        return self.clouds.cloud_min_depth
+
+    @_cloud_min_depth.setter
+    def _cloud_min_depth(self, value):
+        self.clouds.cloud_min_depth = value
+
+    @property
+    def _cloud_terrain_np(self):
+        return self.clouds.cloud_terrain_np
+
+    @_cloud_terrain_np.setter
+    def _cloud_terrain_np(self, value):
+        self.clouds.cloud_terrain_np = value
+
+    @property
+    def _volumetric_clouds_enabled(self):
+        return self.clouds.volumetric_clouds_enabled
+
+    @_volumetric_clouds_enabled.setter
+    def _volumetric_clouds_enabled(self, value):
+        self.clouds.volumetric_clouds_enabled = value
+
+    @property
+    def _cloud_thickness(self):
+        return self.clouds.cloud_thickness
+
+    @_cloud_thickness.setter
+    def _cloud_thickness(self, value):
+        self.clouds.cloud_thickness = value
+
+    @property
+    def _cloud_time(self):
+        return self.clouds.cloud_time
+
+    @_cloud_time.setter
+    def _cloud_time(self, value):
+        self.clouds.cloud_time = value
 
     # ------------------------------------------------------------------
     # Delegation properties — HydroState
@@ -3430,6 +3646,7 @@ class InteractiveViewer:
         self._hydro_terrain_np = None
         self._d_base_frame = None     # invalidate GPU wind/hydro buffers
         self._d_wind_scratch = None
+        self._d_cloud_fog_map = None  # invalidate cached cloud fog map
         H, W = sub.shape
         self.terrain_shape = (H, W)
 
@@ -4315,6 +4532,378 @@ class InteractiveViewer:
 
         if added:
             print(f"  Weather: {len(added)} layers added ({', '.join(added)})")
+
+        # Auto-initialize cloud + rain particles from weather data
+        self._init_clouds(weather_data)
+
+    # ------------------------------------------------------------------
+    # Cloud + rain particle system
+    # ------------------------------------------------------------------
+
+    def _init_clouds(self, weather_data):
+        """Initialize cloud and rain particles from weather data.
+
+        Spawns cloud puffs proportional to cloud_cover and rain streaks
+        proportional to precipitation.  Both drift with the wind field
+        if available.
+        """
+        if weather_data is None:
+            return
+
+        cloud_cover = weather_data.get('cloud_cover')
+        precipitation = weather_data.get('precipitation')
+        if cloud_cover is None and precipitation is None:
+            return
+
+        from .tiles import _build_latlon_grids
+        from scipy.interpolate import RegularGridInterpolator
+
+        raster = self._base_raster
+        H, W = raster.shape
+        w_lats = weather_data['lats']
+        w_lons = weather_data['lons']
+
+        lats_grid, lons_grid = _build_latlon_grids(raster)
+        points = np.stack([lats_grid.ravel(), lons_grid.ravel()], axis=-1)
+
+        # Interpolate cloud_cover (0-100%) to terrain grid
+        if cloud_cover is not None:
+            interp = RegularGridInterpolator(
+                (w_lats, w_lons), cloud_cover.astype(np.float32),
+                method='linear', bounds_error=False, fill_value=0.0,
+            )
+            cc = interp(points).reshape(H, W).astype(np.float32)
+            self._cloud_cover_grid = np.clip(cc / 100.0, 0, 1)
+        else:
+            self._cloud_cover_grid = np.zeros((H, W), dtype=np.float32)
+
+        # Interpolate precipitation (mm) to terrain grid
+        if precipitation is not None:
+            interp_p = RegularGridInterpolator(
+                (w_lats, w_lons), precipitation.astype(np.float32),
+                method='linear', bounds_error=False, fill_value=0.0,
+            )
+            self._rain_grid = interp_p(points).reshape(H, W).astype(np.float32)
+        else:
+            self._rain_grid = np.zeros((H, W), dtype=np.float32)
+
+        # Cloud altitude: above terrain max
+        terrain_data = raster.data
+        if hasattr(terrain_data, 'get'):
+            terrain_np = terrain_data.get()
+        else:
+            terrain_np = np.asarray(terrain_data)
+        psx = self._base_pixel_spacing_x
+        psy = self._base_pixel_spacing_y
+        z_max = float(np.nanmax(terrain_np))
+        z_range = z_max - float(np.nanmin(terrain_np))
+        diag = np.sqrt((W * psx) ** 2 + (H * psy) ** 2)
+        self._cloud_altitude = z_max + max(z_range * 0.5, diag * 0.04)
+        self._cloud_min_depth = diag * 0.01
+        self._cloud_thickness = max(z_range * 0.3, diag * 0.02)
+        self._volumetric_clouds_enabled = True
+
+        # Spawn cloud particles weighted by cloud_cover density
+        N = self._cloud_n_particles
+        cc_flat = self._cloud_cover_grid.ravel()
+        cc_sum = cc_flat.sum()
+        if cc_sum > 0:
+            prob = cc_flat / cc_sum
+        else:
+            prob = np.ones_like(cc_flat) / cc_flat.size
+
+        chosen = np.random.choice(cc_flat.size, size=N, p=prob)
+        rows = (chosen // W).astype(np.float32)
+        cols = (chosen % W).astype(np.float32)
+        # Jitter within cell
+        rows += np.random.uniform(-0.5, 0.5, N).astype(np.float32)
+        cols += np.random.uniform(-0.5, 0.5, N).astype(np.float32)
+        self._cloud_particles = np.column_stack([rows, cols]).astype(np.float32)
+
+        # Per-particle size (world-space radius)
+        base_size = max(psx, psy) * 8
+        self._cloud_sizes = (
+            np.random.uniform(0.6, 1.8, N).astype(np.float32) * base_size
+        )
+
+        # Per-particle alpha from local cloud_cover
+        r_idx = np.clip(rows.astype(int), 0, H - 1)
+        c_idx = np.clip(cols.astype(int), 0, W - 1)
+        local_cc = self._cloud_cover_grid[r_idx, c_idx]
+        self._cloud_alphas = (local_cc * 0.35).astype(np.float32)
+
+        # Ages / lifetimes
+        self._cloud_max_age = 300
+        self._cloud_lifetimes = np.random.randint(
+            self._cloud_max_age // 2, self._cloud_max_age, N)
+        self._cloud_ages = np.random.randint(0, self._cloud_max_age, N)
+
+        # Rain particles — fewer, driven by precipitation
+        rain_N = 8000
+        rain_flat = self._rain_grid.ravel()
+        rain_sum = rain_flat.sum()
+        if rain_sum > 0:
+            rain_prob = rain_flat / rain_sum
+            chosen_r = np.random.choice(rain_flat.size, size=rain_N, p=rain_prob)
+        else:
+            chosen_r = np.random.randint(0, rain_flat.size, rain_N)
+        r_rows = (chosen_r // W).astype(np.float32)
+        r_cols = (chosen_r % W).astype(np.float32)
+        r_rows += np.random.uniform(-0.5, 0.5, rain_N).astype(np.float32)
+        r_cols += np.random.uniform(-0.5, 0.5, rain_N).astype(np.float32)
+        self._rain_particles = np.column_stack([r_rows, r_cols]).astype(np.float32)
+        # Rain z: random altitude between terrain and cloud layer
+        self._rain_z_frac = np.random.uniform(0.0, 1.0, rain_N).astype(np.float32)
+        self._rain_ages = np.random.randint(0, 40, rain_N)
+        self._rain_lifetimes = np.random.randint(20, 40, rain_N)
+        self._rain_max_age = 40
+
+        mean_cc = float(np.mean(self._cloud_cover_grid) * 100)
+        mean_precip = float(np.mean(self._rain_grid))
+        print(f"  Clouds: {N} particles (mean cover {mean_cc:.0f}%)"
+              f"  Rain: {rain_N} particles (mean precip {mean_precip:.1f}mm)")
+
+    def _toggle_clouds(self):
+        """Toggle cloud fog + rain on/off."""
+        if self._cloud_cover_grid is None:
+            print("No weather data loaded. Pass weather_data to explore().")
+            return
+        self._clouds_enabled = not self._clouds_enabled
+        if self._clouds_enabled and self._cloud_cover_grid is not None:
+            cc = self._cloud_cover_grid
+            print(f"Clouds: ON  (cover min={cc.min():.2f} max={cc.max():.2f} mean={cc.mean():.2f})")
+        else:
+            print(f"Clouds: OFF")
+        self._render_needed = True
+
+    def _action_toggle_clouds(self):
+        self._toggle_clouds()
+
+    def _update_rain_particles(self):
+        """Animate rain streaks: fall downward and respawn."""
+        if not hasattr(self, '_rain_particles') or self._rain_particles is None:
+            return
+
+        pts = self._rain_particles
+        H, W = self._cloud_cover_grid.shape
+
+        # Rain falls: decrease z_frac (toward terrain)
+        self._rain_z_frac -= 0.06
+        self._rain_ages += 1
+
+        # Slight wind drift
+        if self._wind_u_px is not None:
+            r0 = np.clip(pts[:, 0].astype(int), 0, H - 1)
+            c0 = np.clip(pts[:, 1].astype(int), 0, W - 1)
+            s = getattr(self, '_dt_scale', 1.0)
+            pts[:, 1] += self._wind_u_px[r0, c0] * 0.15 * s
+            pts[:, 0] += self._wind_v_px[r0, c0] * 0.15 * s
+
+        # Respawn when hitting ground or aged out
+        respawn = (
+            (self._rain_z_frac <= 0) |
+            (self._rain_ages >= self._rain_lifetimes) |
+            (pts[:, 0] < 0) | (pts[:, 0] >= H) |
+            (pts[:, 1] < 0) | (pts[:, 1] >= W)
+        )
+        n_respawn = int(respawn.sum())
+        if n_respawn > 0:
+            rain_flat = self._rain_grid.ravel()
+            rain_sum = rain_flat.sum()
+            if rain_sum > 0:
+                prob = rain_flat / rain_sum
+            else:
+                prob = np.ones_like(rain_flat) / rain_flat.size
+            chosen = np.random.choice(rain_flat.size, size=n_respawn, p=prob)
+            pts[respawn, 0] = (chosen // W).astype(np.float32) + np.random.uniform(-0.5, 0.5, n_respawn)
+            pts[respawn, 1] = (chosen % W).astype(np.float32) + np.random.uniform(-0.5, 0.5, n_respawn)
+            self._rain_z_frac[respawn] = np.random.uniform(0.7, 1.0, n_respawn).astype(np.float32)
+            self._rain_ages[respawn] = 0
+            self._rain_lifetimes[respawn] = np.random.randint(20, 40, n_respawn)
+
+    def _draw_rain_on_frame(self, img, forward, right, cam_up,
+                            fov_scale, aspect, min_depth):
+        """Render rain streaks on the frame."""
+        sh, sw = img.shape[:2]
+        psx = self._base_pixel_spacing_x
+        psy = self._base_pixel_spacing_y
+        ve = self.vertical_exaggeration
+        cam_pos = self.position
+
+        # Cached terrain for z lookup
+        if self._cloud_terrain_np is None:
+            terrain_data = self.raster.data
+            if hasattr(terrain_data, 'get'):
+                self._cloud_terrain_np = terrain_data.get()
+            else:
+                self._cloud_terrain_np = np.asarray(terrain_data)
+        terrain_np = self._cloud_terrain_np
+        tH, tW = terrain_np.shape
+        f = self.subsample_factor
+        cloud_z = self._cloud_altitude * ve
+
+        pts = self._rain_particles
+        N = pts.shape[0]
+
+        # Rain z: interpolate between terrain and cloud altitude
+        sr = np.clip((pts[:, 0] / f).astype(int), 0, tH - 1)
+        sc = np.clip((pts[:, 1] / f).astype(int), 0, tW - 1)
+        terrain_z = np.nan_to_num(terrain_np[sr, sc], nan=0.0) * ve
+        rain_z = terrain_z + self._rain_z_frac * (cloud_z - terrain_z)
+
+        wx = pts[:, 1] * psx
+        wy = pts[:, 0] * psy
+
+        dx = wx - cam_pos[0]
+        dy = wy - cam_pos[1]
+        dz = rain_z - cam_pos[2]
+
+        depth = dx * forward[0] + dy * forward[1] + dz * forward[2]
+        valid = depth > min_depth
+
+        inv_depth = np.where(valid, 1.0 / (depth + 1e-10), 0.0)
+        u_cam = dx * right[0] + dy * right[1] + dz * right[2]
+        v_cam = dx * cam_up[0] + dy * cam_up[1] + dz * cam_up[2]
+        u_ndc = u_cam * inv_depth / (fov_scale * aspect)
+        v_ndc = v_cam * inv_depth / fov_scale
+
+        sx = ((u_ndc + 1.0) * 0.5 * sw).astype(np.int32)
+        sy = ((1.0 - v_ndc) * 0.5 * sh).astype(np.int32)
+
+        # Rain streak length (vertical on screen, 3-8 pixels)
+        streak_len = np.clip((5.0 * inv_depth * sh * fov_scale * 0.003), 2, 8).astype(np.int32)
+
+        # Alpha based on precipitation intensity
+        rain_r = np.clip((pts[:, 0] / f).astype(int), 0, tH - 1)
+        rain_c = np.clip((pts[:, 1] / f).astype(int), 0, tW - 1)
+        local_precip = self._rain_grid[
+            np.clip(pts[:, 0].astype(int), 0, self._rain_grid.shape[0] - 1),
+            np.clip(pts[:, 1].astype(int), 0, self._rain_grid.shape[1] - 1),
+        ]
+        base_alpha = np.clip(local_precip / 5.0, 0.05, 0.5).astype(np.float32)
+
+        # Fade
+        ages = self._rain_ages.astype(np.float32)
+        lifetimes = self._rain_lifetimes.astype(np.float32)
+        fade = np.clip(ages / 3.0, 0, 1) * np.clip((lifetimes - ages) / 5.0, 0, 1)
+        alpha = base_alpha * fade * 0.15
+
+        on_screen = (
+            valid &
+            (sx >= 0) & (sx < sw) &
+            (sy >= 0) & (sy < sh + 8) &
+            (alpha > 0.002)
+        )
+        if not on_screen.any():
+            return
+
+        sx_v = sx[on_screen]
+        sy_v = sy[on_screen]
+        al_v = alpha[on_screen]
+        sl_v = streak_len[on_screen]
+
+        # Draw vertical streaks (light blue-gray)
+        color = np.array([0.7, 0.75, 0.85], dtype=np.float32)
+        max_sl = int(sl_v.max()) if sl_v.size > 0 else 3
+        for dy_off in range(max_sl):
+            py = sy_v + dy_off
+            streak_ok = (dy_off < sl_v) & (py >= 0) & (py < sh)
+            if not streak_ok.any():
+                continue
+            t = dy_off / (sl_v[streak_ok].astype(np.float32))
+            streak_alpha = al_v[streak_ok] * (1.0 - t * 0.6)
+            for c in range(3):
+                np.add.at(img[:, :, c], (py[streak_ok], sx_v[streak_ok]),
+                         streak_alpha * color[c])
+
+        np.clip(img, 0, 1, out=img)
+
+    def _splat_rain_gpu(self, d_frame):
+        """Project and splat rain particles as vertical streaks on GPU."""
+        if not hasattr(self, '_rain_particles') or self._rain_particles is None:
+            return
+        rain_grid = getattr(self, '_rain_grid', None)
+        if rain_grid is None or rain_grid.sum() < 0.01:
+            return
+
+        from .analysis.render import _compute_camera_basis
+
+        sh, sw = d_frame.shape[:2]
+        psx = float(self._base_pixel_spacing_x)
+        psy = float(self._base_pixel_spacing_y)
+        ve = float(self.vertical_exaggeration)
+        cloud_z = float(self._cloud_altitude * ve)
+        min_depth = float(self._cloud_min_depth)
+
+        cam_pos = self.position
+        look_at = self._get_look_at()
+        forward, right, cam_up = _compute_camera_basis(
+            tuple(cam_pos), tuple(look_at), (0, 0, 1),
+        )
+        fov_scale = float(math.tan(math.radians(self.fov) / 2.0))
+        aspect = float(sw / sh)
+
+        rain_pts = self._rain_particles
+        rain_N = rain_pts.shape[0]
+        f = float(self.subsample_factor)
+
+        # GPU terrain for z lookup
+        terrain_data = self.raster.data
+        if not isinstance(terrain_data, cp.ndarray):
+            terrain_data = cp.asarray(terrain_data)
+
+        # Pre-compute rain alpha + streak length on CPU
+        local_precip = self._rain_grid[
+            np.clip(rain_pts[:, 0].astype(int), 0, self._rain_grid.shape[0] - 1),
+            np.clip(rain_pts[:, 1].astype(int), 0, self._rain_grid.shape[1] - 1),
+        ]
+        base_alpha = np.clip(local_precip / 5.0, 0.05, 0.5).astype(np.float32)
+        rain_ages = self._rain_ages.astype(np.float32)
+        rain_lifetimes = self._rain_lifetimes.astype(np.float32)
+        fade = (np.clip(rain_ages / 3.0, 0, 1)
+                * np.clip((rain_lifetimes - rain_ages) / 5.0, 0, 1))
+        rain_alpha = (base_alpha * fade * 0.15).astype(np.float32)
+
+        # Streak length: compute from depth
+        r_wx = rain_pts[:, 1] * psx
+        r_wy = rain_pts[:, 0] * psy
+        r_depth = ((r_wx - cam_pos[0]) * forward[0]
+                   + (r_wy - cam_pos[1]) * forward[1]
+                   + (cloud_z * 0.5 - cam_pos[2]) * forward[2])
+        r_inv = np.where(r_depth > min_depth, 1.0 / (r_depth + 1e-10), 0.0)
+        streak = np.clip((5.0 * r_inv * sh * fov_scale * 0.003), 2, 8).astype(np.int32)
+
+        # Upload
+        _dr = getattr(self, '_d_rain_pts', None)
+        if _dr is None or _dr.shape[0] != rain_N:
+            self._d_rain_pts = cp.empty((rain_N, 2), dtype=cp.float32)
+            self._d_rain_zfrac = cp.empty(rain_N, dtype=cp.float32)
+            self._d_rain_alpha = cp.empty(rain_N, dtype=cp.float32)
+            self._d_rain_streak = cp.empty(rain_N, dtype=cp.int32)
+        self._d_rain_pts.set(rain_pts)
+        self._d_rain_zfrac.set(self._rain_z_frac)
+        self._d_rain_alpha.set(rain_alpha)
+        self._d_rain_streak.set(streak)
+
+        tpb = 256
+        bpg_r = (rain_N + tpb - 1) // tpb
+        _rain_splat_kernel[bpg_r, tpb](
+            self._d_rain_pts,
+            self._d_rain_zfrac,
+            self._d_rain_alpha,
+            self._d_rain_streak,
+            terrain_data,
+            d_frame,
+            float(cam_pos[0]), float(cam_pos[1]), float(cam_pos[2]),
+            float(forward[0]), float(forward[1]), float(forward[2]),
+            float(right[0]), float(right[1]), float(right[2]),
+            float(cam_up[0]), float(cam_up[1]), float(cam_up[2]),
+            fov_scale, aspect,
+            psx, psy, ve, f, cloud_z, min_depth,
+            0.7, 0.75, 0.85,
+        )
+
+        cp.clip(d_frame, 0, 1, out=d_frame)
 
     def _init_wind(self, wind_data):
         """Interpolate wind U/V from lat/lon grid onto the terrain pixel grid.
@@ -6405,8 +6994,10 @@ class InteractiveViewer:
         if self._render_needed:
             self._update_frame()
             self._render_needed = False
-        elif (self._wind_enabled or self._hydro_enabled) and self._d_base_frame is not None:
-            # Wind/hydro is on but camera didn't move — skip the expensive ray
+        elif ((self._wind_enabled or self._hydro_enabled
+               or (self._clouds_enabled and self._rain_particles is not None))
+              and self._d_base_frame is not None):
+            # Particles active but camera didn't move — skip the expensive ray
             # trace and just re-advect particles + GPU splat on fresh copy.
             cp.copyto(self._d_wind_scratch, self._d_base_frame)
             if self._wind_enabled and self._wind_particles is not None:
@@ -6415,6 +7006,9 @@ class InteractiveViewer:
             if self._hydro_enabled and self._hydro_particles is not None:
                 self._update_hydro_particles()
                 self._splat_hydro_gpu(self._d_wind_scratch)
+            if self._clouds_enabled and self._rain_particles is not None:
+                self._update_rain_particles()
+                self._splat_rain_gpu(self._d_wind_scratch)
             self._d_wind_scratch.get(out=self._pinned_frame)
             self._composite_overlays()
 
@@ -7386,6 +7980,22 @@ class InteractiveViewer:
         # Common render kwargs
         # fog_density is scene-relative; convert to absolute for the kernel
         _fog = self.fog_density / self._scene_diagonal if self.fog_density > 0 else 0.0
+
+        # Cloud fog map for screenshot — reuse cached GPU array
+        _cloud_fog_map = None
+        _cloud_fog_density = 0.0
+        if self._clouds_enabled and self._cloud_cover_grid is not None:
+            _d = getattr(self, '_d_cloud_fog_map', None)
+            f = self.subsample_factor
+            if _d is None or getattr(self, '_cloud_fog_subsample', 0) != f:
+                src = self._cloud_cover_grid
+                if f > 1:
+                    src = src[::f, ::f]
+                self._d_cloud_fog_map = cp.asarray(src, dtype=cp.float32)
+                self._cloud_fog_subsample = f
+            _cloud_fog_map = self._d_cloud_fog_map
+            _cloud_fog_density = 12.0 / self._scene_diagonal
+
         render_kwargs = dict(
             camera_position=tuple(self.position),
             look_at=tuple(self._get_look_at()),
@@ -7413,6 +8023,12 @@ class InteractiveViewer:
             overlay_as_water=self._overlay_as_water,
             overlay_color_lut=self._active_overlay_color_lut,
             geometry_colors=geometry_colors,
+            cloud_fog_map=_cloud_fog_map,
+            cloud_fog_density=_cloud_fog_density,
+            volumetric_clouds=self._volumetric_clouds_enabled and self._clouds_enabled,
+            cloud_base_z=self._cloud_altitude,
+            cloud_top_z=self._cloud_altitude + self._cloud_thickness,
+            cloud_time=self._cloud_time,
         )
 
         # Accumulated multi-frame screenshot when AO or DOF is enabled
@@ -7537,6 +8153,24 @@ class InteractiveViewer:
 
         # fog_density is scene-relative; convert to absolute for the kernel
         _fog = self.fog_density / self._scene_diagonal if self.fog_density > 0 else 0.0
+
+        # Cloud fog map: pass cloud_cover_grid for cloud shadow modulation
+        _cloud_fog_map = None
+        _cloud_fog_density = 0.0
+        if self._clouds_enabled and self._cloud_cover_grid is not None:
+            # Cache GPU array to avoid per-frame upload
+            _d = getattr(self, '_d_cloud_fog_map', None)
+            f = self.subsample_factor
+            if _d is None or getattr(self, '_cloud_fog_subsample', 0) != f:
+                src = self._cloud_cover_grid
+                if f > 1:
+                    src = src[::f, ::f]
+                self._d_cloud_fog_map = cp.asarray(src, dtype=cp.float32)
+                self._cloud_fog_subsample = f
+            _cloud_fog_map = self._d_cloud_fog_map
+            # Spatial frequency: ~12 cloud cells across scene
+            _cloud_fog_density = 12.0 / self._scene_diagonal
+
         d_output = render(
             self.raster,
             camera_position=tuple(self.position),
@@ -7579,6 +8213,12 @@ class InteractiveViewer:
             edge_strength=0.2,
             edge_color=(0.15, 0.13, 0.10),
             edl=self.edl_enabled,
+            cloud_fog_map=_cloud_fog_map,
+            cloud_fog_density=_cloud_fog_density,
+            volumetric_clouds=self._volumetric_clouds_enabled and self._clouds_enabled,
+            cloud_base_z=self._cloud_altitude,
+            cloud_top_z=self._cloud_altitude + self._cloud_thickness,
+            cloud_time=self._cloud_time,
             bloom=not defer_post,
             tone_map=not defer_post,
             _return_gpu=True,
@@ -7697,8 +8337,10 @@ class InteractiveViewer:
                 self._pinned_mem, dtype=np.float32, count=d_display.size
             ).reshape(d_display.shape)
 
-        # Save clean post-processed frame for idle wind/hydro replay
-        if self._wind_enabled or self._hydro_enabled:
+        # Save clean post-processed frame for idle wind/hydro/rain replay
+        _any_particles = (self._wind_enabled or self._hydro_enabled
+                          or (self._clouds_enabled and self._rain_particles is not None))
+        if _any_particles:
             if self._d_base_frame is None or self._d_base_frame.shape != d_display.shape:
                 self._d_base_frame = cp.empty_like(d_display)
                 self._d_wind_scratch = cp.empty_like(d_display)
@@ -7714,8 +8356,17 @@ class InteractiveViewer:
             self._update_hydro_particles()
             self._splat_hydro_gpu(d_display)
 
+        # GPU rain: advect on CPU, splat on GPU (cloud fog is baked into ray trace)
+        if self._clouds_enabled and self._rain_particles is not None:
+            self._update_rain_particles()
+            self._splat_rain_gpu(d_display)
+
+        # Advance volumetric cloud animation time
+        if self._clouds_enabled and self._volumetric_clouds_enabled:
+            self._cloud_time += 0.05
+
         # Sync: splat kernels run on stream 0, readback on non-blocking stream
-        if self._wind_enabled or self._hydro_enabled:
+        if _any_particles:
             sync_event = self._wind_done_event or self._hydro_done_event
             if sync_event is None:
                 sync_event = cp.cuda.Event()
@@ -8189,6 +8840,7 @@ class InteractiveViewer:
             ("DATA LAYERS", [
                 ("Shift+F", "FIRMS fire (7d)"),
                 ("Shift+W", "Toggle wind"),
+                ("Shift+N", "Toggle clouds + rain"),
                 ("Shift+Y", "Toggle hydro flow"),
             ]),
             ("RENDERING", [
@@ -8469,6 +9121,9 @@ class InteractiveViewer:
             import termios
             _saved_termios = termios.tcgetattr(sys.stdin.fileno())
         except (ImportError, OSError, ValueError):
+            pass
+        except Exception:
+            # termios.error doesn't inherit from OSError on all platforms
             pass
 
         # --- GLFW window creation ---

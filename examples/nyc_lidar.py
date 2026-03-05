@@ -99,8 +99,16 @@ def main():
         # Save all meshes (buildings + lidar) to zarr for next run
         terrain.rtx.save_meshes(zarr_path)
 
+    # Fetch weather for cloud + rain overlay (Shift+N)
+    weather = None
+    try:
+        from rtxpy import fetch_weather
+        weather = fetch_weather(dem_bounds, grid_size=15)
+    except Exception as e:
+        print(f"Skipping weather: {e}")
+
     # Launch interactive viewer
-    terrain.rtx.explore(width=1600, height=1200)
+    terrain.rtx.explore(width=1600, height=1200, weather_data=weather)
 
 
 if __name__ == '__main__':
