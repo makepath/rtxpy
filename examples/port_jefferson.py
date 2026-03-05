@@ -22,6 +22,7 @@ quickstart(
     source='usgs_1m',
     features=['buildings', 'roads', 'water'],
     tiles='satellite',
+    tile_zoom=18,
     hydro=True,
     wind=True,
     weather=True,

@@ -236,6 +236,14 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"Skipping wind: {e}")
 
+    # --- Weather data (clouds + rain via Shift+N) -------------------------
+    weather = None
+    try:
+        from rtxpy import fetch_weather
+        weather = fetch_weather(BOUNDS, grid_size=15)
+    except Exception as e:
+        print(f"Skipping weather: {e}")
+
     # --- Hydro flow data (off by default, Shift+Y to toggle) ---------------
     hydro = None
     try:
@@ -317,7 +325,7 @@ if __name__ == "__main__":
         print(f"Skipping hydro: {e}")
 
     print("\nLaunching explore (press G to cycle layers, "
-          "Shift+W for wind, Shift+Y for hydro)...\n")
+          "Shift+W for wind, Shift+N for clouds, Shift+Y for hydro)...\n")
     ds.rtx.explore(
         z='elevation',
         scene_zarr=ZARR,
@@ -326,6 +334,7 @@ if __name__ == "__main__":
         height=768,
         render_scale=0.5,
         wind_data=wind,
+        weather_data=weather,
         hydro_data=hydro,
         fog_density=3.0,
         repl=True,

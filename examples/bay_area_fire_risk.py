@@ -513,6 +513,14 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"  Skipping wind: {e}")
 
+    # === Fetch weather data (clouds + rain via Shift+N) =======================
+    weather = None
+    try:
+        from rtxpy import fetch_weather
+        weather = fetch_weather(BOUNDS, grid_size=15)
+    except Exception as e:
+        print(f"  Skipping weather: {e}")
+
     print("\n--- Interpolating wind onto DEM grid ---")
     wind_speed_gpu, wind_u_gpu, wind_v_gpu = interpolate_wind(wind, terrain)
     ds['wind_speed'] = xr.DataArray(
@@ -695,6 +703,7 @@ if __name__ == "__main__":
         color_stretch='cbrt',
         subsample=1,
         wind_data=wind,
+        weather_data=weather,
         ao_samples=1,
         repl=True,
     )

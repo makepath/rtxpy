@@ -809,6 +809,282 @@ def _generate_reflection_rays(reflection_rays, primary_rays, primary_hits,
     )
 
 
+@cuda.jit(device=True, inline='always')
+def _cloud_hash_i(n):
+    """Integer hash for procedural noise (works under Numba CUDA)."""
+    n = (n << 13) ^ n
+    return (n * (n * n * 15731 + 789221) + 1376312589) & 0x7fffffff
+
+
+@cuda.jit(device=True, inline='always')
+def _cloud_hash_3(a, b, c):
+    """Hash 3 integer coords to a float in [0, 1)."""
+    return _cloud_hash_i(a + _cloud_hash_i(b + _cloud_hash_i(c))) / 2147483647.0
+
+
+@cuda.jit(device=True, inline='always')
+def _cloud_noise_3d(x, y, z):
+    """3D value noise via integer hashing + trilinear interpolation."""
+    ix = int(math.floor(x))
+    iy = int(math.floor(y))
+    iz = int(math.floor(z))
+    fx = x - ix
+    fy = y - iy
+    fz = z - iz
+    # Smoothstep
+    ux = fx * fx * (3.0 - 2.0 * fx)
+    uy = fy * fy * (3.0 - 2.0 * fy)
+    uz = fz * fz * (3.0 - 2.0 * fz)
+    # Hash 8 corners
+    n000 = _cloud_hash_3(ix, iy, iz)
+    n100 = _cloud_hash_3(ix + 1, iy, iz)
+    n010 = _cloud_hash_3(ix, iy + 1, iz)
+    n110 = _cloud_hash_3(ix + 1, iy + 1, iz)
+    n001 = _cloud_hash_3(ix, iy, iz + 1)
+    n101 = _cloud_hash_3(ix + 1, iy, iz + 1)
+    n011 = _cloud_hash_3(ix, iy + 1, iz + 1)
+    n111 = _cloud_hash_3(ix + 1, iy + 1, iz + 1)
+    # Trilinear
+    nx00 = n000 * (1.0 - ux) + n100 * ux
+    nx10 = n010 * (1.0 - ux) + n110 * ux
+    nx01 = n001 * (1.0 - ux) + n101 * ux
+    nx11 = n011 * (1.0 - ux) + n111 * ux
+    nxy0 = nx00 * (1.0 - uy) + nx10 * uy
+    nxy1 = nx01 * (1.0 - uy) + nx11 * uy
+    return nxy0 * (1.0 - uz) + nxy1 * uz
+
+
+@cuda.jit(device=True, inline='always')
+def _cloud_fbm_3d(x, y, z, octaves):
+    """Fractal Brownian motion: sum of noise at increasing frequencies."""
+    value = 0.0
+    amplitude = 0.5
+    freq = 1.0
+    for _ in range(octaves):
+        value += amplitude * _cloud_noise_3d(x * freq, y * freq, z * freq)
+        freq *= 2.0
+        amplitude *= 0.5
+    return value
+
+
+@cuda.jit
+def _volumetric_cloud_kernel(
+    output, primary_rays, primary_hits,
+    cloud_cover_grid,
+    sun_dir,
+    width, height,
+    cloud_base_z, cloud_top_z,
+    pixel_spacing_x, pixel_spacing_y,
+    grid_rows, grid_cols,
+    time_offset,
+    extinction,
+    terrain_rows, terrain_cols,
+):
+    """Ray-march volumetric clouds and composite over shaded frame."""
+    idx = cuda.grid(1)
+    if idx >= width * height:
+        return
+
+    py = idx // width
+    px = idx % width
+
+    # Read ray origin and direction
+    ox = primary_rays[idx, 0]
+    oy = primary_rays[idx, 1]
+    oz = primary_rays[idx, 2]
+    dx = primary_rays[idx, 4]
+    dy = primary_rays[idx, 5]
+    dz = primary_rays[idx, 6]
+
+    # Hit distance (terrain/geometry); 0 or NaN means miss (sky)
+    hit_t = primary_hits[idx, 0]
+    # NaN-safe: treat NaN as miss (no terrain to occlude clouds)
+    if not (hit_t > 0.0):
+        hit_t = 0.0
+
+    # Ray-slab intersection: cloud_base_z to cloud_top_z (horizontal slab)
+    if abs(dz) < 1e-8:
+        return  # Ray parallel to slab — skip
+
+    t_base = (cloud_base_z - oz) / dz
+    t_top = (cloud_top_z - oz) / dz
+    entry_t = min(t_base, t_top)
+    exit_t = max(t_base, t_top)
+
+    # Clamp to valid range
+    if entry_t < 0.0:
+        entry_t = 0.0
+    # Clouds behind terrain are occluded
+    if hit_t > 0.0 and exit_t > hit_t:
+        exit_t = hit_t
+    if entry_t >= exit_t:
+        return
+
+    slab_thickness = cloud_top_z - cloud_base_z
+    inv_slab = 1.0 / slab_thickness
+
+    # Pre-loop: sample coverage + noise ONCE at ray midpoint.
+    # This eliminates all hash/noise from the inner loop.
+    mid_t = (entry_t + exit_t) * 0.5
+    mid_x = ox + mid_t * dx
+    mid_y = oy + mid_t * dy
+    mid_gx = mid_x / pixel_spacing_x * grid_cols / terrain_cols
+    mid_gy = mid_y / pixel_spacing_y * grid_rows / terrain_rows
+    mid_ix = int(mid_gx)
+    mid_iy = int(mid_gy)
+    if mid_ix < 0 or mid_ix >= grid_cols or mid_iy < 0 or mid_iy >= grid_rows:
+        return
+    coverage = cloud_cover_grid[mid_iy, mid_ix]
+    if coverage < 0.05:
+        return
+
+    # Single noise sample for cloud shape (2D at slab midpoint)
+    noise_scale = 8.0 * inv_slab
+    nx = mid_x * noise_scale + time_offset * 0.3
+    ny = mid_y * noise_scale + time_offset * 0.1
+    noise_val = _cloud_noise_3d(nx, ny, 0.0)
+
+    # Pre-compute base shape: coverage * noise, then threshold
+    base_shape = coverage * noise_val
+    if base_shape < 0.05:
+        return
+
+    # March through slab in 8 steps — inner loop is now trivially cheap
+    num_steps = 8
+    step_size = (exit_t - entry_t) / num_steps
+
+    # Sun direction for lighting
+    sun_x = sun_dir[0]
+    sun_y = sun_dir[1]
+    sun_z = sun_dir[2]
+
+    # Henyey-Greenstein phase function (cos angle between view and sun)
+    cos_theta = -(dx * sun_x + dy * sun_y + dz * sun_z)
+    g = 0.6
+    g2 = g * g
+    phase = 0.25 / 3.14159 * (1.0 - g2) / ((1.0 + g2 - 2.0 * g * cos_theta) ** 1.5)
+    g_back = -0.3
+    g_back2 = g_back * g_back
+    phase_back = 0.25 / 3.14159 * (1.0 - g_back2) / ((1.0 + g_back2 - 2.0 * g_back * cos_theta) ** 1.5)
+    phase_total = 0.7 * phase + 0.3 * phase_back
+
+    transmittance = 1.0
+    cloud_r = 0.0
+    cloud_g = 0.0
+    cloud_b = 0.0
+
+    # Sun color: warm white
+    sun_cr = 1.0
+    sun_cg = 0.95
+    sun_cb = 0.85
+    # Ambient sky light
+    amb_cr = 0.55
+    amb_cg = 0.65
+    amb_cb = 0.80
+
+    for step in range(num_steps):
+        if transmittance < 0.01:
+            break
+
+        t = entry_t + (step + 0.5) * step_size
+        sz = oz + t * dz
+
+        # Height fraction within slab [0,1]
+        h_frac = (sz - cloud_base_z) * inv_slab
+        if h_frac < 0.0 or h_frac > 1.0:
+            continue
+
+        # Height gradient: cumulus profile
+        if h_frac < 0.3:
+            h_grad = h_frac / 0.3
+        elif h_frac < 0.6:
+            h_grad = 1.0
+        else:
+            h_grad = 1.0 - (h_frac - 0.6) * 2.5
+        if h_grad <= 0.0:
+            continue
+
+        # Density from pre-computed shape * height gradient
+        density = (base_shape * h_grad - 0.12) * 3.5
+        if density <= 0.0:
+            continue
+        if density > 1.0:
+            density = 1.0
+
+        # Beer-Lambert + powder approximation
+        optical_step = density * step_size * extinction
+        beer = math.exp(-optical_step)
+        powder = 1.0 - math.exp(-2.0 * optical_step)
+        energy = 2.0 * beer * powder
+
+        # Light energy: phase-function sun + ambient sky
+        light_r = energy * phase_total * sun_cr + energy * 0.35 * amb_cr
+        light_g = energy * phase_total * sun_cg + energy * 0.35 * amb_cg
+        light_b = energy * phase_total * sun_cb + energy * 0.35 * amb_cb
+
+        # Accumulate
+        cloud_r += transmittance * light_r
+        cloud_g += transmittance * light_g
+        cloud_b += transmittance * light_b
+        transmittance *= beer
+
+    # If no cloud contribution, skip
+    if transmittance > 0.999:
+        return
+
+    # Composite: final = cloud_accumulated + transmittance * existing_pixel
+    existing_r = output[py, px, 0]
+    existing_g = output[py, px, 1]
+    existing_b = output[py, px, 2]
+
+    output[py, px, 0] = cloud_r + transmittance * existing_r
+    output[py, px, 1] = cloud_g + transmittance * existing_g
+    output[py, px, 2] = cloud_b + transmittance * existing_b
+
+
+_DUMMY_CLOUD_1x1 = None
+
+
+def _apply_volumetric_clouds(d_output, d_primary_rays, d_primary_hits,
+                             cloud_cover_grid, d_sun_dir,
+                             width, height,
+                             cloud_base_z, cloud_top_z,
+                             pixel_spacing_x, pixel_spacing_y,
+                             terrain_rows, terrain_cols,
+                             cloud_time, extinction=0.8):
+    """Launch volumetric cloud ray march kernel."""
+    global _DUMMY_CLOUD_1x1
+    if cloud_cover_grid is None:
+        if _DUMMY_CLOUD_1x1 is None:
+            _DUMMY_CLOUD_1x1 = cupy.zeros((1, 1), dtype=np.float32)
+        cloud_cover_grid = _DUMMY_CLOUD_1x1
+    grid_rows, grid_cols = cloud_cover_grid.shape
+    if grid_rows <= 1:
+        return  # No real cloud data
+    # Normalize extinction by slab thickness so visual density is
+    # scale-independent.  Target ~3 optical depths at full density
+    # across the entire slab → translucent-to-opaque clouds.
+    slab_thickness = cloud_top_z - cloud_base_z
+    if slab_thickness > 0:
+        extinction = 3.0 / slab_thickness
+
+    num_pixels = width * height
+    threadsperblock = 256
+    blockspergrid = (num_pixels + threadsperblock - 1) // threadsperblock
+    _volumetric_cloud_kernel[blockspergrid, threadsperblock](
+        d_output, d_primary_rays, d_primary_hits,
+        cloud_cover_grid,
+        d_sun_dir,
+        np.int32(width), np.int32(height),
+        np.float32(cloud_base_z), np.float32(cloud_top_z),
+        np.float32(pixel_spacing_x), np.float32(pixel_spacing_y),
+        np.int32(grid_rows), np.int32(grid_cols),
+        np.float32(cloud_time),
+        np.float32(extinction),
+        np.int32(terrain_rows), np.int32(terrain_cols),
+    )
+
+
 @cuda.jit
 def _shade_terrain_kernel(
     output, albedo_out, primary_rays, primary_hits, shadow_hits,
@@ -827,7 +1103,8 @@ def _shade_terrain_kernel(
     instance_ids, geometry_colors,
     primitive_ids, point_colors, point_color_offsets,
     ao_factor, gi_color, gi_intensity,
-    reflection_hits, reflection_rays
+    reflection_hits, reflection_rays,
+    cloud_fog_map, cloud_fog_density
 ):
     """GPU kernel for terrain shading with lighting, shadows, fog, colormapping, and viewshed."""
     idx = cuda.grid(1)
@@ -1051,6 +1328,37 @@ def _shade_terrain_kernel(
                 if shadow_t > 0:
                     shadow_factor = 0.5
 
+            # Cloud shadow — patchy darkening where cloud_cover is high
+            cfm_h = cloud_fog_map.shape[0]
+            cfm_w = cloud_fog_map.shape[1]
+            cloud_shadow = 0.0
+            if cfm_h > 1:
+                cy = elev_y
+                if cy < 0:
+                    cy = 0
+                elif cy >= cfm_h:
+                    cy = cfm_h - 1
+                cx = elev_x
+                if cx < 0:
+                    cx = 0
+                elif cx >= cfm_w:
+                    cx = cfm_w - 1
+                cc = cloud_fog_map[cy, cx]
+                if cc > 0.01:
+                    # Procedural noise for patchy cloud shapes
+                    wx = hit_x * cloud_fog_density
+                    wy = hit_y * cloud_fog_density
+                    n = (math.sin(wx * 1.2 + wy * 0.7) * 0.45
+                         + math.sin(wx * 2.7 - wy * 1.8 + 3.1) * 0.30
+                         + math.sin(wx * 0.5 + wy * 3.4 - 1.7) * 0.25)
+                    # n in ~[-1,1] → [0,1], squared for sharper edges
+                    cloud_mask = n * 0.5 + 0.5
+                    cloud_mask = cloud_mask * cloud_mask
+                    cloud_shadow = cc * cloud_mask * 0.7
+                    if cloud_shadow > 0.7:
+                        cloud_shadow = 0.7
+                    shadow_factor *= (1.0 - cloud_shadow)
+
             # Final lighting
             diffuse = cos_theta * shadow_factor
             lighting = ambient + (1.0 - ambient) * diffuse
@@ -1234,6 +1542,16 @@ def _shade_terrain_kernel(
                     color_r = color_r * (1 - fog_amount) + fog_color_r * fog_amount
                     color_g = color_g * (1 - fog_amount) + fog_color_g * fog_amount
                     color_b = color_b * (1 - fog_amount) + fog_color_b * fog_amount
+
+            # Cloud desaturation — overcast areas lose color contrast
+            if cloud_shadow > 0.15:
+                gray = color_r * 0.3 + color_g * 0.59 + color_b * 0.11
+                desat = (cloud_shadow - 0.15) * 0.6
+                if desat > 0.35:
+                    desat = 0.35
+                color_r = color_r * (1.0 - desat) + gray * desat
+                color_g = color_g * (1.0 - desat) + gray * desat
+                color_b = color_b * (1.0 - desat) + gray * desat
 
             output[py, px, 0] = color_r
             output[py, px, 1] = color_g
@@ -1580,6 +1898,7 @@ def _shade_terrain(
     ao_factor=None, gi_color=None, gi_intensity=2.0,
     reflection_hits=None, reflection_rays=None,
     albedo_out=None,
+    cloud_fog_map=None, cloud_fog_density=0.0,
 ):
     """Apply terrain shading with all effects."""
     threadsperblock = 256
@@ -1674,6 +1993,13 @@ def _shade_terrain(
             _DUMMY_ALBEDO = cupy.zeros((1, 1, 3), dtype=np.float32)
         albedo_out = _DUMMY_ALBEDO
 
+    # Handle cloud fog map - dummy (1,1) when not provided
+    # Kernel checks shape[0] > 1 to decide whether to apply
+    if cloud_fog_map is None:
+        if _DUMMY_1x1 is None:
+            _DUMMY_1x1 = cupy.zeros((1, 1), dtype=np.float32)
+        cloud_fog_map = _DUMMY_1x1
+
     _shade_terrain_kernel[blockspergrid, threadsperblock](
         output, albedo_out, primary_rays, primary_hits, shadow_hits,
         elevation_data, color_lut, num_rays, width, height,
@@ -1691,7 +2017,8 @@ def _shade_terrain(
         instance_ids, geometry_colors,
         primitive_ids, point_colors, point_color_offsets,
         ao_factor, gi_color, np.float32(gi_intensity),
-        reflection_hits, reflection_rays
+        reflection_hits, reflection_rays,
+        cloud_fog_map, np.float32(cloud_fog_density)
     )
 
 
@@ -1840,6 +2167,12 @@ def render(
     edl: bool = True,
     edl_strength: float = 0.7,
     edl_radius: float = 2.0,
+    cloud_fog_map=None,
+    cloud_fog_density: float = 0.0,
+    volumetric_clouds: bool = False,
+    cloud_base_z: float = 0.0,
+    cloud_top_z: float = 0.0,
+    cloud_time: float = 0.0,
     _return_gpu: bool = False,
 ) -> np.ndarray:
     """Render terrain with a perspective camera for movie-quality visualization.
@@ -2177,6 +2510,14 @@ def render(
         ov_max = float(cupy.nanmax(d_overlay))
         ov_range = ov_max - ov_min
 
+    # Prepare cloud fog map for GPU
+    d_cloud_fog_map = None
+    if cloud_fog_map is not None:
+        if not isinstance(cloud_fog_map, cupy.ndarray):
+            d_cloud_fog_map = cupy.asarray(cloud_fog_map, dtype=cupy.float32)
+        else:
+            d_cloud_fog_map = cloud_fog_map if cloud_fog_map.dtype == cupy.float32 else cloud_fog_map.astype(cupy.float32)
+
     # Build per-point color buffers for sphere geometries
     d_point_colors = None
     d_point_color_offsets = None
@@ -2209,7 +2550,23 @@ def render(
         gi_intensity=gi_intensity,
         reflection_hits=d_reflection_hits, reflection_rays=d_reflection_rays,
         albedo_out=bufs.albedo,
+        cloud_fog_map=None if volumetric_clouds else d_cloud_fog_map,
+        cloud_fog_density=cloud_fog_density,
     )
+
+    # Volumetric clouds (ray-marched, composited over shaded frame)
+    if volumetric_clouds and cloud_top_z > cloud_base_z:
+        d_primary_rays_flat = bufs.primary_rays
+        d_primary_hits_flat = bufs.primary_hits
+        _apply_volumetric_clouds(
+            d_output, d_primary_rays_flat, d_primary_hits_flat,
+            d_cloud_fog_map, d_sun_dir,
+            width, height,
+            cloud_base_z, cloud_top_z,
+            pixel_spacing_x, pixel_spacing_y,
+            H, W,
+            cloud_time,
+        )
 
     # AI denoiser (after shading, before bloom/tone mapping)
     if denoise:
