@@ -739,9 +739,12 @@ class _MeshChunkManager:
             accessor._geometry_colors_dirty = True
 
         # Refresh viewer geometry tracking (same pattern as FIRMS toggle)
+        from .viewer.terrain_lod import is_terrain_lod_gid
         viewer._all_geometries = rtx.list_geometries()
         groups = set()
         for g in viewer._all_geometries:
+            if is_terrain_lod_gid(g):
+                continue
             parts = g.rsplit('_', 1)
             if len(parts) == 2 and parts[1].isdigit():
                 base = parts[0]
@@ -1374,6 +1377,7 @@ class InteractiveViewer:
     - [/]: Decrease/increase observer height
     - R: Decrease terrain resolution (coarser, up to 8x subsample)
     - Shift+R: Increase terrain resolution (finer, down to 1x)
+    - Shift+A: Toggle distance-based terrain LOD
     - Z: Decrease vertical exaggeration
     - Shift+Z: Increase vertical exaggeration
     - B: Toggle mesh type (TIN / voxel)
@@ -3235,6 +3239,22 @@ class InteractiveViewer:
     def _last_reload_time(self, value):
         self.terrain._last_reload_time = value
 
+    @property
+    def lod_enabled(self):
+        return self.terrain.lod_enabled
+
+    @lod_enabled.setter
+    def lod_enabled(self, value):
+        self.terrain.lod_enabled = value
+
+    @property
+    def _terrain_lod_manager(self):
+        return self.terrain._terrain_lod_manager
+
+    @_terrain_lod_manager.setter
+    def _terrain_lod_manager(self, value):
+        self.terrain._terrain_lod_manager = value
+
     # ------------------------------------------------------------------
     # Delegation properties — GeometryLayerManager
     # ------------------------------------------------------------------
@@ -3615,6 +3635,49 @@ class InteractiveViewer:
         result[:, :, :3] = np.clip(result[:, :, :3], 0, 1)
         return result
 
+    def _enable_terrain_lod(self):
+        """Switch terrain rendering from single-GAS to per-tile LOD.
+
+        Removes the single ``'terrain'`` (and ``'terrain_skirt'``)
+        geometry and creates a :class:`TerrainLODManager` that renders
+        each tile at a distance-appropriate resolution.
+        """
+        from .viewer.terrain_lod import TerrainLODManager
+
+        # Get full-res terrain as numpy
+        base = self._base_raster
+        terrain_data = base.data
+        if hasattr(terrain_data, 'get'):
+            terrain_np = terrain_data.get()
+        else:
+            terrain_np = np.asarray(terrain_data)
+
+        # Remove the single terrain geometry
+        if self.rtx.has_geometry('terrain'):
+            self.rtx.remove_geometry('terrain')
+        if self.rtx.has_geometry('terrain_skirt'):
+            self.rtx.remove_geometry('terrain_skirt')
+
+        # Choose tile size: aim for ~8-16 tiles across largest dimension
+        H, W = terrain_np.shape
+        tile_size = max(32, min(256, max(H, W) // 8))
+
+        mgr = TerrainLODManager(
+            terrain_np,
+            tile_size=tile_size,
+            pixel_spacing_x=self._base_pixel_spacing_x,
+            pixel_spacing_y=self._base_pixel_spacing_y,
+            max_lod=3,
+            base_subsample=self.subsample_factor,
+        )
+        self._terrain_lod_manager = mgr
+        self.lod_enabled = True
+
+        # Force initial tile build
+        mgr.update(self.position, self.rtx,
+                    ve=self.vertical_exaggeration, force=True)
+        self._update_frame()
+
     def _rebuild_at_resolution(self, factor):
         """Rebuild terrain mesh at a different subsample factor.
 
@@ -3630,6 +3693,17 @@ class InteractiveViewer:
         from . import mesh as mesh_mod
 
         self.subsample_factor = factor
+
+        # If LOD is active, update the LOD manager's base subsample
+        # and force a full tile rebuild instead of the single-GAS path.
+        if self.lod_enabled and self._terrain_lod_manager is not None:
+            self._terrain_lod_manager.set_base_subsample(factor)
+            self._terrain_lod_manager.update(
+                self.position, self.rtx,
+                ve=self.vertical_exaggeration, force=True)
+            # Still need to update raster/spacing for overlays and re-snapping
+            # but skip the single-terrain GAS rebuild below.
+
         base = self._base_raster
 
         # 1. Subsample the raster
@@ -3658,7 +3732,16 @@ class InteractiveViewer:
         ve = self.vertical_exaggeration
         cache_key = (factor, self.mesh_type)
 
-        if self.mesh_type == 'heightfield':
+        # When LOD is active, tiles are built by the LOD manager.
+        # We still need terrain_np for elevation stats (computed below).
+        _lod_active = (self.lod_enabled and self._terrain_lod_manager is not None)
+        if _lod_active:
+            terrain_data = sub.data
+            if hasattr(terrain_data, 'get'):
+                terrain_np = terrain_data.get()
+            else:
+                terrain_np = np.asarray(terrain_data)
+        elif self.mesh_type == 'heightfield':
             # Heightfield path: no triangle mesh needed
             if cache_key in self._terrain_mesh_cache:
                 _, _, terrain_np = self._terrain_mesh_cache[cache_key]
@@ -3801,8 +3884,11 @@ class InteractiveViewer:
             if has_cupy:
                 gpu_terrain = cp.asarray(terrain_np)
                 self._gpu_terrain = gpu_terrain
+            from .viewer.terrain_lod import is_terrain_lod_gid
             for geom_id in self.rtx.list_geometries():
-                if geom_id == 'terrain':
+                if geom_id == 'terrain' or geom_id == 'terrain_skirt':
+                    continue
+                if is_terrain_lod_gid(geom_id):
                     continue
                 # Baked meshes — re-snap Z to new terrain surface + VE
                 if hasattr(self, '_baked_meshes') and geom_id in self._baked_meshes:
@@ -3923,10 +4009,19 @@ class InteractiveViewer:
         self.vertical_exaggeration = ve
         H, W = self.terrain_shape
 
-        # Use cached mesh if available, otherwise build and cache
-        cache_key = (self.subsample_factor, self.mesh_type)
-
-        if self.mesh_type == 'heightfield':
+        # If LOD is active, force a full tile rebuild with the new VE
+        if self.lod_enabled and self._terrain_lod_manager is not None:
+            self._terrain_lod_manager._tile_cache.clear()
+            self._terrain_lod_manager._tile_lods.clear()
+            self._terrain_lod_manager.update(
+                self.position, self.rtx, ve=ve, force=True)
+            # Still need terrain_np for elevation stats below
+            terrain_data = self.raster.data
+            if hasattr(terrain_data, 'get'):
+                terrain_np = terrain_data.get()
+            else:
+                terrain_np = np.asarray(terrain_data)
+        elif self.mesh_type == 'heightfield':
             # Heightfield path: rebuild GAS with new VE
             if cache_key in self._terrain_mesh_cache:
                 _, _, terrain_np = self._terrain_mesh_cache[cache_key]
@@ -4026,8 +4121,11 @@ class InteractiveViewer:
             if has_cupy:
                 gpu_terrain = cp.asarray(terrain_np)
                 self._gpu_terrain = gpu_terrain
+            from .viewer.terrain_lod import is_terrain_lod_gid
             for geom_id in self.rtx.list_geometries():
-                if geom_id == 'terrain':
+                if geom_id == 'terrain' or geom_id == 'terrain_skirt':
+                    continue
+                if is_terrain_lod_gid(geom_id):
                     continue
                 # Baked meshes (merged buildings/curves) — re-snap Z to terrain + VE
                 if hasattr(self, '_baked_meshes') and geom_id in self._baked_meshes:
@@ -4464,9 +4562,12 @@ class InteractiveViewer:
 
                 # Refresh geometry layer tracking
                 if self.rtx is not None:
+                    from .viewer.terrain_lod import is_terrain_lod_gid
                     self._all_geometries = self.rtx.list_geometries()
                     groups = set()
                     for g in self._all_geometries:
+                        if is_terrain_lod_gid(g):
+                            continue
                         parts = g.rsplit('_', 1)
                         if len(parts) == 2 and parts[1].isdigit():
                             base = parts[0]
@@ -6356,10 +6457,25 @@ class InteractiveViewer:
         self._toggle_wind()
 
     def _action_toggle_terrain_vis(self):
+        from .viewer.terrain_lod import is_terrain_lod_gid
         entry = self.rtx._geom_state.gas_entries.get('terrain')
         if entry is not None:
             vis = not entry.visible
             self.rtx.set_geometry_visible('terrain', vis)
+            print(f"Terrain {'shown' if vis else 'hidden'}")
+            self._needs_render = True
+        elif self.lod_enabled:
+            # Determine current visibility from any LOD tile
+            vis = True
+            for gid in self.rtx.list_geometries():
+                if is_terrain_lod_gid(gid):
+                    e = self.rtx._geom_state.gas_entries.get(gid)
+                    if e is not None:
+                        vis = not e.visible
+                        break
+            for gid in self.rtx.list_geometries():
+                if is_terrain_lod_gid(gid):
+                    self.rtx.set_geometry_visible(gid, vis)
             print(f"Terrain {'shown' if vis else 'hidden'}")
             self._needs_render = True
 
@@ -6491,6 +6607,25 @@ class InteractiveViewer:
         new_factor = max(1, self.subsample_factor // 2)
         if new_factor != self.subsample_factor:
             self._rebuild_at_resolution(new_factor)
+
+    def _action_toggle_terrain_lod(self):
+        """Toggle distance-based terrain LOD on/off."""
+        if self.rtx is None:
+            return
+
+        if self.lod_enabled:
+            # Disable LOD — remove tile geometries, restore single terrain
+            if self._terrain_lod_manager is not None:
+                self._terrain_lod_manager.remove_all(self.rtx)
+                self._terrain_lod_manager = None
+            self.lod_enabled = False
+            # Rebuild the single terrain geometry
+            self._rebuild_at_resolution(self.subsample_factor)
+            print("Terrain LOD: OFF")
+        else:
+            # Enable LOD — replace single terrain with tiled LOD
+            self._enable_terrain_lod()
+            print(f"Terrain LOD: ON ({self._terrain_lod_manager.get_stats()})")
 
     def _action_ve_down(self):
         new_ve = max(0.1, round(self.vertical_exaggeration - 0.1, 1))
@@ -6983,6 +7118,12 @@ class InteractiveViewer:
         if self._chunk_manager is not None:
             if self._chunk_manager.update(self.position[0], self.position[1], self):
                 self._geometry_colors_builder = self._accessor._build_geometry_colors_gpu
+                self._render_needed = True
+        # Terrain LOD: update tile resolutions based on camera distance
+        if self.lod_enabled and self._terrain_lod_manager is not None:
+            if self._terrain_lod_manager.update(
+                    self.position, self.rtx,
+                    ve=self.vertical_exaggeration):
                 self._render_needed = True
         # AO/DOF: keep accumulating samples when camera is stationary
         if ((self.ao_enabled or self.dof_enabled) and not self._held_keys
@@ -8831,6 +8972,7 @@ class InteractiveViewer:
                 ("Y", "Cycle color stretch"),
                 (", / .", "Overlay alpha"),
                 ("R / Shift+R", "Resolution down / up"),
+                ("Shift+A", "Toggle terrain LOD"),
                 ("Z / Shift+Z", "Vert. exag. down / up"),
                 ("B", "Toggle TIN / Voxel"),
                 ("T", "Toggle shadows"),
@@ -9480,6 +9622,7 @@ def explore(raster, width: int = 800, height: int = 600,
     - [/]: Decrease/increase observer height
     - R: Decrease terrain resolution (coarser, up to 8x subsample)
     - Shift+R: Increase terrain resolution (finer, down to 1x)
+    - Shift+A: Toggle distance-based terrain LOD
     - Z: Decrease vertical exaggeration
     - Shift+Z: Increase vertical exaggeration
     - B: Toggle mesh type (TIN / voxel)
