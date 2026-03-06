@@ -40,6 +40,7 @@ SHIFT_BINDINGS = {
     'T': '_action_cycle_time',      # Time-of-day
     'Y': '_action_toggle_hydro',    # Hydro flow particles
     'N': '_action_toggle_clouds',   # Cloud layer
+    'A': '_action_toggle_terrain_lod',  # Distance-based terrain LOD
 }
 
 # Lowercase key bindings — checked after shift bindings

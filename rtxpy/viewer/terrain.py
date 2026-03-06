@@ -24,6 +24,8 @@ class TerrainState:
         '_coord_step_x', '_coord_step_y',
         '_reload_cooldown', '_last_reload_time',
         '_terrain_reload_future', '_terrain_reload_pool',
+        # LOD state
+        'lod_enabled', '_terrain_lod_manager',
     )
 
     def __init__(self, raster, pixel_spacing_x=1.0, pixel_spacing_y=1.0,
@@ -63,3 +65,7 @@ class TerrainState:
         self._last_reload_time = 0.0
         self._terrain_reload_future = None
         self._terrain_reload_pool = None
+
+        # LOD
+        self.lod_enabled = False
+        self._terrain_lod_manager = None

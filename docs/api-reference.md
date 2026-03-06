@@ -350,6 +350,57 @@ Print and return memory breakdown of the current scene.
 
 ---
 
+## LOD Utilities
+
+Level-of-detail helpers for terrain tiles and instanced geometry.
+
+```python
+from rtxpy import compute_lod_level, compute_lod_distances, simplify_mesh, build_lod_chain
+```
+
+#### `compute_lod_level(distance, lod_distances)`
+
+Map a distance value to a discrete LOD level.
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `distance` | float | Distance from camera to object/tile center |
+| `lod_distances` | list[float] | Ascending thresholds for LOD transitions |
+
+**Returns:** `int` — LOD level (0 = highest detail)
+
+#### `compute_lod_distances(tile_diagonal, factor=3.0, max_lod=3)`
+
+Generate distance thresholds from tile geometry.
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `tile_diagonal` | float | | Tile diagonal in world units |
+| `factor` | float | `3.0` | Base multiplier for first threshold |
+| `max_lod` | int | `3` | Number of LOD transitions |
+
+**Returns:** `list[float]` — distance thresholds
+
+#### `simplify_mesh(vertices, indices, ratio)`
+
+Simplify a triangle mesh via quadric decimation (requires `trimesh`).
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `vertices` | ndarray | Flat float32 vertex buffer `(N*3,)` |
+| `indices` | ndarray | Flat int32 index buffer `(M*3,)` |
+| `ratio` | float | Fraction of triangles to keep (0.0-1.0) |
+
+**Returns:** `(vertices, indices)` — simplified mesh buffers
+
+#### `build_lod_chain(vertices, indices, ratios=(1.0, 0.5, 0.25, 0.1))`
+
+Build a list of progressively simplified meshes.
+
+**Returns:** `list[(vertices, indices)]` — one pair per LOD level
+
+---
+
 ## RTX Class
 
 Low-level OptiX wrapper. Use this directly for custom ray tracing without the xarray accessor.
