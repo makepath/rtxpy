@@ -269,6 +269,53 @@ class TestTerrainLODManager:
         # Meshes should differ (fewer vertices at 2x subsample)
         assert len(verts2) != len(verts1)
 
+    def test_adjacent_tiles_share_boundary_vertices(self):
+        """Adjacent tiles must share boundary vertices (no gap). #79"""
+        terrain = self._make_terrain(128, 128)
+        rtx = _FakeRTX()
+        mgr = TerrainLODManager(terrain, tile_size=64,
+                                pixel_spacing_x=1.0, pixel_spacing_y=1.0,
+                                base_subsample=1)
+        mgr.update(np.array([64, 64, 0]), rtx, force=True)
+
+        # Tile (0,0) and tile (0,1) share a column boundary
+        v00 = rtx.geometries[_tile_gid(0, 0)][0]
+        v01 = rtx.geometries[_tile_gid(0, 1)][0]
+        # Max x of tile (0,0) should equal min x of tile (0,1)
+        max_x_00 = float(np.max(v00[0::3]))
+        min_x_01 = float(np.min(v01[0::3]))
+        assert max_x_00 == pytest.approx(min_x_01), (
+            f"Column gap: tile(0,0) max_x={max_x_00}, "
+            f"tile(0,1) min_x={min_x_01}"
+        )
+
+        # Tile (0,0) and tile (1,0) share a row boundary
+        v10 = rtx.geometries[_tile_gid(1, 0)][0]
+        max_y_00 = float(np.max(v00[1::3]))
+        min_y_10 = float(np.min(v10[1::3]))
+        assert max_y_00 == pytest.approx(min_y_10), (
+            f"Row gap: tile(0,0) max_y={max_y_00}, "
+            f"tile(1,0) min_y={min_y_10}"
+        )
+
+    def test_boundary_shared_at_higher_subsample(self):
+        """Boundary sharing works at subsample > 1. #79"""
+        terrain = self._make_terrain(256, 256)
+        rtx = _FakeRTX()
+        mgr = TerrainLODManager(terrain, tile_size=128,
+                                pixel_spacing_x=1.0, pixel_spacing_y=1.0,
+                                base_subsample=2)
+        mgr.update(np.array([128, 128, 0]), rtx, force=True)
+
+        v00 = rtx.geometries[_tile_gid(0, 0)][0]
+        v01 = rtx.geometries[_tile_gid(0, 1)][0]
+        max_x_00 = float(np.max(v00[0::3]))
+        min_x_01 = float(np.min(v01[0::3]))
+        assert max_x_00 == pytest.approx(min_x_01), (
+            f"Column gap at subsample=2: tile(0,0) max_x={max_x_00}, "
+            f"tile(0,1) min_x={min_x_01}"
+        )
+
     def test_get_stats(self):
         terrain = self._make_terrain(128, 128)
         mgr = TerrainLODManager(terrain, tile_size=64)
