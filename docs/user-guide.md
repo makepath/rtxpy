@@ -536,6 +536,63 @@ verts, indices = dem.rtx.triangulate()
 write_stl('terrain.stl', verts, indices)
 ```
 
+## Render Graph
+
+The render graph lets you define a pipeline of render passes as a DAG. Instead of editing one monolithic render function, you declare what each pass reads and writes. The graph handles execution order, buffer allocation, and capability gating.
+
+```python
+from rtxpy import RenderGraph, RenderPass, BufferDesc
+
+rgb = BufferDesc(dtype="float32", channels=3, per_pixel=True)
+scalar = BufferDesc(dtype="float32", channels=1, per_pixel=True)
+
+class MyShadePass(RenderPass):
+    def __init__(self):
+        super().__init__("shade", outputs={"color": rgb})
+
+    def execute(self, buffers):
+        buffers["color"][:] = 0.5  # your shading logic here
+
+class MyDenoisePass(RenderPass):
+    def __init__(self):
+        super().__init__(
+            "denoise",
+            inputs={"color": rgb},
+            outputs={"denoised_color": rgb},
+            requires=["optix_denoiser"],
+        )
+
+    def execute(self, buffers):
+        buffers["denoised_color"][:] = buffers["color"]  # denoiser call here
+
+class MyTonemapPass(RenderPass):
+    def __init__(self):
+        super().__init__(
+            "tonemap",
+            inputs={"denoised_color": rgb},
+            outputs={"final": rgb},
+        )
+
+    def execute(self, buffers):
+        buffers["final"][:] = buffers["denoised_color"] ** (1.0 / 2.2)
+
+graph = RenderGraph(width=1920, height=1080)
+graph.add_pass(MyShadePass())
+graph.add_pass(MyDenoisePass())
+graph.add_pass(MyTonemapPass())
+
+# If denoiser unavailable, tonemap reads 'color' directly
+graph.set_fallback("denoised_color", "color")
+
+compiled = graph.compile(capabilities={"optix_denoiser": False})
+result = compiled.execute()
+# result["final"] contains the output image
+```
+
+The graph skips passes whose `requires` capabilities aren't present, wiring fallbacks so downstream passes still work. Buffer lifetime analysis reuses GPU memory when buffers don't overlap in time.
+
+See the [API Reference](api-reference.md#render-graph) for the full interface.
+
 ## Performance Tips
 
 - **Enable terrain LOD**: Press `Shift+A` in the viewer to activate distance-based LOD. Nearby tiles render at full detail while distant tiles are automatically subsampled, cutting triangle count without visible quality loss

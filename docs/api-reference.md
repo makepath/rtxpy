@@ -568,6 +568,92 @@ Find which zarr chunks overlap a pixel-coordinate window.
 
 ---
 
+## Render Graph
+
+A configurable DAG of render passes. Declare inputs/outputs per pass, and the graph resolves execution order, manages GPU buffers, and gates passes on hardware capabilities.
+
+```python
+from rtxpy import RenderGraph, RenderPass, BufferDesc
+```
+
+### `BufferDesc(dtype='float32', channels=3, per_pixel=True)`
+
+Describes a GPU buffer's shape and data type.
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `dtype` | str | `'float32'` | NumPy-compatible dtype |
+| `channels` | int | `3` | Channels per element |
+| `per_pixel` | bool | `True` | `True` = `(H, W, C)` shape; `False` = `(N, C)` flat |
+
+#### `shape(width, height)`
+
+**Returns:** `tuple[int, ...]` — concrete shape for the given resolution
+
+### `RenderPass` (abstract base class)
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `name` | str | required | Unique pass name |
+| `inputs` | dict[str, BufferDesc] | `{}` | Buffers this pass reads |
+| `outputs` | dict[str, BufferDesc] | `{}` | Buffers this pass writes |
+| `enabled` | bool | `True` | Set `False` to skip |
+| `requires` | list[str] | `[]` | Capability keys that must be truthy |
+
+Override `execute(buffers)` with your pass logic. Optionally override `setup(graph)` and `teardown()`.
+
+### `RenderGraph(width=1920, height=1080)`
+
+#### `add_pass(pass_)`
+
+Add a render pass. Raises `ValueError` on duplicate names.
+
+#### `remove_pass(name)`
+
+Remove a pass by name. Raises `KeyError` if not found.
+
+#### `get_pass(name)`
+
+**Returns:** `RenderPass`
+
+#### `set_fallback(buffer, fallback)`
+
+If `buffer`'s producer is disabled, downstream passes read `fallback` instead.
+
+```python
+graph.set_fallback("denoised_color", "color")
+```
+
+#### `compile(capabilities=None, validate=True)`
+
+Compile the graph: capability-gate passes, topological sort, buffer lifetime analysis.
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `capabilities` | dict | `None` | From `get_capabilities()` |
+| `validate` | bool | `True` | Raise `GraphValidationError` on problems |
+
+**Returns:** `CompiledGraph`
+
+### `CompiledGraph`
+
+#### `execute(external_buffers=None, allocator=None)`
+
+Run all passes in dependency order.
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `external_buffers` | dict | `None` | Pre-allocated buffers to inject |
+| `allocator` | callable | `None` | `(shape, dtype) -> array`; defaults to `cupy.zeros` |
+
+**Returns:** `dict[str, array]` — all buffers after execution
+
+### `GraphValidationError`
+
+Raised on cycle detection, missing inputs, or other graph errors.
+
+---
+
 ### Device Utilities
 
 #### `get_device_count()`
