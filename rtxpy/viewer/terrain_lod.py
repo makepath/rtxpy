@@ -227,8 +227,10 @@ class TerrainLODManager:
         subsample = self._base_subsample * (2 ** lod)
         r0 = tr * self._tile_size
         c0 = tc * self._tile_size
-        r1 = min(r0 + self._tile_size, self._H)
-        c1 = min(c0 + self._tile_size, self._W)
+        # Extend by one pixel so adjacent tiles share boundary vertices,
+        # eliminating the one-pixel gap that causes shading seams.
+        r1 = min(r0 + self._tile_size + 1, self._H)
+        c1 = min(c0 + self._tile_size + 1, self._W)
 
         # Extract tile data with subsampling
         tile = self._terrain_np[r0:r1:subsample, c0:c1:subsample]
