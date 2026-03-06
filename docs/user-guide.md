@@ -461,6 +461,7 @@ dem.rtx.explore(wind_data=wind)  # Shift+W to toggle
 | **[** / **]** | Decrease / increase observer height |
 | **R** | Decrease terrain resolution (coarser) |
 | **Shift+R** | Increase terrain resolution (finer) |
+| **Shift+A** | Toggle distance-based terrain LOD |
 | **Z** | Decrease vertical exaggeration |
 | **Shift+Z** | Increase vertical exaggeration |
 | **B** | Toggle mesh type (TIN / voxel) |
@@ -537,6 +538,7 @@ write_stl('terrain.stl', verts, indices)
 
 ## Performance Tips
 
+- **Enable terrain LOD**: Press `Shift+A` in the viewer to activate distance-based LOD. Nearby tiles render at full detail while distant tiles are automatically subsampled, cutting triangle count without visible quality loss
 - **Subsample large DEMs**: `dem[::2, ::2]` or `explore(subsample=4)` — 4x subsample is 16x less geometry
 - **Lower render_scale**: `explore(render_scale=0.25)` renders at quarter resolution for faster interaction
 - **Cache meshes**: Use `mesh_cache` parameter in `place_buildings()`, `place_roads()`, etc. to skip GeoJSON parsing on reload
