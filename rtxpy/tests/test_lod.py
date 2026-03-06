@@ -316,6 +316,25 @@ class TestTerrainLODManager:
             f"tile(0,1) min_x={min_x_01}"
         )
 
+    def test_interior_tile_has_no_skirt(self):
+        """Interior tiles (not at terrain edge) should have no skirt. #79"""
+        terrain = self._make_terrain(256, 256)
+        rtx = _FakeRTX()
+        mgr = TerrainLODManager(terrain, tile_size=64,
+                                pixel_spacing_x=1.0, pixel_spacing_y=1.0)
+        mgr.update(np.array([128, 128, 0]), rtx, force=True)
+        # Tile (1,1) is fully interior — no edges touch terrain boundary.
+        # Its mesh should have no skirt (vertex count = grid verts only).
+        gid = _tile_gid(1, 1)
+        verts = rtx.geometries[gid][0]
+        # With +1 overlap and subsample=1, tile covers 65x65 grid
+        # (64 tile_size + 1 overlap). No skirt → exactly 65*65 verts.
+        n_verts = len(verts) // 3
+        assert n_verts == 65 * 65, (
+            f"Interior tile should have no skirt, got {n_verts} verts "
+            f"(expected {65 * 65})"
+        )
+
     def test_get_stats(self):
         terrain = self._make_terrain(128, 128)
         mgr = TerrainLODManager(terrain, tile_size=64)
@@ -378,3 +397,33 @@ class TestAddTileSkirt:
         new_v, _ = _add_tile_skirt(verts, indices, H, W)
         skirt_z = new_v[9 * 3 + 2::3]  # z of skirt vertices
         assert np.all(skirt_z < 10.0)
+
+    def test_no_edges_returns_unchanged(self):
+        """edges=all False should return original mesh unchanged. #79"""
+        H, W = 3, 3
+        verts = np.zeros(9 * 3, dtype=np.float32)
+        indices = np.zeros(8 * 3, dtype=np.int32)
+        new_v, new_i = _add_tile_skirt(
+            verts, indices, H, W, edges=(False, False, False, False))
+        np.testing.assert_array_equal(new_v, verts)
+        np.testing.assert_array_equal(new_i, indices)
+
+    def test_partial_edges_fewer_wall_tris(self):
+        """Activating only some edges should produce fewer wall tris. #79"""
+        H, W = 4, 4
+        n_verts = H * W
+        n_tris = (H - 1) * (W - 1) * 2
+        verts = np.zeros(n_verts * 3, dtype=np.float32)
+        indices = np.zeros(n_tris * 3, dtype=np.int32)
+        for h in range(H):
+            for w in range(W):
+                idx = (h * W + w) * 3
+                verts[idx] = float(w)
+                verts[idx + 1] = float(h)
+                verts[idx + 2] = float(h + w)
+
+        _, all_i = _add_tile_skirt(verts, indices, H, W)
+        _, partial_i = _add_tile_skirt(
+            verts, indices, H, W, edges=(True, False, False, False))
+        # Only top edge active → fewer wall triangles
+        assert len(partial_i) < len(all_i)

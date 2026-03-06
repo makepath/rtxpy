@@ -252,8 +252,16 @@ class TerrainLODManager:
         verts[0::3] = verts[0::3] * subsample * self._psx + c0 * self._psx
         verts[1::3] = verts[1::3] * subsample * self._psy + r0 * self._psy
 
-        # Add edge skirt to hide T-junction cracks between LOD levels
-        verts, indices = _add_tile_skirt(verts, indices, th, tw)
+        # Only add skirt on exterior edges (terrain boundary).
+        # Interior edges shared with adjacent tiles via the +1 overlap
+        # don't need skirt — overlapping skirt walls cause artifacts.
+        edges = (
+            tr == 0,                          # top
+            tc == self._n_tile_cols - 1,      # right
+            tr == self._n_tile_rows - 1,      # bottom
+            tc == 0,                          # left
+        )
+        verts, indices = _add_tile_skirt(verts, indices, th, tw, edges=edges)
 
         return verts, indices
 
@@ -272,13 +280,20 @@ def is_terrain_lod_gid(gid):
     return gid.startswith('terrain_lod_r')
 
 
-def _add_tile_skirt(vertices, indices, H, W, skirt_depth=None):
-    """Add a thin skirt around tile edges.
+def _add_tile_skirt(vertices, indices, H, W, skirt_depth=None,
+                    edges=(True, True, True, True)):
+    """Add a thin skirt around specified tile edges.
 
-    The skirt is deliberately small — just enough to cover gaps at
-    LOD boundaries.  It uses the same algorithm as
-    ``mesh.add_terrain_skirt`` but with a shallower default depth.
+    Parameters
+    ----------
+    edges : tuple of bool
+        ``(top, right, bottom, left)`` — which edges get skirt
+        geometry.  Interior tile edges shared with adjacent tiles
+        should be False to avoid overlapping wall triangles.
     """
+    if not any(edges):
+        return vertices, indices
+
     z_vals = vertices[2::3]
     z_min = float(np.nanmin(z_vals))
     z_max = float(np.nanmax(z_vals))
@@ -303,14 +318,29 @@ def _add_tile_skirt(vertices, indices, H, W, skirt_depth=None):
     skirt_verts[1::3] = vertices[perim * 3 + 1]
     skirt_verts[2::3] = skirt_z
 
-    idx = np.arange(n_perim, dtype=np.int32)
-    idx_next = np.roll(idx, -1)
-    top_a = perim
+    # Mask: only create wall triangles for active edges.
+    # Perimeter segments per edge: top W-1, right H-1, bottom W-1, left H-1.
+    edge_top, edge_right, edge_bottom, edge_left = edges
+    seg_mask = np.zeros(n_perim, dtype=bool)
+    off = 0
+    for active, count in [(edge_top, W - 1), (edge_right, H - 1),
+                           (edge_bottom, W - 1), (edge_left, H - 1)]:
+        if active:
+            seg_mask[off:off + count] = True
+        off += count
+
+    active_segs = np.where(seg_mask)[0].astype(np.int32)
+    if len(active_segs) == 0:
+        return vertices, indices
+
+    idx_next = (active_segs + 1) % n_perim
+    top_a = perim[active_segs]
     top_b = perim[idx_next]
-    bot_a = (n_orig + idx).astype(np.int32)
+    bot_a = (n_orig + active_segs).astype(np.int32)
     bot_b = (n_orig + idx_next).astype(np.int32)
 
-    wall_tris = np.empty(n_perim * 6, dtype=np.int32)
+    n_active = len(active_segs)
+    wall_tris = np.empty(n_active * 6, dtype=np.int32)
     wall_tris[0::6] = top_a
     wall_tris[1::6] = bot_b
     wall_tris[2::6] = top_b
