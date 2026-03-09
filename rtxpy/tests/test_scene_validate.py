@@ -237,6 +237,72 @@ def test_tour_valid(scene_dir):
     assert tour_issues == []
 
 
+def test_roughness_missing_tile_size_warns(scene_dir):
+    store = _make_minimal_scene(scene_dir)
+    store.create_array('elevation_roughness',
+                       data=np.ones((4, 4), dtype=np.float32))
+    # No tile_size attribute
+
+    issues = validate_scene(scene_dir)
+    warnings = [msg for lvl, msg in issues if lvl == "warning"]
+    assert any("tile_size" in w for w in warnings)
+
+
+def test_roughness_valid(scene_dir):
+    store = _make_minimal_scene(scene_dir)
+    er = store.create_array('elevation_roughness',
+                            data=np.ones((4, 4), dtype=np.float32))
+    er.attrs['tile_size'] = 16
+
+    issues = validate_scene(scene_dir)
+    roughness_issues = [msg for lvl, msg in issues if "roughness" in msg]
+    assert roughness_issues == []
+
+
+def test_mesh_lod_partial_warns(scene_dir):
+    """Having vertices_lod1 but no indices_lod1 should warn."""
+    store = _make_minimal_scene(scene_dir)
+    mg = store.create_group('meshes')
+    mg.attrs['pixel_spacing'] = [30.0, 30.0]
+    mg.attrs['elevation_shape'] = [64, 64]
+    mg.attrs['elevation_chunks'] = [64, 64]
+
+    gg = mg.create_group('building')
+    gg.attrs['color'] = [0.6, 0.6, 0.6, 1.0]
+    cg = gg.create_group('0_0')
+    cg.create_array('vertices', data=np.zeros(9, dtype=np.float32))
+    cg.create_array('indices', data=np.array([0, 1, 2], dtype=np.int32))
+    # LOD 1 vertices but no indices
+    cg.create_array('vertices_lod1', data=np.zeros(9, dtype=np.float32))
+
+    issues = validate_scene(scene_dir)
+    warnings = [msg for lvl, msg in issues if lvl == "warning"]
+    assert any("partial LOD 1" in w for w in warnings)
+
+
+def test_mesh_lod_complete_ok(scene_dir):
+    """Complete LOD arrays should not warn."""
+    store = _make_minimal_scene(scene_dir)
+    mg = store.create_group('meshes')
+    mg.attrs['pixel_spacing'] = [30.0, 30.0]
+    mg.attrs['elevation_shape'] = [64, 64]
+    mg.attrs['elevation_chunks'] = [64, 64]
+
+    gg = mg.create_group('building')
+    gg.attrs['color'] = [0.6, 0.6, 0.6, 1.0]
+    cg = gg.create_group('0_0')
+    cg.create_array('vertices', data=np.zeros(9, dtype=np.float32))
+    cg.create_array('indices', data=np.array([0, 1, 2], dtype=np.int32))
+    cg.create_array('vertices_lod1', data=np.zeros(9, dtype=np.float32))
+    cg.create_array('indices_lod1', data=np.array([0, 1, 2], dtype=np.int32))
+    cg.create_array('vertices_lod2', data=np.zeros(9, dtype=np.float32))
+    cg.create_array('indices_lod2', data=np.array([0, 1, 2], dtype=np.int32))
+
+    issues = validate_scene(scene_dir)
+    lod_issues = [msg for lvl, msg in issues if "LOD" in msg]
+    assert lod_issues == []
+
+
 def test_nonexistent_path():
     issues = validate_scene("/nonexistent/path/88.zarr")
     assert len(issues) == 1

@@ -22,10 +22,15 @@ scene.zarr/
   elevation_lod2/                  # optional LOD pyramid level (2x downsample)
   elevation_lod4/                  # optional LOD pyramid level (4x downsample)
   elevation_lod8/                  # ...up to elevation_lod64
+  elevation_roughness/             # optional per-tile roughness for adaptive LOD
   spatial_ref                      # scalar variable with CRS attributes
   meshes/                          # placed geometry (buildings, roads, water, etc.)
     {geometry_id}/
       {chunk_row}_{chunk_col}/
+        vertices, indices          # LOD 0 (full detail)
+        vertices_lod1, indices_lod1  # optional pre-simplified LOD levels
+        vertices_lod2, indices_lod2
+        vertices_lod3, indices_lod3
   overlays/                        # raster overlay layers
     {layer_name}/
   wind/                            # wind velocity grids
@@ -100,6 +105,112 @@ compression. Chunks sized to fit the downsampled dimensions.
 These are built lazily on first access by `explore_zarr.py`'s
 `_build_lod_arrays()` and cached in the store. A producer can pre-build them
 with `--build-lods` or skip them and let the viewer build on demand.
+
+### Terrain tile roughness
+
+**Array**: `elevation_roughness` — 2D float32, shape (n_tile_rows, n_tile_cols)
+
+Per-tile roughness scores used by `TerrainLODManager` to adapt LOD thresholds
+to terrain complexity. Each value is the standard deviation of elevation
+residuals from a bilinear fit through the tile's four corners
+(`compute_tile_roughness()` in `lod.py`). Flat tiles score near zero; jagged
+ridgelines score high.
+
+At runtime the raw roughness values get log-normalized across all tiles and
+mapped to a scale factor in [0.5, 2.0] via `0.5 * 4^t`. Smooth tiles have
+their effective camera distance doubled (LOD demoted sooner), rough tiles
+have it halved (finer detail kept at greater distance). When all tiles have
+equal roughness, every tile gets scale 1.0 (neutral).
+
+**Attributes** on `elevation_roughness`:
+
+| Attribute | Type | Description |
+|-----------|------|-------------|
+| `tile_size` | int | Tile edge length in pixels used for roughness computation |
+| `roughness_floor` | float | Minimum roughness threshold — tiles below this get neutral scale |
+
+Pre-computing roughness avoids a full scan of the elevation grid on viewer
+startup. The viewer recomputes if the tile_size doesn't match its own
+(e.g. because zarr chunk alignment changed the tile grid).
+
+### Terrain LOD tiling parameters
+
+The `TerrainLODManager` tiles terrain into a grid and assigns per-tile LOD
+levels based on camera distance. These parameters control that tiling and
+can be stored as attributes on the elevation array or a dedicated group.
+
+**Attributes** on `elevation` (optional):
+
+| Attribute | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `lod_tile_size` | int | chunk_w | Tile edge length in pixels; should match elevation chunk_w for aligned loading |
+| `lod_max_level` | int | 3 | Maximum LOD level (0 = full res, 3 = coarsest) |
+| `lod_distance_factor` | float | 3.0 | Distance multiplier per LOD threshold step |
+| `lod_base_subsample` | int | 1 | Global resolution factor applied before LOD |
+
+When the viewer enables LOD, it reads these to configure the
+`TerrainLODManager` instead of using hardcoded defaults. If absent, the
+viewer falls back to its current auto-detection (tile_size from chunk grid,
+max_level from pyramid depth).
+
+## Mesh LOD
+
+Pre-simplified variants of placed geometry, stored alongside the full-detail
+meshes. Without these, the viewer runs `fast_simplification` at runtime
+(which requires the optional `fast_simplification` package and burns CPU on
+first access for each chunk/LOD combination).
+
+### Layout
+
+```
+scene.zarr/
+  meshes/
+    building/
+      0_0/
+        vertices              # LOD 0 — full detail (existing)
+        indices               # LOD 0 — full detail (existing)
+        vertices_lod1         # LOD 1 — 50% triangles
+        indices_lod1
+        vertices_lod2         # LOD 2 — 25% triangles
+        indices_lod2
+        vertices_lod3         # LOD 3 — 10% triangles
+        indices_lod3
+```
+
+**Naming**: `vertices_lod{N}` and `indices_lod{N}` where N matches the LOD
+level (1, 2, 3). LOD 0 uses the existing `vertices`/`indices` arrays — no
+suffix needed.
+
+For curve geometries, LOD simplification doesn't apply (curves are cheap to
+render and can't be meaningfully decimated). Sphere geometries also skip LOD.
+
+**Attributes** on `/meshes/.zattrs` (in addition to existing ones):
+
+| Attribute | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `lod_ratios` | [float, ...] | [1.0, 0.5, 0.25, 0.1] | Triangle ratio per LOD level |
+
+The `lod_ratios` array tells the viewer what decimation was applied at each
+level. The `_MeshChunkManager` currently hardcodes `(1.0, 0.5, 0.25, 0.1)`.
+Storing the ratios in the file lets a producer choose different decimation
+targets and lets the viewer know what it's loading.
+
+### Producing mesh LOD
+
+`save_meshes_to_zarr()` would accept an optional `lod_ratios` parameter.
+For each chunk, after saving the full-detail mesh, it runs `simplify_mesh()`
+at each ratio and saves the result as `vertices_lod{N}` / `indices_lod{N}`.
+
+### Consuming mesh LOD
+
+`_MeshChunkManager._get_simplified()` currently calls `simplify_mesh()` and
+caches the result. With pre-computed LOD arrays, it would first check for
+`vertices_lod{N}` in the chunk group and use that directly, skipping
+decimation entirely. Falls back to runtime simplification if the arrays
+aren't present.
+
+This makes `fast_simplification` optional at runtime even when mesh LOD is
+active — the work was done at scene build time.
 
 ## spatial_ref
 

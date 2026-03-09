@@ -445,6 +445,14 @@ def validate_scene(zarr_path):
             if attr not in sr.attrs:
                 _warn(f"spatial_ref: missing attribute '{attr}'")
 
+    # -- elevation_roughness (optional) --
+    if 'elevation_roughness' in store:
+        er = store['elevation_roughness']
+        if 'tile_size' not in er.attrs:
+            _warn("elevation_roughness: missing 'tile_size' attribute")
+
+    # -- mesh LOD arrays (checked within meshes below) --
+
     # -- meshes (optional) --
     if 'meshes' in store:
         mg = store['meshes']
@@ -477,6 +485,21 @@ def validate_scene(zarr_path):
                         _warn(f"meshes/{gid}/{key}: missing 'indices'")
                     if geom_type == 'curve' and 'widths' not in cg:
                         _warn(f"meshes/{gid}/{key}: missing 'widths'")
+                    # Check mesh LOD consistency — if any LOD level
+                    # exists, both vertices and indices must be present
+                    if geom_type not in ('curve', 'sphere'):
+                        for lod_n in range(1, 10):
+                            vk = f'vertices_lod{lod_n}'
+                            ik = f'indices_lod{lod_n}'
+                            has_v = vk in cg
+                            has_i = ik in cg
+                            if has_v != has_i:
+                                missing = ik if has_v else vk
+                                _warn(f"meshes/{gid}/{key}: has "
+                                      f"partial LOD {lod_n} "
+                                      f"(missing '{missing}')")
+                            if not has_v and not has_i:
+                                break  # no more LOD levels
 
     # -- overlays (optional) --
     if 'overlays' in store:
