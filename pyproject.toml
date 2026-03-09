@@ -43,6 +43,9 @@ viewer = ["glfw", "moderngl", "Pillow"]
 notebook = ["ipywidgets>=8.0", "ipyevents>=2.0", "Pillow"]
 all = ["xarray", "scipy", "Pillow", "pyproj", "glfw", "moderngl", "ipywidgets>=8.0", "ipyevents>=2.0"]
 
+[project.scripts]
+rtxpy-build-scene = "rtxpy.scene:main"
+
 [project.urls]
 Homepage = "https://github.com/makepath/rtxpy"
 Repository = "https://github.com/makepath/rtxpy"

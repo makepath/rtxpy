@@ -62,6 +62,12 @@ try:
 except ImportError:
     pass
 
+# Scene builder
+try:
+    from .scene import build_scene, explore_scene
+except ImportError:
+    pass
+
 # Register xarray accessor if xarray is available
 try:
     from . import accessor  # noqa: F401
