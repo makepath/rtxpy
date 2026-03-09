@@ -39,6 +39,56 @@ def compute_lod_level(distance, lod_distances):
     return len(lod_distances)
 
 
+def compute_lod_level_with_hysteresis(distance, lod_distances, prev_lod,
+                                      hysteresis=0.2):
+    """Return the LOD level with hysteresis to prevent popping.
+
+    Uses wider thresholds for downgrading (increasing LOD level) than
+    upgrading (decreasing LOD level), creating a dead zone around each
+    transition boundary.
+
+    Parameters
+    ----------
+    distance : float
+        Distance from camera to object or tile center.
+    lod_distances : list of float
+        Ascending distance thresholds defining LOD transitions.
+    prev_lod : int
+        Previous LOD level for this tile (-1 if never assigned).
+    hysteresis : float
+        Fractional band width.  A tile must move ``hysteresis`` past the
+        threshold before switching.  E.g. 0.2 means 20% beyond.
+
+    Returns
+    -------
+    int
+        LOD level (0 = highest detail).
+    """
+    if prev_lod < 0:
+        return compute_lod_level(distance, lod_distances)
+
+    # Upgrade (reduce LOD number = more detail): require distance to be
+    # clearly inside the better band (threshold * (1 - hysteresis)).
+    # Downgrade (increase LOD number = less detail): require distance to
+    # exceed threshold * (1 + hysteresis).
+    new_lod = compute_lod_level(distance, lod_distances)
+    if new_lod < prev_lod:
+        # Upgrading — use tighter threshold
+        lod_tight = compute_lod_level(
+            distance / (1.0 - hysteresis), lod_distances)
+        if lod_tight < prev_lod:
+            return new_lod
+        return prev_lod
+    elif new_lod > prev_lod:
+        # Downgrading — use looser threshold
+        lod_loose = compute_lod_level(
+            distance / (1.0 + hysteresis), lod_distances)
+        if lod_loose > prev_lod:
+            return new_lod
+        return prev_lod
+    return prev_lod
+
+
 def compute_lod_distances(tile_diagonal, factor=3.0, max_lod=3):
     """Compute LOD distance thresholds from tile geometry.
 
@@ -59,6 +109,50 @@ def compute_lod_distances(tile_diagonal, factor=3.0, max_lod=3):
         Distance thresholds for LOD 0 → 1, 1 → 2, etc.
     """
     return [tile_diagonal * factor * (2 ** i) for i in range(max_lod)]
+
+
+def compute_tile_roughness(tile_2d):
+    """Compute terrain roughness as std deviation from bilinear fit.
+
+    Fits a bilinear surface through the tile's four corners and
+    measures how much the actual terrain deviates.  Flat or planar
+    tiles score near zero; jagged ridgelines score high.
+
+    Parameters
+    ----------
+    tile_2d : np.ndarray
+        2D elevation array, shape ``(H, W)``.  May contain NaN.
+
+    Returns
+    -------
+    float
+        Standard deviation of elevation residuals (world-space units).
+        Returns 0.0 for degenerate tiles (all NaN or < 2×2).
+    """
+    h, w = tile_2d.shape
+    if h < 2 or w < 2:
+        return 0.0
+
+    # Corner elevations — fall back to tile nanmean if a corner is NaN
+    corners = np.array([tile_2d[0, 0], tile_2d[0, -1],
+                        tile_2d[-1, 0], tile_2d[-1, -1]])
+    valid = ~np.isnan(corners)
+    if not np.any(valid):
+        return 0.0
+    fill = float(np.mean(corners[valid]))
+    c00 = corners[0] if valid[0] else fill
+    c01 = corners[1] if valid[1] else fill
+    c10 = corners[2] if valid[2] else fill
+    c11 = corners[3] if valid[3] else fill
+
+    # Bilinear interpolation between corners
+    ys = np.linspace(0.0, 1.0, h, dtype=np.float32).reshape(h, 1)
+    xs = np.linspace(0.0, 1.0, w, dtype=np.float32).reshape(1, w)
+    bilinear = (c00 * (1 - xs) * (1 - ys) + c01 * xs * (1 - ys)
+                + c10 * (1 - xs) * ys + c11 * xs * ys)
+
+    residuals = tile_2d - bilinear
+    return float(np.nanstd(residuals))
 
 
 def simplify_mesh(vertices, indices, ratio):

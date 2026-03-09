@@ -8,7 +8,7 @@ def _rasterize_waterways_to_dem(water_geojson, terrain, elev_np, ocean):
     """Rasterize Overture waterway features into a burn-depth grid.
 
     Carves LineStrings (rivers/streams) and fills Polygons (lakes) into
-    the DEM so the D8 algorithm routes flow through known channels.
+    the DEM so the MFD algorithm routes flow through known channels.
 
     Returns a float32 array of burn depths (positive = carve down),
     or None if no features were rasterized.
@@ -441,9 +441,9 @@ def quickstart(
     wind : bool
         Fetch live wind data from Open-Meteo.  Default ``True``.
     hydro : bool
-        Compute D8 flow direction and flow accumulation from the terrain
-        using xarray-spatial and enable hydro flow particle animation
-        (Shift+Y).  Default ``False``.
+        Compute flow accumulation from the terrain using xarray-spatial
+        and enable MFD hydro flow particle animation (Shift+Y).
+        Default ``False``.
     coast_distance : bool
         Compute terrain-aware surface distance from the coast using
         xrspatial's ``surface_distance`` (3-D Dijkstra).  Adds a
@@ -599,10 +599,10 @@ def quickstart(
         try:
             import gc
             from xrspatial import fill as _fill
-            from xrspatial import flow_direction as _flow_direction
-            from xrspatial import flow_accumulation as _flow_accumulation
-            from xrspatial import stream_order as _stream_order
-            from xrspatial import stream_link as _stream_link
+            from xrspatial import flow_direction_mfd as _flow_direction_mfd
+            from xrspatial import flow_accumulation_mfd as _flow_accumulation_mfd
+            from xrspatial import stream_order_mfd as _stream_order_mfd
+            from xrspatial import stream_link_mfd as _stream_link_mfd
 
             print("Conditioning DEM for hydrological flow...")
             from scipy.ndimage import uniform_filter as _uniform_filter
@@ -630,7 +630,7 @@ def quickstart(
                         print(f"  Waterway GeoJSON load failed: {_e}")
 
             # 1b. Burn Overture waterways into the DEM — carve known
-            #     river/stream channels so D8 routes through them.
+            #     river/stream channels so MFD routes through them.
             if _water_geojson is not None:
                 try:
                     _ww_burn = _rasterize_waterways_to_dem(
@@ -675,27 +675,30 @@ def quickstart(
                 resolved[ocean] = -100.0
             del ocean_gradient
 
-            # 3c. Channel burning — compute an initial flow
+            # 3c. Channel burning — compute an initial MFD flow
             #     accumulation, then lower high-accumulation cells
             #     to carve channels into the DEM. Re-fill and
             #     re-compute so streams connect into a network.
-            _fd0 = _flow_direction(terrain.copy(data=resolved))
-            _fa0 = _flow_accumulation(_fd0)
-            del _fd0
-            _fa0_np = _fa0.data.get() if is_cupy else np.asarray(_fa0.data)
-            _fa0_np = np.nan_to_num(_fa0_np, nan=0.0)
+            xp = _cp if is_cupy else np   # array module for GPU/CPU
+            _fd_mfd0 = _flow_direction_mfd(terrain.copy(data=resolved))
+            _fa0 = _flow_accumulation_mfd(_fd_mfd0)
+            del _fd_mfd0
+            _fa0_data = xp.nan_to_num(_fa0.data, nan=0.0)
             del _fa0
 
             # Burn proportional to log(accumulation): cells with
             # more upstream area get carved deeper (up to ~2 m).
-            _log_acc = np.log10(np.clip(_fa0_np, 1, None))
-            _log_max = max(_log_acc.max(), 1.0)
+            _log_acc = xp.log10(xp.clip(_fa0_data, 1, None))
+            _log_max = max(float(_log_acc.max()), 1.0)
             _burn = (_log_acc / _log_max) * 2.0  # 0–2 m carve
-            _burn[ocean] = 0.0
-            del _fa0_np, _log_acc
+            if is_cupy:
+                _burn[_cp.asarray(ocean)] = 0.0
+            else:
+                _burn[ocean] = 0.0
+            del _fa0_data, _log_acc
 
             if is_cupy:
-                resolved = resolved - _cp.asarray(_burn.astype(np.float32))
+                resolved = resolved - _burn.astype(_cp.float32)
                 resolved[_cp.asarray(ocean)] = -100.0
             else:
                 resolved -= _burn.astype(np.float32)
@@ -725,44 +728,38 @@ def quickstart(
                 _cp.get_default_memory_pool().free_all_blocks()
             gc.collect()
 
-            # 4. Compute final D8 flow direction and accumulation.
-            fd = _flow_direction(terrain.copy(data=resolved))
-            del resolved
-            fa = _flow_accumulation(fd)
+            # 4. Compute final MFD flow direction and accumulation.
+            _resolved_da = terrain.copy(data=resolved)
+            fd_mfd = _flow_direction_mfd(_resolved_da)
+            fa_mfd = _flow_accumulation_mfd(fd_mfd)
+            del _resolved_da, resolved
 
-            # 5. Compute Strahler stream order — only stream cells
-            #    (accum >= threshold) get an order; rest are NaN.
-            so = _stream_order(fd, fa, threshold=50)
+            # 5. Compute Strahler stream order (MFD) — only stream
+            #    cells (accum >= threshold) get an order; rest are NaN.
+            so = _stream_order_mfd(fd_mfd, fa_mfd, threshold=50)
 
-            # 5b. Compute stream link — unique segment IDs per reach.
-            sl = _stream_link(fd, fa, threshold=50)
+            # 5b. Compute stream link (MFD) — unique segment IDs.
+            sl = _stream_link_mfd(fd_mfd, fa_mfd, threshold=50)
 
-            # 6. Mask ocean back to NaN/0 in the output grids.
-            fd_out = fd.data
-            fa_out = fa.data
+            # 6. Mask ocean back to NaN in the output grids.
+            fa_mfd_out = fa_mfd.data
+            fd_mfd_out = fd_mfd.data   # (8, H, W)
             so_out = so.data
-            if is_cupy:
-                ocean_gpu = _cp.asarray(ocean)
-                fd_out[ocean_gpu] = _cp.nan
-                fa_out[ocean_gpu] = _cp.nan
-                so_out[ocean_gpu] = _cp.nan
-            else:
-                fd_out[ocean] = np.nan
-                fa_out[ocean] = np.nan
-                so_out[ocean] = np.nan
-
-            # Add stream_link to the dataset so it shows up as an
-            # overlay layer (G key) with palette-matched colors.
             _sl_out = sl.data
             if is_cupy:
+                ocean_gpu = _cp.asarray(ocean)
+                fa_mfd_out[ocean_gpu] = _cp.nan
+                fd_mfd_out[:, ocean_gpu] = _cp.nan
+                so_out[ocean_gpu] = _cp.nan
                 _sl_out[ocean_gpu] = _cp.nan
             else:
+                fa_mfd_out[ocean] = np.nan
+                fd_mfd_out[:, ocean] = np.nan
+                so_out[ocean] = np.nan
                 _sl_out[ocean] = np.nan
-            _sl_np = _sl_out.get() if is_cupy else np.asarray(_sl_out)
-            _sl_clean = np.nan_to_num(_sl_np, nan=0.0).astype(np.float32)
-            if is_cupy:
-                _sl_clean = _cp.asarray(_sl_clean)
-            del _sl_np
+
+            # Clean stream_link for overlay (stay on GPU when possible)
+            _sl_clean = xp.nan_to_num(_sl_out, nan=0.0).astype(xp.float32)
 
             # 6b. Burn Overture waterways into stream_link + stream_order
             #     so they appear in the overlay with the water shader.
@@ -792,11 +789,20 @@ def quickstart(
                 except Exception as _e2:
                     print(f"  Waterway overlay burn skipped: {_e2}")
 
-            # 6c. Trace tributary network via flow_path
+            # 6c. Trace tributary network via flow_path (D8-only).
+            #     Compute a lightweight D8 fd/fa from the raw terrain
+            #     since the conditioned DEM was already released.
             if _water_geojson is not None:
                 try:
+                    from xrspatial import (
+                        flow_direction as _flow_direction,
+                        flow_accumulation as _flow_accumulation,
+                    )
+                    _fd_d8 = _flow_direction(terrain)
+                    _fa_d8 = _flow_accumulation(_fd_d8)
                     _trib, _ww_net = _trace_tributaries_flow_path(
-                        fd, fa, _water_geojson, terrain, ocean)
+                        _fd_d8, _fa_d8, _water_geojson, terrain, ocean)
+                    del _fd_d8, _fa_d8
                     if _trib is not None:
                         _so_np3 = so_out.get() if is_cupy else np.asarray(so_out)
                         _so_np3 = np.nan_to_num(_so_np3, nan=0.0).astype(
@@ -805,13 +811,11 @@ def quickstart(
                             _sl_clean)
                         _sl_np3 = np.array(_sl_np3, dtype=np.float32)
                         _max_link3 = int(_sl_np3.max()) + 1
-                        # New waterway-channel cells → stream_order 3
                         _new_ww = _ww_net & (_sl_np3 == 0) & (~ocean)
                         _sl_np3[_new_ww] = _max_link3
                         _so_np3[_new_ww] = np.maximum(
                             _so_np3[_new_ww], 3.0)
                         _max_link3 += 1
-                        # New tributary cells → stream_order 1
                         _new_trib = _trib & (_sl_np3 == 0) & (~ocean)
                         _sl_np3[_new_trib] = _max_link3
                         _so_np3[_new_trib] = np.maximum(
@@ -831,18 +835,18 @@ def quickstart(
                     print(f"  flow_path tracing skipped: {_e3}")
 
             # Drop xrspatial DataArray wrappers — we only need .data
-            del fd, fa, so, sl
+            del fd_mfd, fa_mfd, so, sl
 
             ds['stream_link'] = terrain.copy(data=_sl_clean).rename(None)
 
             hydro_data = {
-                'flow_dir': fd_out,
-                'flow_accum': fa_out,
+                'flow_accum': fa_mfd_out,
+                'flow_dir_mfd': fd_mfd_out,
                 'stream_order': so_out,
                 'stream_link': _sl_out,
                 'accum_threshold': 50,
             }
-            del fd_out, fa_out, _sl_out
+            del fa_mfd_out, fd_mfd_out, _sl_out
             # Pass overrides from explore_kwargs if present
             for key in ('n_particles', 'max_age', 'trail_len', 'speed',
                         'accum_threshold', 'color', 'alpha', 'dot_radius'):

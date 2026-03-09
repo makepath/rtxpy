@@ -24,6 +24,8 @@ class TerrainState:
         '_coord_step_x', '_coord_step_y',
         '_reload_cooldown', '_last_reload_time',
         '_terrain_reload_future', '_terrain_reload_pool',
+        # World-space offset: keeps camera stable across terrain reloads
+        '_world_offset_x', '_world_offset_y',
         # LOD state
         'lod_enabled', '_terrain_lod_manager',
     )
@@ -66,6 +68,23 @@ class TerrainState:
         self._terrain_reload_future = None
         self._terrain_reload_pool = None
 
+        # World-space offset for stable camera across terrain reloads
+        self._world_offset_x = 0.0
+        self._world_offset_y = 0.0
+
         # LOD
         self.lod_enabled = False
         self._terrain_lod_manager = None
+
+    def clear_all_caches(self):
+        """Clear all terrain mesh caches (single-GAS, baked, and LOD tiles).
+
+        Call this when terrain data or resolution changes to ensure no
+        stale geometry survives across the different caching layers.
+        """
+        self._terrain_mesh_cache.clear()
+        self._baked_mesh_cache.clear()
+        if self._terrain_lod_manager is not None:
+            self._terrain_lod_manager._tile_cache.clear()
+            self._terrain_lod_manager._tile_lods.clear()
+            self._terrain_lod_manager._pyramid_cache.clear()

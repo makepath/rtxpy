@@ -2595,11 +2595,12 @@ class RTXAccessor:
                 mesh_type='heightfield', color_stretch='linear', title=None,
                 subsample=1, wind_data=None, weather_data=None,
                 hydro_data=None, gtfs_data=None,
-                terrain_loader=None,
+                terrain_loader=None, tile_data_fn=None,
                 scene_zarr=None, ao_samples=0, gi_bounces=1, denoise=False,
                 fog_density=0.0, fog_color=(0.7, 0.8, 0.9),
                 colormap=None, sun_azimuth=None, sun_altitude=None,
                 shadows=None, ambient=None,
+                lod=False,
                 repl=False, tour=None):
         """Launch an interactive terrain viewer with keyboard controls.
 
@@ -2741,6 +2742,7 @@ class RTXAccessor:
             gtfs_data=gtfs_data,
             accessor=self,
             terrain_loader=terrain_loader,
+            tile_data_fn=tile_data_fn,
             scene_zarr=scene_zarr,
             ao_samples=ao_samples,
             gi_bounces=gi_bounces,
@@ -2752,6 +2754,7 @@ class RTXAccessor:
             sun_altitude=sun_altitude,
             shadows=shadows,
             ambient=ambient,
+            lod=lod,
             repl=repl,
             tour=tour,
         )
@@ -3069,7 +3072,7 @@ class RTXDatasetAccessor:
                 subsample=1, wind_data=None, weather_data=None,
                 hydro_data=None,
                 gtfs_data=None,
-                terrain_loader=None,
+                terrain_loader=None, tile_data_fn=None,
                 scene_zarr=None,
                 ao_samples=0, gi_bounces=1, denoise=False,
                 fog_density=0.0, fog_color=(0.7, 0.8, 0.9),
@@ -3077,6 +3080,7 @@ class RTXDatasetAccessor:
                 shadows=None, ambient=None,
                 minimap_style=None, minimap_layer=None,
                 minimap_colors=None, info_text=None,
+                lod=False,
                 repl=False, tour=None):
         """Launch an interactive terrain viewer with Dataset variables as
         overlay layers cycled with the G key.
@@ -3183,6 +3187,7 @@ class RTXDatasetAccessor:
             gtfs_data=gtfs_data,
             accessor=terrain_da.rtx,
             terrain_loader=terrain_loader,
+            tile_data_fn=tile_data_fn,
             scene_zarr=scene_zarr,
             ao_samples=ao_samples,
             gi_bounces=gi_bounces,
@@ -3198,6 +3203,7 @@ class RTXDatasetAccessor:
             minimap_layer=minimap_layer,
             minimap_colors=minimap_colors,
             info_text=info_text,
+            lod=lod,
             repl=repl,
             tour=tour,
         )

@@ -68,4 +68,6 @@ struct Params
     int                    _pad0;              // padding for pointer alignment
     // --- point cloud fields (offset 88) ---
     float*                 point_colors;       // per-point RGBA (4 floats per point, indexed by primitive_id)
+    // --- smooth normal fields (offset 96) ---
+    unsigned long long*    smooth_normal_table; // [2*instanceId]=normals_ptr, [2*instanceId+1]=indices_ptr
 };

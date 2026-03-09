@@ -43,6 +43,8 @@ class _GASEntry:
     is_curve: bool = False  # True for round curve tube GAS
     is_heightfield: bool = False  # True for heightfield custom primitive GAS
     is_sphere: bool = False  # True for sphere primitive GAS (point clouds)
+    d_normals: Optional[cupy.ndarray] = None  # GPU per-vertex normals (N*3 float32)
+    d_indices: Optional[cupy.ndarray] = None  # GPU index buffer (M*3 int32) for normal lookup
 
 
 # -----------------------------------------------------------------------------
@@ -173,6 +175,9 @@ class _GeometryState:
         self.point_colors = None  # concatenated GPU buffer (built on demand)
         self.point_color_offsets = None  # GPU int32 per-instance offsets
 
+        # Smooth normal table — GPU uint64 array [2*N], built in _build_ias
+        self.d_smooth_normal_table = None
+
         # Device buffers for CPU->GPU transfers (per-instance)
         self.d_rays = None
         self.d_rays_size = 0
@@ -207,6 +212,9 @@ class _GeometryState:
         self.point_colors_per_gas = {}
         self.point_colors = None
         self.point_color_offsets = None
+
+        # Clear smooth normal table
+        self.d_smooth_normal_table = None
 
         # Reset to single-GAS mode
         self.single_gas_mode = True
@@ -693,8 +701,8 @@ def _init_optix(device: Optional[int] = None):
     # Create shader binding table
     _create_sbt()
 
-    # Allocate params buffer: 48 + 40 (heightfield) + 8 (point_colors) = 96
-    _state.d_params = cupy.zeros(96, dtype=cupy.uint8)
+    # Allocate params buffer: 48 + 40 (heightfield) + 8 (point_colors) + 8 (smooth_normal_table) = 104
+    _state.d_params = cupy.zeros(104, dtype=cupy.uint8)
 
     _state.initialized = True
     atexit.register(_cleanup_at_exit)
@@ -1274,7 +1282,7 @@ def _build_gas_for_curves(vertices, widths, indices, num_segments):
     return gas_handle, gas_buffer
 
 
-def _build_gas_for_heightfield(elevation_data, H, W, spacing_x, spacing_y, ve, tile_size):
+def _build_gas_for_heightfield(elevation_data, H, W, spacing_x, spacing_y, ve, tile_size, active_mask=None):
     """
     Build a GAS for heightfield terrain using custom AABB primitives.
 
@@ -1289,6 +1297,9 @@ def _build_gas_for_heightfield(elevation_data, H, W, spacing_x, spacing_y, ve, t
         spacing_y: World-space pixel spacing in Y
         ve: Vertical exaggeration factor
         tile_size: Tile dimension (e.g. 32)
+        active_mask: Optional numpy bool array of length num_tiles.
+            When provided, inactive tiles get zero-volume AABBs so only
+            a subset of the heightfield grid participates in ray tracing.
 
     Returns:
         Tuple of (gas_handle, gas_buffer, d_elevation, num_tiles_x, num_tiles_y)
@@ -1315,6 +1326,12 @@ def _build_gas_for_heightfield(elevation_data, H, W, spacing_x, spacing_y, ve, t
     for ty in range(num_tiles_y):
         for tx in range(num_tiles_x):
             tile_idx = ty * num_tiles_x + tx
+
+            # Skip inactive tiles (LOD-managed heightfield mode)
+            if active_mask is not None and not active_mask[tile_idx]:
+                base = tile_idx * 6
+                aabbs[base:base + 6] = 0.0
+                continue
 
             # Cell range for this tile
             c0 = tx * tile_size
@@ -1592,6 +1609,19 @@ def _build_ias(geom_state: _GeometryState):
 
     geom_state.ias_dirty = False
 
+    # Build smooth normal lookup table: [2*i]=normals_ptr, [2*i+1]=indices_ptr
+    has_any_normals = any(
+        e.d_normals is not None for e in geom_state.gas_entries.values())
+    if has_any_normals:
+        table = np.zeros(2 * num_instances, dtype=np.uint64)
+        for i, (gid, entry) in enumerate(geom_state.gas_entries.items()):
+            if entry.d_normals is not None and entry.d_indices is not None:
+                table[2 * i] = entry.d_normals.data.ptr
+                table[2 * i + 1] = entry.d_indices.data.ptr
+        geom_state.d_smooth_normal_table = cupy.asarray(table)
+    else:
+        geom_state.d_smooth_normal_table = None
+
 
 def _build_accel(geom_state: _GeometryState, hash_value: int, vertices, indices) -> int:
     """
@@ -1852,8 +1882,13 @@ def _trace_rays(geom_state: _GeometryState, rays, hits, num_rays: int,
     if geom_state.point_colors is not None:
         pc_colors_ptr = geom_state.point_colors.data.ptr
 
+    # Smooth normal table pointer
+    sn_table_ptr = 0
+    if geom_state.d_smooth_normal_table is not None:
+        sn_table_ptr = geom_state.d_smooth_normal_table.data.ptr
+
     params_data = struct.pack(
-        'QQQQQIIQiifffiiIQ',
+        'QQQQQIIQiifffiiIQQ',
         trace_handle,           # 8
         d_rays.data.ptr,        # 8
         d_hits.data.ptr,        # 8
@@ -1871,6 +1906,7 @@ def _trace_rays(geom_state: _GeometryState, rays, hits, num_rays: int,
         hf_ntx,                 # 4
         0,                      # 4 padding for alignment
         pc_colors_ptr,          # 8
+        sn_table_ptr,           # 8
     )
     _state.d_params[:] = cupy.frombuffer(np.frombuffer(params_data, dtype=np.uint8), dtype=cupy.uint8)
 
@@ -1879,7 +1915,7 @@ def _trace_rays(geom_state: _GeometryState, rays, hits, num_rays: int,
         _state.pipeline,
         0,  # stream
         _state.d_params.data.ptr,
-        96,  # sizeof(Params)
+        104,  # sizeof(Params)
         _state.sbt,
         num_rays,  # width
         1,  # height
@@ -2078,7 +2114,8 @@ class RTX:
 
     def add_geometry(self, geometry_id: str, vertices, indices,
                      transform: Optional[List[float]] = None,
-                     grid_dims: Optional[tuple] = None) -> int:
+                     grid_dims: Optional[tuple] = None,
+                     normals=None) -> int:
         """
         Add a geometry (GAS) to the scene with an optional transform.
 
@@ -2095,6 +2132,10 @@ class RTX:
             grid_dims: Optional (H, W) grid dimensions for cluster-accelerated
                       builds.  When provided and OptiX 9+ clusters are
                       available, uses the CLAS pipeline for faster BVH builds.
+            normals: Optional per-vertex normal buffer (flattened float32 array,
+                    3 floats per vertex).  When provided, the closest-hit
+                    shader interpolates smooth normals using barycentrics
+                    instead of computing flat face normals.
 
         Returns:
             0 on success, non-zero on error
@@ -2120,9 +2161,16 @@ class RTX:
 
         existing = self._geom_state.gas_entries.get(geometry_id)
         if existing is not None and existing.vertices_hash == vertices_hash:
-            # GAS already built for identical vertices — update transform only
+            # GAS already built for identical vertices — update transform/normals only
             if transform is not None:
                 existing.transform = list(transform)
+                self._geom_state.ias_dirty = True
+            if normals is not None:
+                existing.d_normals = cupy.asarray(
+                    np.asarray(normals, dtype=np.float32))
+                if existing.d_indices is None:
+                    existing.d_indices = cupy.asarray(
+                        np.asarray(indices, dtype=np.int32))
                 self._geom_state.ias_dirty = True
             return 0
 
@@ -2157,6 +2205,14 @@ class RTX:
         indices_np = indices.get() if isinstance(indices, cupy.ndarray) else np.asarray(indices)
         num_triangles = len(indices_np.ravel()) // 3
 
+        # Upload smooth normals and index buffer if provided
+        d_normals_gpu = None
+        d_indices_gpu = None
+        if normals is not None:
+            d_normals_gpu = cupy.asarray(
+                np.asarray(normals, dtype=np.float32))
+            d_indices_gpu = cupy.asarray(indices_np)
+
         # Create or update the GAS entry
         self._geom_state.gas_entries[geometry_id] = _GASEntry(
             gas_id=geometry_id,
@@ -2166,6 +2222,8 @@ class RTX:
             transform=transform,
             num_vertices=num_vertices,
             num_triangles=num_triangles,
+            d_normals=d_normals_gpu,
+            d_indices=d_indices_gpu,
         )
 
         # Mark IAS as needing rebuild
@@ -2258,7 +2316,9 @@ class RTX:
                                  H: int, W: int,
                                  spacing_x: float, spacing_y: float,
                                  ve: float = 1.0,
-                                 tile_size: int = 32) -> int:
+                                 tile_size: int = 32,
+                                 active_mask=None,
+                                 transform=None) -> int:
         """
         Add a heightfield terrain as a custom-primitive GAS.
 
@@ -2277,6 +2337,10 @@ class RTX:
             spacing_y: World-space pixel spacing in Y.
             ve: Vertical exaggeration. Default 1.0.
             tile_size: Tile dimension for AABB grouping. Default 32.
+            active_mask: Optional bool array (one per AABB tile). When
+                provided, inactive tiles get zero-volume AABBs.
+            transform: Optional 12-float affine transform (3x4 row-major).
+                Defaults to identity.
 
         Returns:
             0 on success, non-zero on error.
@@ -2300,7 +2364,7 @@ class RTX:
             elev_np = np.asarray(elevation, dtype=np.float32)
 
         gas_handle, gas_buffer, d_elevation, num_tiles_x, num_tiles_y = \
-            _build_gas_for_heightfield(elev_np, H, W, spacing_x, spacing_y, ve, tile_size)
+            _build_gas_for_heightfield(elev_np, H, W, spacing_x, spacing_y, ve, tile_size, active_mask)
 
         if gas_handle == 0:
             return -1
@@ -2315,12 +2379,12 @@ class RTX:
         self._geom_state.hf_tile_size = tile_size
         self._geom_state.hf_num_tiles_x = num_tiles_x
 
-        # Identity transform
-        transform = [
-            1.0, 0.0, 0.0, 0.0,
-            0.0, 1.0, 0.0, 0.0,
-            0.0, 0.0, 1.0, 0.0,
-        ]
+        if transform is None:
+            transform = [
+                1.0, 0.0, 0.0, 0.0,
+                0.0, 1.0, 0.0, 0.0,
+                0.0, 0.0, 1.0, 0.0,
+            ]
 
         # Compute hash for cache invalidation
         vertices_hash = hash(elev_np.tobytes())

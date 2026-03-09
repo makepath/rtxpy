@@ -7,11 +7,11 @@
 //
 
 .version 9.1
-.target sm_75
+.target sm_86
 .address_size 64
 
 	// .globl	__raygen__main
-.const .align 8 .b8 params[96];
+.const .align 8 .b8 params[104];
 
 .visible .entry __raygen__main()
 {
@@ -130,103 +130,174 @@ $L__BB0_4:
 	// .globl	__closesthit__chit
 .visible .entry __closesthit__chit()
 {
-	.reg .pred 	%p<3>;
-	.reg .f32 	%f<38>;
-	.reg .b32 	%r<34>;
-	.reg .b64 	%rd<3>;
+	.reg .pred 	%p<5>;
+	.reg .f32 	%f<77>;
+	.reg .b32 	%r<33>;
+	.reg .b64 	%rd<21>;
 
 
 	// begin inline asm
-	call (%f2), _optix_get_ray_tmax, ();
+	call (%f11), _optix_get_ray_tmax, ();
 	// end inline asm
 	// begin inline asm
-	call (%r8), _optix_read_primitive_idx, ();
+	call (%r2), _optix_read_primitive_idx, ();
 	// end inline asm
 	// begin inline asm
-	call (%r9), _optix_get_hit_kind, ();
+	call (%r3), _optix_get_hit_kind, ();
 	// end inline asm
-	setp.eq.s32 	%p1, %r9, 254;
+	setp.eq.s32 	%p1, %r3, 254;
 	@%p1 bra 	$L__BB2_2;
 
 	// begin inline asm
-	call (%r10), _optix_get_hit_kind, ();
+	call (%r4), _optix_get_hit_kind, ();
 	// end inline asm
-	setp.ne.s32 	%p2, %r10, 255;
-	mov.u32 	%r33, 1065353216;
-	mov.u32 	%r31, 0;
-	mov.u32 	%r32, %r31;
-	@%p2 bra 	$L__BB2_3;
+	setp.ne.s32 	%p2, %r4, 255;
+	mov.f32 	%f76, 0f3F800000;
+	mov.f32 	%f74, 0f00000000;
+	mov.f32 	%f75, %f74;
+	@%p2 bra 	$L__BB2_6;
 
 $L__BB2_2:
-	// begin inline asm
-	call (%rd1), _optix_get_gas_traversable_handle, ();
-	// end inline asm
-	// begin inline asm
-	call (%r14), _optix_read_sbt_gas_idx, ();
-	// end inline asm
-	// begin inline asm
-	call (%f3), _optix_get_ray_time, ();
-	// end inline asm
-	// begin inline asm
-	call (%f4, %f5, %f6, %f7, %f8, %f9, %f10, %f11, %f12), _optix_get_triangle_vertex_data, (%rd1, %r8, %r14, %f3);
-	// end inline asm
-	sub.ftz.f32 	%f14, %f7, %f4;
-	sub.ftz.f32 	%f15, %f8, %f5;
-	sub.ftz.f32 	%f16, %f9, %f6;
-	sub.ftz.f32 	%f17, %f10, %f4;
-	sub.ftz.f32 	%f18, %f11, %f5;
-	sub.ftz.f32 	%f19, %f12, %f6;
-	mul.ftz.f32 	%f20, %f15, %f19;
-	mul.ftz.f32 	%f21, %f16, %f18;
-	sub.ftz.f32 	%f22, %f20, %f21;
-	mul.ftz.f32 	%f23, %f14, %f19;
-	mul.ftz.f32 	%f24, %f16, %f17;
-	sub.ftz.f32 	%f25, %f23, %f24;
-	mul.ftz.f32 	%f26, %f14, %f18;
-	mul.ftz.f32 	%f27, %f15, %f17;
-	sub.ftz.f32 	%f28, %f26, %f27;
-	mul.ftz.f32 	%f29, %f25, %f25;
-	fma.rn.ftz.f32 	%f30, %f22, %f22, %f29;
-	fma.rn.ftz.f32 	%f31, %f28, %f28, %f30;
-	rsqrt.approx.ftz.f32 	%f32, %f31;
-	mul.ftz.f32 	%f33, %f32, %f22;
-	mul.ftz.f32 	%f34, %f25, %f32;
-	neg.ftz.f32 	%f35, %f34;
-	mul.ftz.f32 	%f36, %f32, %f28;
-	mov.b32 	%r31, %f33;
-	mov.b32 	%r32, %f35;
-	mov.b32 	%r33, %f36;
+	ld.const.u64 	%rd1, [params+96];
+	setp.eq.s64 	%p3, %rd1, 0;
+	@%p3 bra 	$L__BB2_5;
 
-$L__BB2_3:
-	cvt.rzi.ftz.u32.f32 	%r30, %f2;
-	cvt.rn.f32.u32 	%f37, %r30;
-	mov.b32 	%r18, %f37;
-	mov.u32 	%r17, 0;
 	// begin inline asm
-	call _optix_set_payload, (%r17, %r18);
+	call (%r5), _optix_read_instance_id, ();
 	// end inline asm
-	mov.u32 	%r19, 1;
+	shl.b32 	%r6, %r5, 1;
+	cvta.to.global.u64 	%rd4, %rd1;
+	mul.wide.u32 	%rd5, %r6, 8;
+	add.s64 	%rd2, %rd4, %rd5;
+	ld.global.u64 	%rd3, [%rd2];
+	setp.eq.s64 	%p4, %rd3, 0;
+	@%p4 bra 	$L__BB2_5;
+
+	ld.global.u64 	%rd6, [%rd2+8];
 	// begin inline asm
-	call _optix_set_payload, (%r19, %r31);
+	call (%f15, %f16), _optix_get_triangle_barycentrics, ();
 	// end inline asm
-	mov.u32 	%r21, 2;
+	mov.f32 	%f17, 0f3F800000;
+	sub.ftz.f32 	%f18, %f17, %f15;
+	sub.ftz.f32 	%f19, %f18, %f16;
+	mul.lo.s32 	%r7, %r2, 3;
+	mul.wide.u32 	%rd7, %r7, 4;
+	add.s64 	%rd8, %rd6, %rd7;
+	add.s32 	%r8, %r7, 1;
+	mul.wide.u32 	%rd9, %r8, 4;
+	add.s64 	%rd10, %rd6, %rd9;
+	add.s32 	%r9, %r7, 2;
+	mul.wide.u32 	%rd11, %r9, 4;
+	add.s64 	%rd12, %rd6, %rd11;
+	ld.u32 	%r10, [%rd8];
+	mul.lo.s32 	%r11, %r10, 3;
+	mul.wide.s32 	%rd13, %r11, 4;
+	add.s64 	%rd14, %rd3, %rd13;
+	ld.f32 	%f20, [%rd14];
+	mul.ftz.f32 	%f21, %f20, %f19;
+	ld.u32 	%r12, [%rd10];
+	mul.lo.s32 	%r13, %r12, 3;
+	mul.wide.s32 	%rd15, %r13, 4;
+	add.s64 	%rd16, %rd3, %rd15;
+	ld.f32 	%f22, [%rd16];
+	fma.rn.ftz.f32 	%f23, %f15, %f22, %f21;
+	ld.u32 	%r14, [%rd12];
+	mul.lo.s32 	%r15, %r14, 3;
+	mul.wide.s32 	%rd17, %r15, 4;
+	add.s64 	%rd18, %rd3, %rd17;
+	ld.f32 	%f24, [%rd18];
+	fma.rn.ftz.f32 	%f25, %f16, %f24, %f23;
+	ld.f32 	%f26, [%rd14+4];
+	ld.f32 	%f27, [%rd16+4];
+	mul.ftz.f32 	%f28, %f15, %f27;
+	fma.rn.ftz.f32 	%f29, %f19, %f26, %f28;
+	ld.f32 	%f30, [%rd18+4];
+	fma.rn.ftz.f32 	%f31, %f16, %f30, %f29;
+	ld.f32 	%f32, [%rd14+8];
+	ld.f32 	%f33, [%rd16+8];
+	mul.ftz.f32 	%f34, %f15, %f33;
+	fma.rn.ftz.f32 	%f35, %f19, %f32, %f34;
+	ld.f32 	%f36, [%rd18+8];
+	fma.rn.ftz.f32 	%f37, %f16, %f36, %f35;
+	mul.ftz.f32 	%f38, %f31, %f31;
+	fma.rn.ftz.f32 	%f39, %f25, %f25, %f38;
+	fma.rn.ftz.f32 	%f40, %f37, %f37, %f39;
+	rsqrt.approx.ftz.f32 	%f41, %f40;
+	mul.ftz.f32 	%f74, %f41, %f25;
+	mul.ftz.f32 	%f75, %f41, %f31;
+	mul.ftz.f32 	%f76, %f41, %f37;
+	bra.uni 	$L__BB2_6;
+
+$L__BB2_5:
 	// begin inline asm
-	call _optix_set_payload, (%r21, %r32);
+	call (%rd19), _optix_get_gas_traversable_handle, ();
 	// end inline asm
-	mov.u32 	%r23, 3;
 	// begin inline asm
-	call _optix_set_payload, (%r23, %r33);
-	// end inline asm
-	mov.u32 	%r25, 4;
-	// begin inline asm
-	call _optix_set_payload, (%r25, %r8);
+	call (%r16), _optix_read_sbt_gas_idx, ();
 	// end inline asm
 	// begin inline asm
-	call (%r27), _optix_read_instance_id, ();
+	call (%f42), _optix_get_ray_time, ();
 	// end inline asm
-	mov.u32 	%r28, 5;
 	// begin inline asm
-	call _optix_set_payload, (%r28, %r27);
+	call (%f43, %f44, %f45, %f46, %f47, %f48, %f49, %f50, %f51), _optix_get_triangle_vertex_data, (%rd19, %r2, %r16, %f42);
+	// end inline asm
+	sub.ftz.f32 	%f53, %f46, %f43;
+	sub.ftz.f32 	%f54, %f47, %f44;
+	sub.ftz.f32 	%f55, %f48, %f45;
+	sub.ftz.f32 	%f56, %f49, %f43;
+	sub.ftz.f32 	%f57, %f50, %f44;
+	sub.ftz.f32 	%f58, %f51, %f45;
+	mul.ftz.f32 	%f59, %f54, %f58;
+	mul.ftz.f32 	%f60, %f55, %f57;
+	sub.ftz.f32 	%f61, %f59, %f60;
+	mul.ftz.f32 	%f62, %f53, %f58;
+	mul.ftz.f32 	%f63, %f55, %f56;
+	sub.ftz.f32 	%f64, %f62, %f63;
+	mul.ftz.f32 	%f65, %f53, %f57;
+	mul.ftz.f32 	%f66, %f54, %f56;
+	sub.ftz.f32 	%f67, %f65, %f66;
+	mul.ftz.f32 	%f68, %f64, %f64;
+	fma.rn.ftz.f32 	%f69, %f61, %f61, %f68;
+	fma.rn.ftz.f32 	%f70, %f67, %f67, %f69;
+	rsqrt.approx.ftz.f32 	%f71, %f70;
+	mul.ftz.f32 	%f74, %f71, %f61;
+	mul.ftz.f32 	%f72, %f64, %f71;
+	neg.ftz.f32 	%f75, %f72;
+	mul.ftz.f32 	%f76, %f71, %f67;
+
+$L__BB2_6:
+	cvt.rzi.ftz.u32.f32 	%r32, %f11;
+	cvt.rn.f32.u32 	%f73, %r32;
+	mov.b32 	%r20, %f73;
+	mov.u32 	%r19, 0;
+	// begin inline asm
+	call _optix_set_payload, (%r19, %r20);
+	// end inline asm
+	mov.b32 	%r22, %f74;
+	mov.u32 	%r21, 1;
+	// begin inline asm
+	call _optix_set_payload, (%r21, %r22);
+	// end inline asm
+	mov.b32 	%r24, %f75;
+	mov.u32 	%r23, 2;
+	// begin inline asm
+	call _optix_set_payload, (%r23, %r24);
+	// end inline asm
+	mov.b32 	%r26, %f76;
+	mov.u32 	%r25, 3;
+	// begin inline asm
+	call _optix_set_payload, (%r25, %r26);
+	// end inline asm
+	mov.u32 	%r27, 4;
+	// begin inline asm
+	call _optix_set_payload, (%r27, %r2);
+	// end inline asm
+	// begin inline asm
+	call (%r29), _optix_read_instance_id, ();
+	// end inline asm
+	mov.u32 	%r30, 5;
+	// begin inline asm
+	call _optix_set_payload, (%r30, %r29);
 	// end inline asm
 	ret;
 
