@@ -22,6 +22,8 @@ from .mesh_store import (
     save_meshes_to_zarr,
     load_meshes_from_zarr,
     chunks_for_pixel_window,
+    validate_scene,
+    SCENE_VERSION,
 )
 from .lod import (
     compute_lod_level,

@@ -388,3 +388,137 @@ def load_meshes_from_zarr(zarr_path, chunks=None):
                                np.empty(0, dtype=np.int32))
 
     return meshes, colors, meta, curves, spheres
+
+
+# ---------------------------------------------------------------------------
+# Scene validation
+# ---------------------------------------------------------------------------
+
+SCENE_VERSION = "1.0"
+
+
+def validate_scene(zarr_path):
+    """Validate a zarr store against the rtxpy scene specification.
+
+    Returns a list of ``(level, message)`` tuples where *level* is
+    ``"error"`` for spec violations that would prevent loading, or
+    ``"warning"`` for non-conforming optional data.
+
+    An empty list means the scene is valid.
+
+    Parameters
+    ----------
+    zarr_path : str or Path
+        Path to the zarr store.
+    """
+    issues = []
+    try:
+        store = zarr.open(str(zarr_path), mode='r', use_consolidated=False)
+    except Exception as exc:
+        return [("error", f"Cannot open zarr store: {exc}")]
+
+    def _err(msg):
+        issues.append(("error", msg))
+
+    def _warn(msg):
+        issues.append(("warning", msg))
+
+    # -- Root attributes --
+    if 'rtxpy_scene_version' not in store.attrs:
+        _warn("Missing root attribute 'rtxpy_scene_version'")
+
+    # -- elevation --
+    if 'elevation' not in store:
+        _err("Missing required array 'elevation'")
+    else:
+        elev = store['elevation']
+        for attr in ('scale_factor', 'add_offset', '_FillValue'):
+            if attr not in elev.attrs:
+                _warn(f"elevation: missing CF attribute '{attr}'")
+
+    # -- spatial_ref --
+    if 'spatial_ref' not in store:
+        _err("Missing required variable 'spatial_ref'")
+    else:
+        sr = store['spatial_ref']
+        for attr in ('crs_wkt', 'GeoTransform'):
+            if attr not in sr.attrs:
+                _warn(f"spatial_ref: missing attribute '{attr}'")
+
+    # -- meshes (optional) --
+    if 'meshes' in store:
+        mg = store['meshes']
+        for attr in ('pixel_spacing', 'elevation_shape', 'elevation_chunks'):
+            if attr not in mg.attrs:
+                _warn(f"meshes: missing attribute '{attr}'")
+        for gid in mg:
+            gg = mg[gid]
+            if not hasattr(gg, 'attrs'):
+                continue
+            if 'color' not in gg.attrs:
+                _warn(f"meshes/{gid}: missing 'color' attribute")
+            geom_type = gg.attrs.get('type', '')
+            for key in gg:
+                if key in ('vertices', 'indices', 'widths',
+                           'centers', 'radii', 'colors'):
+                    continue
+                cg = gg[key]
+                if not hasattr(cg, 'keys'):
+                    continue
+                if geom_type == 'sphere':
+                    if 'centers' not in cg:
+                        _warn(f"meshes/{gid}/{key}: missing 'centers'")
+                    if 'radii' not in cg:
+                        _warn(f"meshes/{gid}/{key}: missing 'radii'")
+                else:
+                    if 'vertices' not in cg:
+                        _warn(f"meshes/{gid}/{key}: missing 'vertices'")
+                    if 'indices' not in cg:
+                        _warn(f"meshes/{gid}/{key}: missing 'indices'")
+                    if geom_type == 'curve' and 'widths' not in cg:
+                        _warn(f"meshes/{gid}/{key}: missing 'widths'")
+
+    # -- overlays (optional) --
+    if 'overlays' in store:
+        elev_shape = None
+        if 'elevation' in store:
+            elev_shape = store['elevation'].shape
+        for name in store['overlays']:
+            og = store['overlays'][name]
+            if 'data' not in og:
+                _warn(f"overlays/{name}: missing 'data' array")
+            elif elev_shape is not None:
+                if og['data'].shape != elev_shape:
+                    _warn(f"overlays/{name}: shape {og['data'].shape} "
+                          f"doesn't match elevation {elev_shape}")
+
+    # -- wind (optional) --
+    if 'wind' in store:
+        wg = store['wind']
+        for arr in ('u', 'v'):
+            if arr not in wg:
+                _warn(f"wind: missing array '{arr}'")
+        if 'grid_bounds' not in wg.attrs:
+            _warn("wind: missing 'grid_bounds' attribute")
+
+    # -- hydro (optional) --
+    if 'hydro' in store:
+        hg = store['hydro']
+        for arr in ('flow_accum', 'flow_dir_mfd'):
+            if arr not in hg:
+                _warn(f"hydro: missing array '{arr}'")
+
+    # -- tour (optional) --
+    if 'tour' in store:
+        tg = store['tour']
+        required_tour = ('time', 'position', 'yaw', 'pitch')
+        lengths = {}
+        for arr in required_tour:
+            if arr not in tg:
+                _warn(f"tour: missing array '{arr}'")
+            else:
+                lengths[arr] = tg[arr].shape[0]
+        if len(set(lengths.values())) > 1:
+            _warn(f"tour: arrays have mismatched lengths: {lengths}")
+
+    return issues
