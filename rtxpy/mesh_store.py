@@ -478,6 +478,19 @@ def validate_scene(zarr_path):
                         _warn(f"meshes/{gid}/{key}: missing 'centers'")
                     if 'radii' not in cg:
                         _warn(f"meshes/{gid}/{key}: missing 'radii'")
+                    # Point cloud attribute length consistency
+                    if 'centers' in cg:
+                        n_pts = cg['centers'].shape[0] // 3
+                        for pc_attr in ('classification', 'intensity',
+                                        'return_number', 'number_of_returns'):
+                            if pc_attr in cg:
+                                if cg[pc_attr].shape[0] != n_pts:
+                                    _warn(
+                                        f"meshes/{gid}/{key}: "
+                                        f"'{pc_attr}' length "
+                                        f"{cg[pc_attr].shape[0]} != "
+                                        f"point count {n_pts}"
+                                    )
                 else:
                     if 'vertices' not in cg:
                         _warn(f"meshes/{gid}/{key}: missing 'vertices'")

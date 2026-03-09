@@ -302,6 +302,31 @@ Used for LiDAR point clouds and scattered point data.
 | `centers` | float32 | (N*3,) | Sphere center xyz, flat |
 | `radii` | float32 | (N,) | Per-sphere radius |
 | `colors` | float32 | (N*4,) | Per-sphere RGBA, optional |
+| `classification` | int32 | (N,) | ASPRS classification code per point, optional |
+| `intensity` | float32 | (N,) | Normalized intensity [0-1] per point, optional |
+| `rgb` | float32 | (N*3,) | RGB color per point [0-1], flat, optional |
+| `return_number` | int32 | (N,) | Return number per point, optional |
+| `number_of_returns` | int32 | (N,) | Total returns per pulse per point, optional |
+
+The `colors` array stores the rendered RGBA used by the viewer (typically
+derived from one of the attribute arrays via `build_colors()`). The raw
+attribute arrays (`classification`, `intensity`, `rgb`, `return_number`)
+are stored separately so the viewer can cycle color modes at runtime
+(elevation, intensity, classification, RGB — toggled with the
+point cloud color mode key).
+
+**Attributes** on sphere geometry groups:
+
+| Attribute | Type | Description |
+|-----------|------|-------------|
+| `color_mode` | string | Default color mode: `"elevation"`, `"intensity"`, `"classification"`, or `"rgb"` |
+| `source_crs` | string | Optional WKT of the original LAS/LAZ CRS before reprojection |
+| `point_count` | int | Total number of points (redundant with array length, but quick metadata lookup) |
+
+When `classification` is present, the viewer can apply ASPRS standard colors
+(ground=brown, vegetation=green, building=red, water=blue, etc.) from the
+`CLASSIFICATION_COLORS` table in `pointcloud.py` without re-reading the
+source file.
 
 ### Chunking alignment
 

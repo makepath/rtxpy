@@ -280,6 +280,54 @@ def test_mesh_lod_partial_warns(scene_dir):
     assert any("partial LOD 1" in w for w in warnings)
 
 
+def test_pointcloud_valid(scene_dir):
+    """Sphere geometry with point cloud attributes should pass clean."""
+    store = _make_minimal_scene(scene_dir)
+    mg = store.create_group('meshes')
+    mg.attrs['pixel_spacing'] = [30.0, 30.0]
+    mg.attrs['elevation_shape'] = [64, 64]
+    mg.attrs['elevation_chunks'] = [64, 64]
+
+    gg = mg.create_group('lidar')
+    gg.attrs['color'] = [0.5, 0.5, 0.5, 5.0]
+    gg.attrs['type'] = 'sphere'
+    cg = gg.create_group('0_0')
+    n_pts = 100
+    cg.create_array('centers', data=np.zeros(n_pts * 3, dtype=np.float32))
+    cg.create_array('radii', data=np.ones(n_pts, dtype=np.float32))
+    cg.create_array('colors', data=np.ones(n_pts * 4, dtype=np.float32))
+    cg.create_array('classification', data=np.full(n_pts, 2, dtype=np.int32))
+    cg.create_array('intensity', data=np.zeros(n_pts, dtype=np.float32))
+    cg.create_array('rgb', data=np.zeros(n_pts * 3, dtype=np.float32))
+
+    issues = validate_scene(scene_dir)
+    pc_issues = [msg for lvl, msg in issues if "lidar" in msg]
+    assert pc_issues == []
+
+
+def test_pointcloud_attr_length_mismatch_warns(scene_dir):
+    """Classification array with wrong length should warn."""
+    store = _make_minimal_scene(scene_dir)
+    mg = store.create_group('meshes')
+    mg.attrs['pixel_spacing'] = [30.0, 30.0]
+    mg.attrs['elevation_shape'] = [64, 64]
+    mg.attrs['elevation_chunks'] = [64, 64]
+
+    gg = mg.create_group('lidar')
+    gg.attrs['color'] = [0.5, 0.5, 0.5, 5.0]
+    gg.attrs['type'] = 'sphere'
+    cg = gg.create_group('0_0')
+    n_pts = 50
+    cg.create_array('centers', data=np.zeros(n_pts * 3, dtype=np.float32))
+    cg.create_array('radii', data=np.ones(n_pts, dtype=np.float32))
+    # Wrong length — 30 instead of 50
+    cg.create_array('classification', data=np.full(30, 2, dtype=np.int32))
+
+    issues = validate_scene(scene_dir)
+    warnings = [msg for lvl, msg in issues if lvl == "warning"]
+    assert any("classification" in w and "length" in w for w in warnings)
+
+
 def test_mesh_lod_complete_ok(scene_dir):
     """Complete LOD arrays should not warn."""
     store = _make_minimal_scene(scene_dir)
