@@ -23,7 +23,7 @@ scene.zarr/
   elevation_lod4/                  # optional LOD pyramid level (4x downsample)
   elevation_lod8/                  # ...up to elevation_lod64
   elevation_roughness/             # optional per-tile roughness for adaptive LOD
-  spatial_ref                      # scalar variable with CRS attributes
+  spatial_ref                      # scene CRS (crs_wkt, GeoTransform, epsg)
   meshes/                          # placed geometry (buildings, roads, water, etc.)
     {geometry_id}/
       {chunk_row}_{chunk_col}/
@@ -215,12 +215,16 @@ active — the work was done at scene build time.
 ## spatial_ref
 
 A scalar int32 variable carrying CRS metadata as attributes. Follows the CF
-grid_mapping convention used by rioxarray.
+grid_mapping convention used by rioxarray. This is the single source of
+truth for the scene's coordinate reference system — all spatial data in the
+store (elevation, meshes, overlays, wind/hydro/weather grid bounds) is in
+this CRS unless explicitly noted otherwise.
 
 | Attribute | Type | Description |
 |-----------|------|-------------|
 | `crs_wkt` | string | WKT2 representation of the coordinate reference system |
 | `GeoTransform` | string | Six space-separated values: `"x_origin dx rot_x y_origin rot_y dy"` |
+| `epsg` | int | Optional EPSG code (e.g. 32617 for UTM zone 17N). Redundant with `crs_wkt` but convenient for quick lookup |
 
 The GeoTransform matches GDAL conventions. For a north-up raster with no
 rotation: `x_origin` is the west edge, `dx` is positive pixel width,
@@ -228,6 +232,41 @@ rotation: `x_origin` is the west edge, `dx` is positive pixel width,
 
 explore() uses this to set up CRS transforms for streaming tile I/O and
 coordinate display.
+
+## Coordinate reference system
+
+All spatial coordinates in the store share one CRS, defined by
+`spatial_ref.crs_wkt`. Typical scene CRS values:
+
+| CRS type | Example | Units | When used |
+|----------|---------|-------|-----------|
+| UTM zone | EPSG:32617 | meters | Most scenes — `fetch_dem()` reprojects to local UTM |
+| Geographic | EPSG:4326 | degrees | Rare — only if the source DEM is unprojected |
+| State Plane | EPSG:2263 | feet | LiDAR data in local survey CRS |
+
+The scene CRS determines:
+
+- **elevation** `x` and `y` coordinate arrays (pixel center positions in CRS units)
+- **mesh vertex** world coordinates (`world_x = pixel_col * pixel_spacing_x`)
+- **wind/weather/hydro** `grid_bounds` (extent in CRS coordinates)
+- **camera** position (world coordinates = CRS units)
+- **observer** positions and tour keyframes
+
+The root attribute `bounds_lonlat` is always WGS84 (EPSG:4326), regardless
+of the scene CRS. It's there for quick geographic lookup ("where on Earth is
+this scene?") without parsing the CRS or coordinate arrays.
+
+**Point clouds** may carry a `source_crs` attribute on their geometry group
+recording the original LAS/LAZ CRS before reprojection. The stored vertex
+coordinates are already in the scene CRS — `source_crs` is provenance only.
+
+**Streaming tiles** use the CRS transform derived from `spatial_ref` to
+convert pixel indices back to CRS coordinates for the `tile_data_fn`
+callback. The `GeoTransform` encodes this mapping:
+```
+crs_x = x_origin + pixel_col * dx
+crs_y = y_origin + pixel_row * dy
+```
 
 ## meshes
 
@@ -388,10 +427,15 @@ bounds.
 
 | Attribute | Type | Description |
 |-----------|------|-------------|
-| `grid_bounds` | {x0, y0, x1, y1} | World-space extent of the wind grid |
+| `grid_bounds` | {x0, y0, x1, y1} | Extent in scene CRS coordinates |
 | `grid_size` | int | Grid resolution (e.g. 20) |
 | `source_time` | string | ISO 8601 timestamp of the forecast data |
 | `source` | string | Data source (e.g. `"open-meteo"`) |
+
+`grid_bounds` uses the scene CRS (from `spatial_ref`). The viewer bilinearly
+interpolates the coarse wind grid onto the terrain's pixel grid at runtime,
+so the wind grid doesn't need to match the elevation resolution or chunk
+layout.
 
 ## hydro
 
@@ -445,9 +489,11 @@ Like wind, the grid dimensions are independent of the elevation grid.
 
 | Attribute | Type | Description |
 |-----------|------|-------------|
-| `grid_bounds` | {x0, y0, x1, y1} | World-space extent |
+| `grid_bounds` | {x0, y0, x1, y1} | Extent in scene CRS coordinates |
 | `grid_size` | int | Grid resolution |
 | `source_time` | string | ISO 8601 timestamp |
+
+Same CRS rules as wind — `grid_bounds` is in the scene CRS.
 
 ## camera
 
