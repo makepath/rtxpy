@@ -60,16 +60,22 @@ ds.rtx.explore(z='elevation', mesh_type='voxel')
 
 ## Scene files
 
-Pack everything into a single zarr file — elevation, buildings, water, wind, weather — then explore it offline without re-fetching. Good for sharing scenes or working on machines without network access.
+Pack everything into a single zarr file — elevation, buildings, roads, water, wind, weather — then explore it offline without re-fetching. Good for sharing scenes or working on machines without network access.
 
 ### Build from the command line
 
 ```bash
-# Boulder, CO — fetches 30m Copernicus DEM, Overture buildings + water, Open-Meteo wind
-rtxpy-build-scene -105.28 39.99 -105.26 40.01 boulder.zarr
+# Grand Canyon — fetches 30m DEM, Overture buildings + roads + water, Open-Meteo wind/weather
+rtxpy-build-scene -112.2 36.0 -112.0 36.2 grand_canyon.zarr
+
+# Add fire detections, skip roads
+rtxpy-build-scene -112.2 36.0 -112.0 36.2 grand_canyon.zarr --fires --no-roads
+
+# Add wind to an existing scene without re-fetching everything
+rtxpy-build-scene -112.2 36.0 -112.0 36.2 grand_canyon.zarr --resume
 ```
 
-Options: `--no-buildings`, `--no-water`, `--no-wind`, `--no-weather`, `--hydro` (off by default, needs GPU).
+Options: `--no-buildings`, `--no-roads`, `--no-water`, `--no-wind`, `--no-weather`, `--hydro`, `--fires`, `--resume`.
 
 ### Build from Python
 

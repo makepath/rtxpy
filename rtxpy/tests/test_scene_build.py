@@ -8,11 +8,14 @@ from rtxpy.scene import (
     _save_wind,
     _save_weather,
     _save_hydro,
+    _save_roughness,
     _load_wind,
     _load_weather,
     _load_hydro,
+    _adaptive_grid_size,
     main,
 )
+from rtxpy.scene_locations import Location
 from rtxpy.mesh_store import validate_scene
 
 
@@ -185,3 +188,84 @@ def test_save_wind_overwrites(store):
     loaded = _load_wind(s2)
     assert loaded['u'].shape == (8, 8)
     np.testing.assert_array_almost_equal(loaded['u'], 0.0)
+
+
+# -------------------------------------------------------------------
+# Adaptive grid size
+# -------------------------------------------------------------------
+
+def test_adaptive_grid_tiny_bbox():
+    """Tiny bbox should get a small grid."""
+    n = _adaptive_grid_size((-105.28, 39.99, -105.26, 40.01))
+    assert n == 3  # 0.02 * 50 = 1, clamped to lo=3
+
+def test_adaptive_grid_large_bbox():
+    """1-degree bbox should hit the max."""
+    n = _adaptive_grid_size((-106.0, 39.0, -105.0, 40.0))
+    assert n == 12  # 1.0 * 50 = 50, clamped to hi=12
+
+def test_adaptive_grid_clamps():
+    """Should never exceed hi or go below lo."""
+    assert _adaptive_grid_size((-180, -90, 180, 90)) == 12
+    assert _adaptive_grid_size((0, 0, 0.001, 0.001)) == 3
+
+
+# -------------------------------------------------------------------
+# Roughness round-trip
+# -------------------------------------------------------------------
+
+def test_save_roughness(store):
+    s, path = store
+    import xarray as xr
+    elev = np.random.rand(64, 64).astype(np.float32) * 100
+    da = xr.DataArray(elev, dims=('y', 'x'))
+    _save_roughness(s, da, tile_size=32)
+
+    s2 = zarr.open(path, mode='r')
+    assert 'elevation_roughness' in s2
+    rg = s2['elevation_roughness']
+    assert rg.attrs['tile_size'] == 32
+    vals = np.array(rg['values'])
+    assert vals.shape == (2, 2)
+    assert vals.dtype == np.float32
+    # Roughness should be non-negative
+    assert (vals >= 0).all()
+
+
+# -------------------------------------------------------------------
+# Location auto-CRS
+# -------------------------------------------------------------------
+
+def test_location_unpacks_as_bounds():
+    loc = Location((-112.2, 36.0, -112.0, 36.2), 'EPSG:32612')
+    w, s, e, n = loc
+    assert w == -112.2
+    assert loc.crs == 'EPSG:32612'
+
+def test_location_is_tuple():
+    loc = Location((-112.2, 36.0, -112.0, 36.2), 'EPSG:32612')
+    assert isinstance(loc, tuple)
+    assert len(loc) == 4
+
+
+# -------------------------------------------------------------------
+# CLI new flags
+# -------------------------------------------------------------------
+
+def test_cli_new_flags():
+    """Verify argparse accepts the new flags."""
+    try:
+        main(["-112.2", "36.0", "-112.0", "36.2", "/tmp/test_88_cli.zarr",
+              "--no-buildings", "--no-roads", "--no-water",
+              "--no-wind", "--no-weather", "--fires", "--resume"])
+    except (ImportError, Exception):
+        pass
+
+
+def test_cli_help_includes_roads(capsys):
+    with pytest.raises(SystemExit):
+        main(["--help"])
+    captured = capsys.readouterr()
+    assert "--no-roads" in captured.out
+    assert "--fires" in captured.out
+    assert "--resume" in captured.out

@@ -39,19 +39,25 @@ def build_scene(
     dem_source="copernicus",
     crs=None,
     buildings=True,
+    roads=True,
     water=True,
     wind=True,
     weather=True,
     hydro=False,
+    fires=False,
     name=None,
     cache_dir=None,
+    resume=False,
+    progress=None,
 ):
     """Fetch data for a bounding box and write a scene zarr.
 
     Parameters
     ----------
-    bounds : tuple
-        (west, south, east, north) in WGS84 degrees.
+    bounds : tuple or Location
+        (west, south, east, north) in WGS84 degrees.  If a
+        :class:`~rtxpy.scene_locations.Location` is passed and *crs*
+        is None, its ``.crs`` is used automatically.
     output_path : str or Path
         Where to write the zarr store. Overwrites if it exists.
     dem_source : str
@@ -62,6 +68,8 @@ def build_scene(
         UTM zone from the bounding box center.
     buildings : bool
         Fetch and place Overture Maps building footprints.
+    roads : bool
+        Fetch and place Overture Maps road networks.
     water : bool
         Fetch and place Overture Maps water features.
     wind : bool
@@ -70,13 +78,29 @@ def build_scene(
         Fetch Open-Meteo weather (cloud cover, temperature, etc.).
     hydro : bool
         Compute MFD hydrological flow from the DEM.
+    fires : bool
+        Fetch NASA FIRMS fire detections (last 24 h).
     name : str or None
         Human-readable scene name. Defaults to the output filename stem.
     cache_dir : str or Path or None
         Directory for intermediate tile caches. Defaults to a ``.cache``
         sibling of *output_path*.
+    resume : bool
+        If True, skip fetching data whose zarr group already exists.
+        Useful for adding layers to an existing scene without
+        re-downloading everything.
+    progress : callable or None
+        Optional callback ``progress(step, message)`` called at each
+        stage. *step* is a string like ``'elevation'``, ``'buildings'``.
+        If None, messages go to stdout via ``print()``.
     """
     import zarr
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    from .scene_locations import Location
+
+    # Auto-detect CRS from Location objects
+    if crs is None and isinstance(bounds, Location):
+        crs = bounds.crs
 
     output_path = Path(output_path)
     if name is None:
@@ -87,16 +111,23 @@ def build_scene(
     cache_dir = Path(cache_dir)
     cache_dir.mkdir(parents=True, exist_ok=True)
 
+    def _log(step, msg):
+        if progress is not None:
+            progress(step, msg)
+        else:
+            print(msg)
+
     west, south, east, north = bounds
 
-    # ---- 1. Elevation ----
-    print(f"Fetching {dem_source} DEM for "
-          f"({west:.4f}, {south:.4f}, {east:.4f}, {north:.4f})...")
+    # ---- 1. Elevation (always needed — zarr store is created here) ----
+    _log('elevation',
+         f"Fetching {dem_source} DEM for "
+         f"({west:.4f}, {south:.4f}, {east:.4f}, {north:.4f})...")
 
     from .remote_data import fetch_dem
     dem = fetch_dem(bounds, str(output_path), source=dem_source, crs=crs,
                     cache_dir=str(cache_dir))
-    print(f"  DEM shape: {dem.shape}, CRS: {dem.rio.crs}")
+    _log('elevation', f"  DEM shape: {dem.shape}, CRS: {dem.rio.crs}")
 
     # Stamp root attributes per spec
     store = zarr.open(str(output_path), mode='r+')
@@ -117,61 +148,111 @@ def build_scene(
             pass
 
     # ---- 2. Triangulate for mesh placement ----
-    print("Triangulating terrain...")
-    terrain = dem.copy()
-    terrain.data = np.ascontiguousarray(terrain.data)
-    terrain.rtx.triangulate()
+    need_meshes = buildings or roads or water or fires
+    if need_meshes and not (resume and 'meshes' in store):
+        _log('triangulate', "Triangulating terrain...")
+        terrain = dem.copy()
+        terrain.data = np.ascontiguousarray(terrain.data)
+        terrain.rtx.triangulate()
+    else:
+        terrain = None
 
-    # ---- 3. Buildings (Overture) ----
-    if buildings:
-        buildings_geojson = _fetch_or_skip(
-            "Overture buildings",
-            lambda: _fetch_buildings_overture(bounds, cache_dir),
-        )
-        if buildings_geojson and buildings_geojson.get('features'):
-            n = len(buildings_geojson['features'])
-            print(f"  Placing {n} buildings...")
-            terrain.rtx.place_buildings(buildings_geojson)
+    # ---- 3. Parallel network fetches (buildings, roads, water, fires) ----
+    # These are independent of each other and can overlap.
+    geojson_results = {}
 
-    # ---- 4. Water (Overture) ----
-    if water:
-        water_geojson = _fetch_or_skip(
-            "Overture water",
-            lambda: _fetch_water_overture(bounds, cache_dir),
-        )
-        if water_geojson and water_geojson.get('features'):
-            n = len(water_geojson['features'])
-            print(f"  Placing {n} water features...")
-            terrain.rtx.place_water(water_geojson)
+    if terrain is not None:
+        fetch_jobs = {}
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            if buildings:
+                fetch_jobs['buildings'] = pool.submit(
+                    _fetch_or_skip, "Overture buildings",
+                    lambda: _fetch_buildings_overture(bounds, cache_dir))
+            if roads:
+                fetch_jobs['roads'] = pool.submit(
+                    _fetch_or_skip, "Overture roads",
+                    lambda: _fetch_roads_overture(bounds, cache_dir))
+            if water:
+                fetch_jobs['water'] = pool.submit(
+                    _fetch_or_skip, "Overture water",
+                    lambda: _fetch_water_overture(bounds, cache_dir))
+            if fires:
+                fetch_jobs['fires'] = pool.submit(
+                    _fetch_or_skip, "FIRMS fire detections",
+                    lambda: _fetch_firms(bounds, cache_dir))
 
-    # ---- 5. Save meshes ----
-    if _has_baked_meshes_da(terrain):
-        print("Saving meshes to zarr...")
-        terrain.rtx.save_meshes(str(output_path))
+            for key, future in fetch_jobs.items():
+                geojson_results[key] = future.result()
 
-    # ---- 6. Wind ----
-    if wind:
-        wind_data = _fetch_or_skip(
-            "wind",
-            lambda: _fetch_wind(bounds),
-        )
-        if wind_data is not None:
-            _save_wind(store, wind_data, bounds)
+    # ---- 4. Place geometry ----
+    def _place(key, place_fn, label):
+        gj = geojson_results.get(key)
+        if gj and gj.get('features'):
+            n = len(gj['features'])
+            _log(key, f"  Placing {n} {label}...")
+            place_fn(gj)
 
-    # ---- 7. Weather ----
-    if weather:
-        weather_data = _fetch_or_skip(
-            "weather",
-            lambda: _fetch_weather(bounds),
-        )
-        if weather_data is not None:
-            _save_weather(store, weather_data, bounds)
+    if terrain is not None:
+        _place('buildings', terrain.rtx.place_buildings, 'buildings')
+        _place('roads',
+               lambda gj: terrain.rtx.place_roads(gj, geometry_id='road'),
+               'roads')
+        _place('water', terrain.rtx.place_water, 'water features')
+        _place('fires',
+               lambda gj: terrain.rtx.place_geojson(
+                   gj, geometry_id='fire', height=5.0,
+                   color=(1.0, 0.2, 0.0, 1.0)),
+               'fire detections')
 
-    # ---- 8. Hydro ----
-    if hydro:
+        if _has_baked_meshes_da(terrain):
+            _log('meshes', "Saving meshes to zarr...")
+            terrain.rtx.save_meshes(str(output_path))
+    elif resume and 'meshes' in store:
+        _log('meshes', "Meshes already in zarr, skipping (resume=True)")
+
+    # ---- 5. Parallel non-mesh data fetches (wind, weather) ----
+    wind_data = None
+    weather_data = None
+
+    if wind or weather:
+        net_jobs = {}
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            if wind and not (resume and 'wind' in store):
+                net_jobs['wind'] = pool.submit(
+                    _fetch_or_skip, "wind",
+                    lambda: _fetch_wind(bounds))
+            elif resume and 'wind' in store:
+                _log('wind', "Wind already in zarr, skipping (resume=True)")
+
+            if weather and not (resume and 'weather' in store):
+                net_jobs['weather'] = pool.submit(
+                    _fetch_or_skip, "weather",
+                    lambda: _fetch_weather(bounds))
+            elif resume and 'weather' in store:
+                _log('weather',
+                     "Weather already in zarr, skipping (resume=True)")
+
+            for key, future in net_jobs.items():
+                if key == 'wind':
+                    wind_data = future.result()
+                else:
+                    weather_data = future.result()
+
+    if wind_data is not None:
+        _save_wind(store, wind_data, bounds)
+    if weather_data is not None:
+        _save_weather(store, weather_data, bounds)
+
+    # ---- 6. Hydro ----
+    if hydro and not (resume and 'hydro' in store):
         hydro_data = _compute_hydro_or_skip(dem)
         if hydro_data is not None:
             _save_hydro(store, hydro_data)
+    elif resume and 'hydro' in store:
+        _log('hydro', "Hydro already in zarr, skipping (resume=True)")
+
+    # ---- 7. LOD roughness ----
+    _save_roughness(store, dem)
 
     # ---- Done ----
     from .mesh_store import validate_scene
@@ -179,15 +260,16 @@ def build_scene(
     errors = [msg for lvl, msg in issues if lvl == "error"]
     warnings = [msg for lvl, msg in issues if lvl == "warning"]
     if errors:
-        print(f"Validation: {len(errors)} errors, {len(warnings)} warnings")
+        _log('done',
+             f"Validation: {len(errors)} errors, {len(warnings)} warnings")
         for e in errors:
-            print(f"  ERROR: {e}")
+            _log('done', f"  ERROR: {e}")
     elif warnings:
-        print(f"Validation: OK ({len(warnings)} warnings)")
+        _log('done', f"Validation: OK ({len(warnings)} warnings)")
     else:
-        print("Validation: OK")
+        _log('done', "Validation: OK")
 
-    print(f"Scene written to {output_path}")
+    _log('done', f"Scene written to {output_path}")
     return str(output_path)
 
 
@@ -212,6 +294,13 @@ def _fetch_buildings_overture(bounds, cache_dir):
                            source='overture')
 
 
+def _fetch_roads_overture(bounds, cache_dir):
+    from .remote_data import fetch_roads
+    cache_path = Path(cache_dir) / "roads_overture.json"
+    return fetch_roads(bounds, cache_path=str(cache_path),
+                       source='overture')
+
+
 def _fetch_water_overture(bounds, cache_dir):
     from .remote_data import fetch_water
     cache_path = Path(cache_dir) / "water_overture.json"
@@ -219,14 +308,34 @@ def _fetch_water_overture(bounds, cache_dir):
                        source='overture')
 
 
+def _fetch_firms(bounds, cache_dir):
+    from .remote_data import fetch_firms
+    cache_path = Path(cache_dir) / "firms_24h.json"
+    return fetch_firms(bounds, cache_path=str(cache_path))
+
+
+def _adaptive_grid_size(bounds, points_per_degree=50, lo=3, hi=12):
+    """Pick a grid_size that scales with bbox extent.
+
+    Open-Meteo encodes all grid_size² lat/lon pairs in the URL, so
+    the total must stay under ~8 KB.  grid_size=12 → 144 points
+    → ~3600 chars, well within limits.  For weather/wind the spatial
+    resolution is coarse anyway (~10-25 km), so 12 is plenty.
+    """
+    west, south, east, north = bounds
+    span = max(abs(east - west), abs(north - south))
+    n = int(round(span * points_per_degree))
+    return max(lo, min(n, hi))
+
+
 def _fetch_wind(bounds):
     from .remote_data import fetch_wind
-    return fetch_wind(bounds)
+    return fetch_wind(bounds, grid_size=_adaptive_grid_size(bounds))
 
 
 def _fetch_weather(bounds):
     from .remote_data import fetch_weather
-    return fetch_weather(bounds)
+    return fetch_weather(bounds, grid_size=_adaptive_grid_size(bounds))
 
 
 def _has_baked_meshes_da(da):
@@ -330,6 +439,65 @@ def _save_hydro(store, hydro_data):
 
     print(f"  Hydro: flow_accum + flow_dir_mfd"
           f"{' + stream_order' if 'stream_order' in hydro_data else ''}")
+
+
+def _save_roughness(store, dem, tile_size=64):
+    """Compute per-tile roughness and write elevation_roughness group.
+
+    Roughness = std of residuals from bilinear interpolation of the four
+    tile corner elevations.  This lets the LOD manager promote rough
+    tiles to higher detail and demote flat ones.
+    """
+    elev = dem.values.astype(np.float32)
+    h, w = elev.shape
+    th = (h + tile_size - 1) // tile_size
+    tw = (w + tile_size - 1) // tile_size
+
+    roughness = np.zeros((th, tw), dtype=np.float32)
+    for tr in range(th):
+        for tc in range(tw):
+            r0 = tr * tile_size
+            c0 = tc * tile_size
+            r1 = min(r0 + tile_size, h)
+            c1 = min(c0 + tile_size, w)
+            tile = elev[r0:r1, c0:c1]
+
+            valid = tile[~np.isnan(tile)]
+            if len(valid) < 4:
+                roughness[tr, tc] = 0.0
+                continue
+
+            # Bilinear fit from corners
+            corners = np.array([
+                tile[0, 0] if not np.isnan(tile[0, 0]) else np.nanmean(tile),
+                tile[0, -1] if not np.isnan(tile[0, -1]) else np.nanmean(tile),
+                tile[-1, 0] if not np.isnan(tile[-1, 0]) else np.nanmean(tile),
+                tile[-1, -1] if not np.isnan(tile[-1, -1]) else np.nanmean(tile),
+            ], dtype=np.float32)
+
+            rows, cols = tile.shape
+            yy, xx = np.mgrid[0:rows, 0:cols].astype(np.float32)
+            fy = yy / max(rows - 1, 1)
+            fx = xx / max(cols - 1, 1)
+            interp = (corners[0] * (1 - fx) * (1 - fy) +
+                      corners[1] * fx * (1 - fy) +
+                      corners[2] * (1 - fx) * fy +
+                      corners[3] * fx * fy)
+
+            residuals = tile - interp
+            mask = ~np.isnan(residuals)
+            if mask.any():
+                roughness[tr, tc] = float(np.std(residuals[mask]))
+
+    if 'elevation_roughness' in store:
+        del store['elevation_roughness']
+    rg = store.create_group('elevation_roughness')
+    rg.create_array('values', data=roughness,
+                     chunks=roughness.shape, compressors=_BLOSC)
+    rg.attrs['tile_size'] = tile_size
+    rg.attrs['shape'] = [th, tw]
+    print(f"  Roughness: {th}x{tw} tiles, "
+          f"range [{roughness.min():.1f}, {roughness.max():.1f}]")
 
 
 def _compute_hydro_or_skip(dem):
@@ -549,6 +717,10 @@ def main(argv=None):
         help="Skip building footprints",
     )
     parser.add_argument(
+        "--no-roads", action="store_true",
+        help="Skip road networks",
+    )
+    parser.add_argument(
         "--no-water", action="store_true",
         help="Skip water features",
     )
@@ -563,6 +735,14 @@ def main(argv=None):
     parser.add_argument(
         "--hydro", action="store_true",
         help="Compute MFD hydrology from the DEM",
+    )
+    parser.add_argument(
+        "--fires", action="store_true",
+        help="Fetch NASA FIRMS fire detections (last 24 h)",
+    )
+    parser.add_argument(
+        "--resume", action="store_true",
+        help="Skip layers already present in an existing zarr",
     )
     parser.add_argument(
         "--name", default=None,
@@ -581,10 +761,13 @@ def main(argv=None):
         dem_source=args.dem_source,
         crs=args.crs,
         buildings=not args.no_buildings,
+        roads=not args.no_roads,
         water=not args.no_water,
         wind=not args.no_wind,
         weather=not args.no_weather,
         hydro=args.hydro,
+        fires=args.fires,
+        resume=args.resume,
         name=args.name,
         cache_dir=args.cache_dir,
     )
