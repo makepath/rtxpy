@@ -23,6 +23,9 @@ import sys
 from pathlib import Path
 
 import numpy as np
+from zarr.codecs import BloscCodec
+
+_BLOSC = BloscCodec(cname='zstd', clevel=6, shuffle='bitshuffle')
 
 
 # ---------------------------------------------------------------------------
@@ -117,7 +120,7 @@ def build_scene(
     print("Triangulating terrain...")
     terrain = dem.copy()
     terrain.data = np.ascontiguousarray(terrain.data)
-    ds = terrain.rtx.triangulate()
+    terrain.rtx.triangulate()
 
     # ---- 3. Buildings (Overture) ----
     if buildings:
@@ -128,7 +131,7 @@ def build_scene(
         if buildings_geojson and buildings_geojson.get('features'):
             n = len(buildings_geojson['features'])
             print(f"  Placing {n} buildings...")
-            ds.rtx.place_buildings(buildings_geojson)
+            terrain.rtx.place_buildings(buildings_geojson)
 
     # ---- 4. Water (Overture) ----
     if water:
@@ -139,12 +142,12 @@ def build_scene(
         if water_geojson and water_geojson.get('features'):
             n = len(water_geojson['features'])
             print(f"  Placing {n} water features...")
-            ds.rtx.place_water(water_geojson)
+            terrain.rtx.place_water(water_geojson)
 
     # ---- 5. Save meshes ----
-    if _has_baked_meshes(ds):
+    if _has_baked_meshes_da(terrain):
         print("Saving meshes to zarr...")
-        ds.rtx.save_meshes(str(output_path))
+        terrain.rtx.save_meshes(str(output_path))
 
     # ---- 6. Wind ----
     if wind:
@@ -226,16 +229,10 @@ def _fetch_weather(bounds):
     return fetch_weather(bounds)
 
 
-def _has_baked_meshes(ds):
-    """Check whether any geometries were placed."""
-    # The DataArray accessor stores baked meshes in _baked_meshes
+def _has_baked_meshes_da(da):
+    """Check whether any geometries were placed on a DataArray."""
     try:
-        acc = ds.rtx if hasattr(ds, 'rtx') else None
-        if acc is None:
-            return False
-        # Dataset accessor delegates to the terrain DataArray
-        terrain_da = acc._get_terrain_da(acc._z_var)
-        baked = getattr(terrain_da.rtx, '_baked_meshes', None)
+        baked = getattr(da.rtx, '_baked_meshes', None)
         return baked is not None and len(baked) > 0
     except Exception:
         return False
@@ -253,15 +250,15 @@ def _save_wind(store, wind_data, bounds):
 
     u = np.asarray(wind_data['u'], dtype=np.float32)
     v = np.asarray(wind_data['v'], dtype=np.float32)
-    wg.create_array('u', data=u, chunks=u.shape)
-    wg.create_array('v', data=v, chunks=v.shape)
+    wg.create_array('u', data=u, chunks=u.shape, compressors=_BLOSC)
+    wg.create_array('v', data=v, chunks=v.shape, compressors=_BLOSC)
 
     # Store lats/lons so the viewer can interpolate onto the terrain
     if 'lats' in wind_data:
         lats = np.asarray(wind_data['lats'], dtype=np.float32)
         lons = np.asarray(wind_data['lons'], dtype=np.float32)
-        wg.create_array('lats', data=lats, chunks=lats.shape)
-        wg.create_array('lons', data=lons, chunks=lons.shape)
+        wg.create_array('lats', data=lats, chunks=lats.shape, compressors=_BLOSC)
+        wg.create_array('lons', data=lons, chunks=lons.shape, compressors=_BLOSC)
 
     west, south, east, north = bounds
     wg.attrs['grid_bounds'] = {'x0': west, 'y0': south,
@@ -282,14 +279,14 @@ def _save_weather(store, weather_data, bounds):
                 'pressure', 'precipitation'):
         if key in weather_data:
             arr = np.asarray(weather_data[key], dtype=np.float32)
-            wg.create_array(key, data=arr, chunks=arr.shape)
+            wg.create_array(key, data=arr, chunks=arr.shape, compressors=_BLOSC)
 
     # Store lats/lons for spatial reference
     if 'lats' in weather_data:
         lats = np.asarray(weather_data['lats'], dtype=np.float32)
         lons = np.asarray(weather_data['lons'], dtype=np.float32)
-        wg.create_array('lats', data=lats, chunks=lats.shape)
-        wg.create_array('lons', data=lons, chunks=lons.shape)
+        wg.create_array('lats', data=lats, chunks=lats.shape, compressors=_BLOSC)
+        wg.create_array('lons', data=lons, chunks=lons.shape, compressors=_BLOSC)
 
     west, south, east, north = bounds
     wg.attrs['grid_bounds'] = {'x0': west, 'y0': south,
@@ -319,7 +316,7 @@ def _save_hydro(store, hydro_data):
                              if key == 'flow_accum' else np.int32
                              if key in ('stream_order', 'stream_link')
                              else np.float32)
-            hg.create_array(key, data=arr, chunks=arr.shape)
+            hg.create_array(key, data=arr, chunks=arr.shape, compressors=_BLOSC)
 
     # Copy tuning parameters
     for attr in ('n_particles', 'max_age', 'trail_len', 'speed',

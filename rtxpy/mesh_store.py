@@ -26,6 +26,9 @@ Zarr layout::
 
 import numpy as np
 import zarr
+from zarr.codecs import BloscCodec
+
+_BLOSC = BloscCodec(cname='zstd', clevel=6, shuffle='bitshuffle')
 
 
 def chunks_for_pixel_window(yi0, yi1, xi0, xi1, chunk_h, chunk_w):
@@ -146,11 +149,11 @@ def save_meshes_to_zarr(zarr_path, meshes, colors, pixel_spacing,
             chunk_grp = gg.create_group(f'{cr}_{cc}')
             chunk_grp.create_array(
                 'vertices', data=local_verts,
-                chunks=(len(local_verts),),
+                chunks=(len(local_verts),), compressors=_BLOSC,
             )
             chunk_grp.create_array(
                 'indices', data=local_indices,
-                chunks=(len(local_indices),),
+                chunks=(len(local_indices),), compressors=_BLOSC,
             )
 
     # --- Curve geometries (roads, water) ---
@@ -208,15 +211,15 @@ def save_meshes_to_zarr(zarr_path, meshes, colors, pixel_spacing,
                 chunk_grp = gg.create_group(f'{cr}_{cc}')
                 chunk_grp.create_array(
                     'vertices', data=local_verts,
-                    chunks=(len(local_verts),),
+                    chunks=(len(local_verts),), compressors=_BLOSC,
                 )
                 chunk_grp.create_array(
                     'widths', data=local_widths,
-                    chunks=(len(local_widths),),
+                    chunks=(len(local_widths),), compressors=_BLOSC,
                 )
                 chunk_grp.create_array(
                     'indices', data=local_indices,
-                    chunks=(len(local_indices),),
+                    chunks=(len(local_indices),), compressors=_BLOSC,
                 )
 
     # --- Sphere geometries (point clouds) ---
@@ -238,15 +241,15 @@ def save_meshes_to_zarr(zarr_path, meshes, colors, pixel_spacing,
             chunk_grp = gg.create_group('0_0')
             chunk_grp.create_array(
                 'centers', data=centers,
-                chunks=(len(centers),),
+                chunks=(len(centers),), compressors=_BLOSC,
             )
             chunk_grp.create_array(
                 'radii', data=radii,
-                chunks=(len(radii),),
+                chunks=(len(radii),), compressors=_BLOSC,
             )
             chunk_grp.create_array(
                 'colors', data=sph_colors,
-                chunks=(len(sph_colors),),
+                chunks=(len(sph_colors),), compressors=_BLOSC,
             )
 
     total = len(meshes) + (len(curves) if curves else 0) + \
