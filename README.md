@@ -75,14 +75,25 @@ Options: `--no-buildings`, `--no-water`, `--no-wind`, `--no-weather`, `--hydro` 
 
 ```python
 from rtxpy.scene import build_scene, explore_scene
+from rtxpy import LANDSCAPES
 
-build_scene(
-    bounds=(-112.2, 36.0, -112.0, 36.2),
-    output_path='grand_canyon.zarr',
-)
+build_scene(LANDSCAPES['grand_canyon'], 'grand_canyon.zarr')
 
 # Load and launch the viewer in one call
 explore_scene('grand_canyon.zarr')
+```
+
+119 preset locations ship with the package — countries, cities, and landscapes:
+
+```python
+from rtxpy import COUNTRIES, CITIES, LANDSCAPES
+from rtxpy.scene_locations import find
+
+build_scene(CITIES['tokyo'], 'tokyo.zarr')
+build_scene(LANDSCAPES['matterhorn'], 'matterhorn.zarr')
+
+# Search by name
+find('canyon')  # {'landscape/grand_canyon': ..., 'landscape/bryce_canyon': ...}
 ```
 
 The zarr is self-contained: elevation stored as CF-encoded int16 with blosc compression, meshes spatially chunked to match the DEM grid, and wind/weather/hydro in their own groups. See `docs/proposals/scene-zarr-spec.md` for the full format.

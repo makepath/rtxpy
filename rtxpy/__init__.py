@@ -62,11 +62,12 @@ try:
 except ImportError:
     pass
 
-# Scene builder
+# Scene builder and location presets
 try:
     from .scene import build_scene, explore_scene
 except ImportError:
     pass
+from .scene_locations import COUNTRIES, CITIES, LANDSCAPES
 
 # Register xarray accessor if xarray is available
 try:
