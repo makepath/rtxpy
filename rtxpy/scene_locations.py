@@ -1,22 +1,117 @@
-"""Predefined bounding boxes for countries, cities, and landscapes.
+"""Predefined bounding boxes with recommended CRS for countries, cities,
+and landscapes.
 
-All bounds are (west, south, east, north) in WGS 84 degrees, matching
-the format expected by ``build_scene()`` and ``fetch_dem()``.
+Each entry is a ``Location`` — a tuple subclass that unpacks as
+``(west, south, east, north)`` in WGS 84 degrees and carries a ``.crs``
+attribute with the recommended projected CRS for that area.
 
 Usage::
 
     from rtxpy.scene_locations import CITIES, LANDSCAPES
     from rtxpy.scene import build_scene
 
-    build_scene(LANDSCAPES['grand_canyon'], 'grand_canyon.zarr')
-    build_scene(CITIES['tokyo'], 'tokyo.zarr')
+    loc = LANDSCAPES['grand_canyon']
+    build_scene(loc, 'grand_canyon.zarr', crs=loc.crs)
+
+    # Still works as a plain bounds tuple
+    west, south, east, north = loc
 """
+
+
+# ---------------------------------------------------------------------------
+# Location type — tuple that also carries a CRS
+# ---------------------------------------------------------------------------
+
+class Location(tuple):
+    """Bounding box with a recommended projected CRS.
+
+    Inherits from ``tuple`` so it unpacks as ``(west, south, east, north)``
+    and can be passed directly to ``build_scene()`` or ``fetch_dem()``.
+
+    Attributes
+    ----------
+    crs : str
+        EPSG code string (e.g. ``'EPSG:32612'``) for the recommended
+        projected coordinate reference system.
+    bounds : tuple
+        The ``(west, south, east, north)`` values (same as unpacking).
+    """
+
+    def __new__(cls, bounds, crs):
+        obj = super().__new__(cls, bounds)
+        obj.crs = crs
+        return obj
+
+    @property
+    def bounds(self):
+        return (self[0], self[1], self[2], self[3])
+
+    def __repr__(self):
+        w, s, e, n = self
+        return f"Location(({w}, {s}, {e}, {n}), crs='{self.crs}')"
+
+
+def _utm_epsg(west, south, east, north):
+    """Compute the UTM EPSG code for the center of a bounding box."""
+    lon = (west + east) / 2
+    lat = (south + north) / 2
+    zone = int((lon + 180) / 6) + 1
+    if lat >= 0:
+        return f'EPSG:326{zone:02d}'
+    return f'EPSG:327{zone:02d}'
+
+
+# ---------------------------------------------------------------------------
+# Country-level CRS overrides — well-established national systems
+# Everything else falls back to UTM at the centroid.
+# ---------------------------------------------------------------------------
+
+_COUNTRY_CRS = {
+    'united_states': 'EPSG:5070',    # Conus Albers Equal Area
+    'canada': 'EPSG:3978',           # NAD83 Canada Atlas Lambert
+    'mexico': 'EPSG:6372',           # Mexico ITRF2008 LCC
+    'brazil': 'EPSG:5880',           # SIRGAS 2000 Polyconic
+    'argentina': 'EPSG:5343',        # POSGAR 2007 Argentina zone 5
+    'chile': 'EPSG:5880',            # SIRGAS 2000 Polyconic (continent)
+    'united_kingdom': 'EPSG:27700',  # British National Grid
+    'france': 'EPSG:2154',           # RGF93 v1 / Lambert-93
+    'germany': 'EPSG:25832',         # ETRS89 / UTM 32N
+    'italy': 'EPSG:25832',           # ETRS89 / UTM 32N
+    'spain': 'EPSG:25830',           # ETRS89 / UTM 30N
+    'norway': 'EPSG:25833',          # ETRS89 / UTM 33N
+    'switzerland': 'EPSG:2056',      # CH1903+ / LV95
+    'iceland': 'EPSG:3057',          # ISN93 / Lambert 1993
+    'greece': 'EPSG:2100',           # GGRS87 / Greek Grid
+    'portugal': 'EPSG:3763',         # ETRS89 / PT-TM06
+    'japan': 'EPSG:6677',            # JGD2011 / Japan Plane IX (central)
+    'south_korea': 'EPSG:5186',      # Korea 2000 / Central Belt 2010
+    'india': 'EPSG:7755',            # WGS 84 / India NSF LCC
+    'turkey': 'EPSG:5254',           # TUREF / TM33
+    'south_africa': 'EPSG:2048',     # Hartebeesthoek94 / Lo19
+    'egypt': 'EPSG:22992',           # Egypt 1907 Red Belt
+    'morocco': 'EPSG:26191',         # Merchich / Nord Maroc
+    'australia': 'EPSG:3577',        # GDA94 Australian Albers
+    'new_zealand': 'EPSG:2193',      # NZGD2000 / NZTM 2000
+}
+
+
+def _make(raw, crs_overrides=None):
+    """Convert a {name: (w,s,e,n)} dict to {name: Location}."""
+    out = {}
+    for name, bounds in raw.items():
+        if crs_overrides and name in crs_overrides:
+            crs = crs_overrides[name]
+        else:
+            crs = _utm_epsg(*bounds)
+        out[name] = Location(bounds, crs)
+    return out
+
 
 # ---------------------------------------------------------------------------
 # Countries — rough mainland bounds, not including distant overseas territories
 # ---------------------------------------------------------------------------
 
-COUNTRIES = {
+COUNTRIES = _make({
     # Americas
     'united_states': (-125.0, 24.5, -66.9, 49.4),
     'canada': (-141.0, 41.7, -52.6, 83.1),
@@ -62,13 +157,14 @@ COUNTRIES = {
     # Oceania
     'australia': (113.16, -43.63, 153.64, -10.68),
     'new_zealand': (166.43, -47.29, 178.55, -34.39),
-}
+}, _COUNTRY_CRS)
 
 # ---------------------------------------------------------------------------
 # Cities — roughly 10-20 km across, centered on the urban core
+# All use UTM computed from bbox center.
 # ---------------------------------------------------------------------------
 
-CITIES = {
+CITIES = _make({
     # Americas
     'new_york': (-74.05, 40.68, -73.90, 40.82),
     'los_angeles': (-118.35, 33.95, -118.15, 34.10),
@@ -114,13 +210,14 @@ CITIES = {
     'melbourne': (144.90, -37.84, 145.02, -37.77),
     'auckland': (174.70, -36.90, 174.84, -36.82),
     'queenstown': (168.62, -45.06, 168.72, -44.98),
-}
+})
 
 # ---------------------------------------------------------------------------
 # Landscapes — scenic or geologically interesting areas
+# All use UTM computed from bbox center.
 # ---------------------------------------------------------------------------
 
-LANDSCAPES = {
+LANDSCAPES = _make({
     # North America
     'grand_canyon': (-112.20, 36.00, -112.00, 36.20),
     'yosemite': (-119.65, 37.70, -119.50, 37.80),
@@ -179,7 +276,7 @@ LANDSCAPES = {
     'blue_mountains': (150.28, -33.78, 150.42, -33.68),
     'tongariro': (175.55, -39.30, 175.70, -39.18),
     'great_barrier_reef': (146.00, -18.40, 146.30, -18.20),
-}
+})
 
 
 # Combined lookup for convenience
@@ -200,13 +297,13 @@ def find(query):
     Returns
     -------
     dict
-        Matching ``{name: (west, south, east, north)}`` entries.
+        Matching ``{name: Location}`` entries.
 
     Example
     -------
     >>> from rtxpy.scene_locations import find
     >>> find('canyon')
-    {'landscape/grand_canyon': (-112.2, 36.0, ...), ...}
+    {'landscape/grand_canyon': Location(..., crs='EPSG:32612'), ...}
     """
     q = query.lower()
     return {k: v for k, v in ALL.items() if q in k.lower()}
@@ -231,6 +328,6 @@ def list_locations(category=None):
         if category and category.lower() not in (label.lower(), tag):
             continue
         print(f"\n{label} ({len(locs)}):")
-        for name, bounds in sorted(locs.items()):
-            w, s, e, n = bounds
-            print(f"  {name:30s} ({w:8.2f}, {s:7.2f}, {e:8.2f}, {n:7.2f})")
+        for name, loc in sorted(locs.items()):
+            w, s, e, n = loc
+            print(f"  {name:30s} ({w:8.2f}, {s:7.2f}, {e:8.2f}, {n:7.2f})  {loc.crs}")

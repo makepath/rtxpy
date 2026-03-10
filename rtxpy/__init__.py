@@ -67,7 +67,7 @@ try:
     from .scene import build_scene, explore_scene
 except ImportError:
     pass
-from .scene_locations import COUNTRIES, CITIES, LANDSCAPES
+from .scene_locations import Location, COUNTRIES, CITIES, LANDSCAPES
 
 # Register xarray accessor if xarray is available
 try:
