@@ -58,6 +58,35 @@ ds.rtx.place_buildings(bldgs, z='elevation')
 ds.rtx.explore(z='elevation', mesh_type='voxel')
 ```
 
+## Scene files
+
+Pack everything into a single zarr file — elevation, buildings, water, wind, weather — then explore it offline without re-fetching. Good for sharing scenes or working on machines without network access.
+
+### Build from the command line
+
+```bash
+# Boulder, CO — fetches 30m Copernicus DEM, Overture buildings + water, Open-Meteo wind
+rtxpy-build-scene -105.28 39.99 -105.26 40.01 boulder.zarr
+```
+
+Options: `--no-buildings`, `--no-water`, `--no-wind`, `--no-weather`, `--hydro` (off by default, needs GPU).
+
+### Build from Python
+
+```python
+from rtxpy.scene import build_scene, explore_scene
+
+build_scene(
+    bounds=(-112.2, 36.0, -112.0, 36.2),
+    output_path='grand_canyon.zarr',
+)
+
+# Load and launch the viewer in one call
+explore_scene('grand_canyon.zarr')
+```
+
+The zarr is self-contained: elevation stored as CF-encoded int16 with blosc compression, meshes spatially chunked to match the DEM grid, and wind/weather/hydro in their own groups. See `docs/proposals/scene-zarr-spec.md` for the full format.
+
 ## Prerequisites
 
 - **NVIDIA GPU**: Maxwell architecture or newer (GTX 900+ / RTX series)
