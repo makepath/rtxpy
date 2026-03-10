@@ -33,13 +33,16 @@ class Location(tuple):
     crs : str
         EPSG code string (e.g. ``'EPSG:32612'``) for the recommended
         projected coordinate reference system.
+    units : str
+        Linear unit of the CRS (``'meters'``, ``'feet'``, or ``'degrees'``).
     bounds : tuple
         The ``(west, south, east, north)`` values (same as unpacking).
     """
 
-    def __new__(cls, bounds, crs):
+    def __new__(cls, bounds, crs, units='meters'):
         obj = super().__new__(cls, bounds)
         obj.crs = crs
+        obj.units = units
         return obj
 
     @property
@@ -48,7 +51,7 @@ class Location(tuple):
 
     def __repr__(self):
         w, s, e, n = self
-        return f"Location(({w}, {s}, {e}, {n}), crs='{self.crs}')"
+        return f"Location(({w}, {s}, {e}, {n}), crs='{self.crs}', units='{self.units}')"
 
 
 def _utm_epsg(west, south, east, north):
@@ -95,6 +98,13 @@ _COUNTRY_CRS = {
 }
 
 
+# CRS units — every CRS in our set uses meters, but this table exists
+# so adding a feet-based CRS (e.g. US state plane) just means one entry here.
+_CRS_UNITS = {
+    # 'EPSG:2229': 'feet',  # example: NAD83 / California zone 5 (ftUS)
+}
+
+
 def _make(raw, crs_overrides=None):
     """Convert a {name: (w,s,e,n)} dict to {name: Location}."""
     out = {}
@@ -103,7 +113,8 @@ def _make(raw, crs_overrides=None):
             crs = crs_overrides[name]
         else:
             crs = _utm_epsg(*bounds)
-        out[name] = Location(bounds, crs)
+        units = _CRS_UNITS.get(crs, 'meters')
+        out[name] = Location(bounds, crs, units)
     return out
 
 
@@ -330,4 +341,4 @@ def list_locations(category=None):
         print(f"\n{label} ({len(locs)}):")
         for name, loc in sorted(locs.items()):
             w, s, e, n = loc
-            print(f"  {name:30s} ({w:8.2f}, {s:7.2f}, {e:8.2f}, {n:7.2f})  {loc.crs}")
+            print(f"  {name:30s} ({w:8.2f}, {s:7.2f}, {e:8.2f}, {n:7.2f})  {loc.crs} ({loc.units})")
