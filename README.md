@@ -58,6 +58,58 @@ ds.rtx.place_buildings(bldgs, z='elevation')
 ds.rtx.explore(z='elevation', mesh_type='voxel')
 ```
 
+## Scene files
+
+Pack everything into a single zarr file — elevation, buildings, roads, water, wind, weather — then explore it offline without re-fetching. Good for sharing scenes or working on machines without network access.
+
+### Build from the command line
+
+```bash
+# Grand Canyon — fetches 30m DEM, Overture buildings + roads + water, Open-Meteo wind/weather
+rtxpy-build-scene -112.2 36.0 -112.0 36.2 grand_canyon.zarr
+
+# Add fire detections, skip roads
+rtxpy-build-scene -112.2 36.0 -112.0 36.2 grand_canyon.zarr --fires --no-roads
+
+# Add wind to an existing scene without re-fetching everything
+rtxpy-build-scene -112.2 36.0 -112.0 36.2 grand_canyon.zarr --resume
+```
+
+Options: `--no-buildings`, `--no-roads`, `--no-water`, `--no-wind`, `--no-weather`, `--hydro`, `--fires`, `--resume`.
+
+### Build from Python
+
+```python
+from rtxpy.scene import build_scene, explore_scene
+from rtxpy import LANDSCAPES
+
+loc = LANDSCAPES['grand_canyon']
+build_scene(loc, 'grand_canyon.zarr', crs=loc.crs)
+
+# Load and launch the viewer in one call
+explore_scene('grand_canyon.zarr')
+```
+
+119 preset locations ship with the package — countries, cities, and landscapes. Each carries a recommended projected CRS and its linear unit:
+
+```python
+from rtxpy import COUNTRIES, CITIES, LANDSCAPES
+from rtxpy.scene_locations import find
+
+loc = CITIES['tokyo']
+loc.crs    # 'EPSG:32654' (UTM 54N)
+loc.units  # 'meters'
+
+build_scene(loc, 'tokyo.zarr', crs=loc.crs)
+
+# Search by name
+find('canyon')  # {'landscape/grand_canyon': Location(..., crs='EPSG:32612'), ...}
+```
+
+**Why these CRS?** The explore() viewer needs a projected (metric) CRS so that terrain spacing, building heights, and particle simulations all work in real-world units. Cities and landscapes use UTM — the zone is computed automatically from the bounding box center, giving meter-accurate coordinates anywhere on earth. Countries with well-established national grids use those instead (British National Grid for the UK, Lambert-93 for France, Conus Albers for the US, etc.) since they minimize distortion over the full country extent. All CRS in the current set use meters.
+
+The zarr is self-contained: elevation stored as CF-encoded int16 with blosc compression, meshes spatially chunked to match the DEM grid, and wind/weather/hydro in their own groups. See `docs/proposals/scene-zarr-spec.md` for the full format.
+
 ## Prerequisites
 
 - **NVIDIA GPU**: Maxwell architecture or newer (GTX 900+ / RTX series)
