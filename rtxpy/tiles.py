@@ -169,6 +169,31 @@ def _build_latlon_grids(raster):
     return yy, xx
 
 
+def _build_crs_transformer(raster):
+    """Build a pyproj Transformer from the raster's CRS to WGS84.
+
+    Returns the transformer, or None if CRS info is unavailable.
+    """
+    try:
+        import pyproj
+        crs = raster.rio.crs
+    except (ImportError, AttributeError):
+        return None
+    if crs is None:
+        return None
+    if crs.is_geographic:
+        return 'geographic'  # sentinel: x=lon, y=lat, no transform needed
+    try:
+        return pyproj.Transformer.from_crs(
+            crs, "+proj=longlat +datum=WGS84 +no_defs", always_xy=True)
+    except Exception:
+        try:
+            return pyproj.Transformer.from_crs(
+                crs, "EPSG:4326", always_xy=True)
+        except Exception:
+            return None
+
+
 def _compute_pixel_spacing_meters(raster):
     """Estimate the ground-truth pixel spacing in metres.
 
@@ -238,6 +263,9 @@ class XYZTileService:
         # Per-pixel WGS84 coordinate grids — shape (H, W) each
         self._lats, self._lons = _build_latlon_grids(raster)
 
+        # CRS → WGS84 transformer (for streaming tile basemap fetching)
+        self._crs_transformer = _build_crs_transformer(raster)
+
         # Terrain WGS84 bounds (from the grids)
         self._lat_min = float(np.nanmin(self._lats))
         self._lat_max = float(np.nanmax(self._lats))
@@ -303,6 +331,134 @@ class XYZTileService:
                 return None
             self._texture_dirty = False
             return self._gpu_texture
+
+    def fetch_rgb_for_bounds(self, crs_x_min, crs_y_min, crs_x_max, crs_y_max,
+                             out_h, out_w):
+        """Fetch basemap RGB for an arbitrary CRS bounding box.
+
+        Builds a small lat/lon grid, fetches/caches needed XYZ tiles,
+        and composites them.  Runs synchronously (call from background
+        thread).
+
+        Parameters
+        ----------
+        crs_x_min, crs_y_min, crs_x_max, crs_y_max : float
+            Bounding box in the raster's native CRS (e.g. UTM metres).
+        out_h, out_w : int
+            Output pixel dimensions.
+
+        Returns
+        -------
+        np.ndarray, shape (out_h, out_w, 3), float32 [0-1], or None.
+        """
+        if self._crs_transformer is None:
+            return None
+
+        # Build CRS coordinate grid for the output tile.
+        # Row 0 = max y (north) to match raster row convention.
+        xs = np.linspace(crs_x_min, crs_x_max, out_w, dtype=np.float64)
+        ys = np.linspace(crs_y_max, crs_y_min, out_h, dtype=np.float64)
+        xx, yy = np.meshgrid(xs, ys)
+
+        # Transform to WGS84
+        if self._crs_transformer == 'geographic':
+            lons, lats = xx, yy
+        else:
+            lons, lats = self._crs_transformer.transform(xx, yy)
+
+        lat_min = float(np.nanmin(lats))
+        lat_max = float(np.nanmax(lats))
+        lon_min = float(np.nanmin(lons))
+        lon_max = float(np.nanmax(lons))
+
+        # Find which XYZ tiles cover this area
+        tile_list = tiles_for_bounds(lat_min, lon_min, lat_max, lon_max,
+                                     self._zoom)
+
+        # Fetch tiles (synchronous, using cache + disk + network)
+        rgb = np.zeros((out_h, out_w, 3), dtype=np.float32)
+        for coord in tile_list:
+            tile_array = self._get_or_fetch_tile(coord)
+            if tile_array is None:
+                continue
+            # Composite this tile onto output
+            tx, ty, tz = coord
+            tile_h, tile_w = tile_array.shape[:2]
+            nw_lat, nw_lon = tile_to_lat_lon(tx, ty, tz)
+            se_lat, se_lon = tile_to_lat_lon(tx + 1, ty + 1, tz)
+            lat_span = nw_lat - se_lat
+            lon_span = se_lon - nw_lon
+            if lat_span == 0 or lon_span == 0:
+                continue
+            mask = ((lats >= se_lat) & (lats <= nw_lat) &
+                    (lons >= nw_lon) & (lons <= se_lon))
+            rows, cols = np.where(mask)
+            if len(rows) == 0:
+                continue
+            pixel_lats = lats[rows, cols]
+            pixel_lons = lons[rows, cols]
+            row_fracs = (nw_lat - pixel_lats) / lat_span
+            col_fracs = (pixel_lons - nw_lon) / lon_span
+            tile_rows = np.clip((row_fracs * tile_h).astype(int),
+                                0, tile_h - 1)
+            tile_cols = np.clip((col_fracs * tile_w).astype(int),
+                                0, tile_w - 1)
+            rgb[rows, cols] = tile_array[tile_rows, tile_cols]
+
+        return rgb
+
+    def _get_or_fetch_tile(self, coord):
+        """Get a tile from cache, disk, or network (synchronous).
+
+        Returns (256, 256, 3) float32 [0-1], or None.
+        """
+        # In-memory cache
+        if coord in self._tile_cache:
+            return self._tile_cache[coord]
+
+        tx, ty, tz = coord
+        tile_array = None
+        disk_path = self._disk_path(coord)
+
+        # Disk cache
+        if disk_path.exists():
+            try:
+                from PIL import Image
+                img = Image.open(disk_path).convert('RGB')
+                tile_array = np.asarray(img, dtype=np.float32) / 255.0
+            except Exception:
+                pass
+
+        # Download
+        if tile_array is None:
+            url = self._url_template.format(x=tx, y=ty, z=tz)
+            try:
+                req = Request(url, headers={'User-Agent': 'rtxpy/0.1'})
+                with urlopen(req, timeout=15) as resp:
+                    data = resp.read()
+            except Exception:
+                return None
+            try:
+                from PIL import Image
+                import io
+                img = Image.open(io.BytesIO(data)).convert('RGB')
+                tile_array = np.asarray(img, dtype=np.float32) / 255.0
+            except Exception:
+                return None
+            # Save to disk cache
+            try:
+                disk_path.parent.mkdir(parents=True, exist_ok=True)
+                with open(disk_path, 'wb') as f:
+                    f.write(data)
+            except Exception:
+                pass
+
+        # Store in memory LRU cache
+        self._tile_cache[coord] = tile_array
+        if len(self._tile_cache) > self._cache_limit:
+            self._tile_cache.popitem(last=False)
+
+        return tile_array
 
     def reinit_for_raster(self, raster, pixel_spacing_x=None, pixel_spacing_y=None):
         """Re-initialize texture for a new raster (e.g. after resolution change).

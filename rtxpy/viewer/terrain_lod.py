@@ -59,17 +59,18 @@ class TerrainLODManager:
         '_update_threshold_sq',
         '_base_subsample', '_pyramid_cache', '_has_in_flight_work',
         '_tile_half_diag_sq', '_tile_half_diag',
-        '_max_dist_sq', '_max_dist',
+        '_max_dist_sq', '_max_dist', '_streaming_max_dist',
         '_tile_world_x', '_tile_world_y',
         '_offset_x', '_offset_y',
         'max_tiles', 'per_tick_build_limit',
         '_tile_roughness',
-        '_tile_data_fn', '_streaming',
+        '_tile_data_fn', '_streaming', '_crs_origin', '_crs_spacing',
         '_tile_data_cache', '_io_futures',
         '_executor', '_pending_futures', '_threaded',
         '_batched', '_lod_tile_meshes', '_dirty_lods', '_batch_gids',
         '_hf_enabled', '_hf_gid', '_hf_dirty', '_hf_tile_size',
         '_build_retries',
+        '_on_tile_added', '_on_tile_removed',
     )
 
     def __init__(self, terrain_np, tile_size=128,
@@ -101,6 +102,12 @@ class TerrainLODManager:
         self._streaming = False
         self._tile_data_cache = {}  # cache_key -> np.ndarray (prefetched I/O)
         self._io_futures = {}       # cache_key -> Future (in-flight prefetches)
+        # CRS coordinate origin and signed spacing — used to convert pixel
+        # indices to CRS coordinates for tile_data_fn calls.  Without this,
+        # the callback receives viewer world-space coords (pixel * abs(spacing))
+        # which are NOT valid CRS coordinates (UTM easting/northing).
+        self._crs_origin = None   # (crs_x0, crs_y0) or None
+        self._crs_spacing = None  # (crs_dx, crs_dy) signed, or None
 
         # Pre-compute tile centres in world coordinates
         self._tile_centers = {}
@@ -118,6 +125,8 @@ class TerrainLODManager:
                     if self._lod_distances else float('inf'))
         self._max_dist_sq = max_dist * max_dist
         self._max_dist = max_dist
+        self._streaming_max_dist = (self._lod_distances[-1] * 1.5
+                                    if self._lod_distances else max_dist)
         # Tile world-space dimensions (for streaming radius computation)
         self._tile_world_x = tile_size * abs(pixel_spacing_x)
         self._tile_world_y = tile_size * abs(pixel_spacing_y)
@@ -171,6 +180,11 @@ class TerrainLODManager:
         self._hf_dirty = False
         self._hf_tile_size = 32
 
+        # Tile lifecycle callbacks — used by OverlayTileManager to
+        # keep per-tile overlay data in sync with the tile set.
+        self._on_tile_added = None    # fn(tr, tc, elevation_tile)
+        self._on_tile_removed = None  # fn(tr, tc)
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -197,6 +211,21 @@ class TerrainLODManager:
         level changes (tile added, removed, or LOD transition).
         """
         self._batched = True
+
+    def set_tile_callbacks(self, on_added=None, on_removed=None):
+        """Register callbacks for tile lifecycle events.
+
+        Parameters
+        ----------
+        on_added : callable(tr, tc, elevation_tile) or None
+            Called when a tile is successfully added to the scene.
+            *elevation_tile* is the tile's elevation data from the
+            pyramid cache or streaming fetch (may be None for HF tiles).
+        on_removed : callable(tr, tc) or None
+            Called when a tile is evicted from the scene.
+        """
+        self._on_tile_added = on_added
+        self._on_tile_removed = on_removed
 
     def enable_heightfield_lod0(self, hf_tile_size=32):
         """Use heightfield ray marching for LOD 0 in-bounds tiles.
@@ -301,6 +330,41 @@ class TerrainLODManager:
         self._tile_data_fn = fn
         self._streaming = fn is not None
 
+        if self._streaming:
+            # Use floor division so partial edge tiles become out-of-bounds
+            # and are handled by streaming (which fetches from zarr without
+            # NaN reprojection artifacts).  Ceiling division leaves a gap
+            # between the last in-bounds partial tile and the first streaming
+            # tile when terrain dims aren't divisible by tile_size.
+            ts = self._tile_size
+            new_rows = self._H // ts
+            new_cols = self._W // ts
+            if new_rows != self._n_tile_rows or new_cols != self._n_tile_cols:
+                self._n_tile_rows = new_rows
+                self._n_tile_cols = new_cols
+                self._recompute_tile_centers()
+                self._compute_all_roughness()
+
+    def set_crs_transform(self, origin_x, origin_y, dx, dy):
+        """Set CRS coordinate origin and signed pixel spacing.
+
+        Required for streaming tiles: converts pixel indices to actual
+        CRS coordinates (e.g. UTM easting/northing) before calling
+        ``tile_data_fn``.  Without this, the callback receives viewer
+        world-space coordinates which are not valid CRS values.
+
+        Parameters
+        ----------
+        origin_x, origin_y : float
+            CRS coordinate of the first pixel (row 0, col 0).
+        dx, dy : float
+            Signed CRS spacing per pixel.  For UTM rasters, ``dx > 0``
+            (easting increases with column) and ``dy < 0`` (northing
+            decreases with row, since row 0 = north).
+        """
+        self._crs_origin = (origin_x, origin_y)
+        self._crs_spacing = (dx, dy)
+
     def _tile_center(self, tr, tc):
         """Return the world-space center of tile (tr, tc).
 
@@ -337,8 +401,13 @@ class TerrainLODManager:
         H, W = terrain_np.shape
         self._H = H
         self._W = W
-        self._n_tile_rows = (H + self._tile_size - 1) // self._tile_size
-        self._n_tile_cols = (W + self._tile_size - 1) // self._tile_size
+        ts = self._tile_size
+        if self._streaming:
+            self._n_tile_rows = H // ts
+            self._n_tile_cols = W // ts
+        else:
+            self._n_tile_rows = (H + ts - 1) // ts
+            self._n_tile_cols = (W + ts - 1) // ts
         if offset_x is not None:
             self._offset_x = offset_x
         if offset_y is not None:
@@ -436,13 +505,23 @@ class TerrainLODManager:
                 frustum_cos = math.cos(half_angle)
 
         tile_half_diag_sq = self._tile_half_diag_sq
-        max_dist_sq = self._max_dist_sq
+        # Use a tighter radius for streaming to keep tile count
+        # manageable.  Beyond the last LOD threshold all tiles are at
+        # max LOD — adding more doesn't improve quality but each one
+        # grows the batch GAS that must be rebuilt on LOD changes.
+        if self._streaming:
+            max_dist = self._streaming_max_dist
+            max_dist_sq = max_dist * max_dist
+        else:
+            max_dist_sq = self._max_dist_sq
+            max_dist = self._max_dist
 
         # Pass 1: find all tiles within distance range, and flag which
         # are also inside the view frustum (candidates for building).
         # Uses squared distances to avoid sqrt per tile.
         in_frustum = []    # tiles that passed distance + frustum culling
         in_range_ids = set()  # all distance-valid tiles (frustum-independent)
+        in_range_rc = set()   # (tr, tc) pairs for all in-range tiles
 
         lod_distances = self._lod_distances
         max_lod = self._max_lod
@@ -457,8 +536,8 @@ class TerrainLODManager:
             tr_f = (cam_y - self._offset_y) / (ts * self._psy) - 0.5
             tc_cam = int(round(tc_f))
             tr_cam = int(round(tr_f))
-            r_tc = int(self._max_dist / self._tile_world_x) + 1
-            r_tr = int(self._max_dist / self._tile_world_y) + 1
+            r_tc = int(max_dist / self._tile_world_x) + 1
+            r_tr = int(max_dist / self._tile_world_y) + 1
             tile_iter = ((tr, tc)
                          for tr in range(tr_cam - r_tr, tr_cam + r_tr + 1)
                          for tc in range(tc_cam - r_tc, tc_cam + r_tc + 1))
@@ -478,6 +557,7 @@ class TerrainLODManager:
             # Track all in-range tiles (prevents eviction on rotate).
             gid = _tile_gid(tr, tc)
             in_range_ids.add(gid)
+            in_range_rc.add((tr, tc))
 
             # Frustum check — skip LOD/roughness for tiles behind the
             # camera.  Tiles close enough to overlap the view origin
@@ -525,11 +605,12 @@ class TerrainLODManager:
         changed = False
 
         # --- Phase A: collect completed async builds ---
-        self._collect_completed_builds()
+        changed |= self._collect_completed_builds(rtx, ve)
 
         # --- Phase B: process tile queue (build/upload/stage) ---
-        changed, pending = self._process_tile_queue(
+        b_changed, pending = self._process_tile_queue(
             unbuilt + lod_updates, rtx, ve)
+        changed |= b_changed
 
         # --- Phase C: prefetch I/O for streaming tiles ---
         if (self._streaming and self._threaded
@@ -537,7 +618,7 @@ class TerrainLODManager:
             self._prefetch_streaming_tiles(unbuilt + lod_updates)
 
         # --- Phase D: remove stale tiles ---
-        changed |= self._remove_stale_tiles(rtx, in_range_ids)
+        changed |= self._remove_stale_tiles(rtx, in_range_ids, in_range_rc)
 
         # --- Phase E: rebuild heightfield and batch GAS ---
         if self._hf_enabled and self._hf_dirty:
@@ -546,7 +627,8 @@ class TerrainLODManager:
             changed |= self._rebuild_batches(rtx)
 
         self._has_in_flight_work = (pending or bool(self._pending_futures)
-                             or bool(self._io_futures))
+                             or bool(self._io_futures)
+                             or bool(self._dirty_lods))
         return changed
 
     # ------------------------------------------------------------------
@@ -555,9 +637,16 @@ class TerrainLODManager:
 
     _MAX_BUILD_RETRIES = 3
 
-    def _collect_completed_builds(self):
-        """Phase A: harvest completed async mesh builds and I/O prefetches."""
+    def _collect_completed_builds(self, rtx, ve):
+        """Phase A: harvest completed async mesh builds and I/O prefetches.
+
+        Freshly completed meshes are uploaded/staged immediately so they
+        don't depend on re-passing the frustum check (the build was
+        already approved on a prior tick).
+        """
+        changed = False
         if self._pending_futures:
+            batched = self._batched
             for cache_key, fut in list(self._pending_futures.items()):
                 if not fut.done():
                     continue
@@ -579,6 +668,17 @@ class TerrainLODManager:
                 result = fut.result()
                 if result is not None and result[0] is not None:
                     self._tile_cache[cache_key] = result
+                    # Upload/stage immediately — don't wait for frustum re-check
+                    tr, tc, lod = cache_key[0], cache_key[1], cache_key[2]
+                    gid = _tile_gid(tr, tc)
+                    if batched:
+                        self._stage_tile(gid, tr, tc, lod, result, ve)
+                    else:
+                        changed |= self._upload_tile(
+                            gid, tr, tc, lod, result, ve, rtx)
+                else:
+                    # Cache empty result so this tile is not rebuilt
+                    self._tile_cache[cache_key] = (None, None, None)
 
         if self._io_futures:
             for cache_key, fut in list(self._io_futures.items()):
@@ -593,6 +693,7 @@ class TerrainLODManager:
                 result = fut.result()
                 if result is not None:
                     self._tile_data_cache[cache_key] = result
+        return changed
 
     def _process_tile_queue(self, queue, rtx, ve):
         """Phase B: build, upload, or stage tiles from the priority queue.
@@ -622,9 +723,12 @@ class TerrainLODManager:
                     prev_lod = tile_lods.get((tr, tc), -1)
                     if prev_lod > 0 and batched:
                         self._unstage_tile(tr, tc, prev_lod)
+                    was_new = (tr, tc) not in self._tile_lods
                     self._tile_lods[(tr, tc)] = 0
                     self._active_tiles.add(gid)
                     self._hf_dirty = True
+                    if was_new and self._on_tile_added is not None:
+                        self._fire_tile_added(tr, tc)
                     continue
 
             cache_key = (tr, tc, lod, self._base_subsample)
@@ -632,6 +736,8 @@ class TerrainLODManager:
             # Already in the cache — upload/stage immediately (free)
             cached = self._tile_cache.get(cache_key)
             if cached is not None:
+                if cached[0] is None:
+                    continue  # empty tile (no data available)
                 if batched:
                     self._stage_tile(gid, tr, tc, lod, cached, ve)
                 else:
@@ -695,55 +801,78 @@ class TerrainLODManager:
                 self._fetch_tile_data, tr, tc, lod)
             submitted += 1
 
-    def _remove_stale_tiles(self, rtx, in_range_ids):
+    def _remove_stale_tiles(self, rtx, in_range_ids, in_range_rc):
         """Phase D: remove tiles that left the distance range.
 
         Never removes tiles merely outside the frustum (avoids flicker
         when the camera rotates).  Evicts mesh cache entries to bound
-        memory.
+        memory, including orphaned None-cached entries from streaming
+        tiles that were never activated.
 
         Returns True if any tile GAS was removed.
         """
         stale_ids = self._active_tiles - in_range_ids
-        if not stale_ids:
-            return False
 
         changed = False
         batched = self._batched
         hf_enabled = self._hf_enabled
 
-        if not batched:
+        if stale_ids:
+            # Remove individual GAS entries for stale tiles.  In batched
+            # mode, tiles from the pre-batching initial build still have
+            # individual GAS entries that must be cleaned up.
             for old_id in stale_ids:
-                rtx.remove_geometry(old_id)
-                changed = True
+                if rtx.has_geometry(old_id):
+                    rtx.remove_geometry(old_id)
+                    changed = True
 
-        stale_keys = {k for k in self._tile_lods
-                      if _tile_gid(*k) in stale_ids}
-        stale_rc = {(k[0], k[1]) for k in stale_keys}
-        for k in stale_keys:
-            prev_lod = self._tile_lods.get(k, -1)
-            if hf_enabled and prev_lod == 0:
-                self._hf_dirty = True
-            elif batched and prev_lod >= 0:
-                self._unstage_tile(k[0], k[1], prev_lod)
-            del self._tile_lods[k]
-        # Evict all cached LOD variants for stale tiles (single pass)
-        for cache_k in [ck for ck in self._tile_cache
-                        if (ck[0], ck[1]) in stale_rc]:
-            del self._tile_cache[cache_k]
-        # Cancel in-flight builds for stale tiles (single pass)
-        for fk in [fk for fk in self._pending_futures
-                   if (fk[0], fk[1]) in stale_rc]:
-            self._pending_futures.pop(fk).cancel()
-        # Cancel in-flight I/O prefetches (single pass)
-        for fk in [fk for fk in self._io_futures
-                   if (fk[0], fk[1]) in stale_rc]:
-            self._io_futures.pop(fk).cancel()
-        # Evict prefetched tile data (single pass)
-        for dk in [dk for dk in self._tile_data_cache
-                   if (dk[0], dk[1]) in stale_rc]:
-            del self._tile_data_cache[dk]
-        self._active_tiles -= stale_ids
+            stale_keys = {k for k in self._tile_lods
+                          if _tile_gid(*k) in stale_ids}
+            stale_rc = {(k[0], k[1]) for k in stale_keys}
+            on_removed = self._on_tile_removed
+            for k in stale_keys:
+                prev_lod = self._tile_lods.get(k, -1)
+                if hf_enabled and prev_lod == 0:
+                    self._hf_dirty = True
+                elif batched and prev_lod >= 0:
+                    self._unstage_tile(k[0], k[1], prev_lod)
+                del self._tile_lods[k]
+                if on_removed is not None:
+                    on_removed(k[0], k[1])
+            # Evict all cached LOD variants for stale tiles (single pass)
+            for cache_k in [ck for ck in self._tile_cache
+                            if (ck[0], ck[1]) in stale_rc]:
+                del self._tile_cache[cache_k]
+            # Cancel in-flight builds for stale tiles (single pass)
+            for fk in [fk for fk in self._pending_futures
+                       if (fk[0], fk[1]) in stale_rc]:
+                self._pending_futures.pop(fk).cancel()
+            # Cancel in-flight I/O prefetches (single pass)
+            for fk in [fk for fk in self._io_futures
+                       if (fk[0], fk[1]) in stale_rc]:
+                self._io_futures.pop(fk).cancel()
+            # Evict prefetched tile data (single pass)
+            for dk in [dk for dk in self._tile_data_cache
+                       if (dk[0], dk[1]) in stale_rc]:
+                del self._tile_data_cache[dk]
+            # Evict stale build retry entries
+            for brk in [brk for brk in self._build_retries
+                        if (brk[0], brk[1]) in stale_rc]:
+                del self._build_retries[brk]
+            self._active_tiles -= stale_ids
+
+        # Evict orphaned cache entries: tiles cached (including
+        # None-cached streaming tiles outside DEM extent) but not in
+        # distance range and not pending build.  Without this, None
+        # entries from tiles the camera flew past accumulate forever.
+        if self._streaming and self._tile_cache:
+            pending_rc = {(k[0], k[1]) for k in self._pending_futures}
+            orphan_keys = [ck for ck in self._tile_cache
+                           if (ck[0], ck[1]) not in in_range_rc
+                           and (ck[0], ck[1]) not in pending_rc]
+            for ck in orphan_keys:
+                del self._tile_cache[ck]
+
         return changed
 
     def remove_all(self, rtx):
@@ -805,7 +934,11 @@ class TerrainLODManager:
         active = len(self._tile_lods)
         if self._batched or self._hf_enabled:
             n_gas = len(self._batch_gids)
-            suffix = f", {n_gas} GAS"
+            staged = sum(len(t) for t in self._lod_tile_meshes.values())
+            total_verts = sum(len(v) // 3
+                              for tiles in self._lod_tile_meshes.values()
+                              for v, _, _ in tiles.values())
+            suffix = f", {n_gas} GAS, {staged}stg/{total_verts//1000}Kv"
         else:
             suffix = ""
         if self._streaming:
@@ -899,8 +1032,30 @@ class TerrainLODManager:
         if rc == 0 or rc is None:
             self._active_tiles.add(gid)
             self._tile_lods[(tr, tc)] = lod
+            if self._on_tile_added is not None:
+                self._fire_tile_added(tr, tc)
             return True
         return False
+
+    def _fire_tile_added(self, tr, tc):
+        """Invoke the on_tile_added callback with this tile's elevation."""
+        ts = self._tile_size
+        in_bounds = (0 <= tr < self._n_tile_rows
+                     and 0 <= tc < self._n_tile_cols)
+        if in_bounds:
+            r0, c0 = tr * ts, tc * ts
+            r1 = min(r0 + ts, self._H)
+            c1 = min(c0 + ts, self._W)
+            elev = self._terrain_np[r0:r1, c0:c1]
+        else:
+            # Streaming tile — check prefetch cache
+            cache_key = (tr, tc)
+            elev = self._tile_data_cache.get(cache_key)
+        try:
+            self._on_tile_added(tr, tc, elev)
+        except Exception:
+            logger.debug("on_tile_added callback failed for (%d, %d)",
+                         tr, tc, exc_info=True)
 
     def _needs_stitch(self, tr, tc, lod):
         """Check whether any neighbor requires boundary stitching."""
@@ -927,9 +1082,7 @@ class TerrainLODManager:
             (suitable for immediate GPU upload that copies internally).
         """
         cached_verts, indices, cached_normals = mesh_data
-        in_bounds = (0 <= tr < self._n_tile_rows
-                     and 0 <= tc < self._n_tile_cols)
-        needs_stitch = in_bounds and self._needs_stitch(tr, tc, lod)
+        needs_stitch = self._needs_stitch(tr, tc, lod)
         needs_ve = ve != 1.0
 
         if not needs_stitch and not needs_ve:
@@ -974,6 +1127,8 @@ class TerrainLODManager:
         self._dirty_lods.add(lod)
         self._active_tiles.add(gid)
         self._tile_lods[(tr, tc)] = lod
+        if self._on_tile_added is not None:
+            self._fire_tile_added(tr, tc)
 
     def _tile_grid_dims(self, tr, tc, lod):
         """Compute grid dimensions (th, tw) for a tile without building it."""
@@ -1002,13 +1157,31 @@ class TerrainLODManager:
 
         For each edge where the neighbor has a different LOD (or is a
         heightfield tile), the boundary vertices are interpolated from
-        the reference pyramid level.  This closes T-junction cracks
-        without needing skirt geometry.
+        the reference pyramid level or the neighbor's cached mesh.
+        Works for both in-bounds and streaming tiles.
         """
-        th, tw = self._tile_grid_dims(tr, tc, lod)
+        in_bounds = (0 <= tr < self._n_tile_rows
+                     and 0 <= tc < self._n_tile_cols)
         n_verts = len(verts) // 3
-        if n_verts != th * tw or th < 2 or tw < 2:
+        if n_verts < 4:
             return
+        if in_bounds:
+            th, tw = self._tile_grid_dims(tr, tc, lod)
+            if n_verts != th * tw or th < 2 or tw < 2:
+                return
+        else:
+            # Streaming tile: infer grid dims from vertex count.
+            # Streaming meshes are regular grids, so th * tw == n_verts.
+            # Count vertices sharing the first row's Y coordinate.
+            y_coords = verts[1::3]
+            y0 = y_coords[0]
+            tol = abs(self._psy) * 0.1
+            tw = int(np.sum(np.abs(y_coords - y0) < max(tol, 1e-6)))
+            if tw < 2:
+                return
+            th = n_verts // tw
+            if th < 2 or th * tw != n_verts:
+                return
 
         neighbors = {
             'top': (tr - 1, tc),
@@ -1060,10 +1233,104 @@ class TerrainLODManager:
             verts[edge_indices * 3 + 2] = z_interp.astype(np.float32)
 
     def _get_boundary_z_ref(self, tr, tc, edge, ref_lod):
-        """Get Z values from a reference pyramid level at a shared boundary.
+        """Get Z values from a reference level at a shared tile boundary.
 
         Returns the 1-D array of elevation values that the reference
         (coarser or heightfield) tile would have along the shared edge.
+        Falls back to extracting Z from the neighbor's cached mesh
+        when pyramid data is not available (streaming tiles).
+        """
+        tile_in_bounds = (0 <= tr < self._n_tile_rows
+                          and 0 <= tc < self._n_tile_cols)
+
+        # Pyramid path works when the tile itself is in-bounds
+        if tile_in_bounds:
+            return self._get_boundary_z_ref_pyramid(tr, tc, edge, ref_lod)
+
+        # Tile is streaming (out of bounds) — determine the neighbor
+        # and try to get boundary Z from IT
+        if edge == 'top':
+            nr, nc = tr - 1, tc
+        elif edge == 'bottom':
+            nr, nc = tr + 1, tc
+        elif edge == 'left':
+            nr, nc = tr, tc - 1
+        else:
+            nr, nc = tr, tc + 1
+
+        neighbor_in_bounds = (0 <= nr < self._n_tile_rows
+                              and 0 <= nc < self._n_tile_cols)
+
+        if neighbor_in_bounds:
+            # Neighbor is in-bounds — use pyramid via neighbor's coords
+            opposite = {'top': 'bottom', 'bottom': 'top',
+                        'left': 'right', 'right': 'left'}
+            return self._get_boundary_z_ref_pyramid(
+                nr, nc, opposite[edge], ref_lod)
+
+        # Both tiles are streaming — extract from neighbor's cached mesh
+        return self._get_boundary_z_from_cache(nr, nc, edge, ref_lod)
+
+    def _get_boundary_z_from_cache(self, nr, nc, edge, ref_lod):
+        """Extract boundary Z values from a neighbor's cached mesh.
+
+        Used for streaming tiles that have no pyramid data.  Reads the
+        un-VE'd mesh from ``_tile_cache`` and returns Z at the shared
+        edge.
+
+        Parameters
+        ----------
+        nr, nc : int
+            Neighbor tile row/column.
+        edge : str
+            Edge from the perspective of the tile being stitched
+            ('top'/'bottom'/'left'/'right').  The neighbor's shared
+            edge is the opposite.
+        ref_lod : int
+            LOD of the neighbor tile.
+        """
+        cache_key = (nr, nc, ref_lod, self._base_subsample)
+        cached = self._tile_cache.get(cache_key)
+        if cached is None or cached[0] is None:
+            return None
+
+        n_verts_cached, _, _ = cached
+        nverts = len(n_verts_cached) // 3
+        if nverts < 4:
+            return None
+
+        # Infer grid dims from cached mesh
+        y_coords = n_verts_cached[1::3]
+        y0 = y_coords[0]
+        tol = abs(self._psy) * 0.1
+        n_tw = int(np.sum(np.abs(y_coords - y0) < max(tol, 1e-6)))
+        if n_tw < 2:
+            return None
+        n_th = nverts // n_tw
+        if n_th < 2 or n_th * n_tw != nverts:
+            return None
+
+        z_vals = n_verts_cached[2::3]
+
+        # Map caller's edge to neighbor's opposite edge
+        opposite = {'top': 'bottom', 'bottom': 'top',
+                    'left': 'right', 'right': 'left'}
+        neighbor_edge = opposite[edge]
+
+        if neighbor_edge == 'top':
+            return z_vals[:n_tw].copy()
+        elif neighbor_edge == 'bottom':
+            return z_vals[(n_th - 1) * n_tw:n_th * n_tw].copy()
+        elif neighbor_edge == 'left':
+            return z_vals[::n_tw].copy()
+        elif neighbor_edge == 'right':
+            return z_vals[n_tw - 1::n_tw].copy()
+        return None
+
+    def _get_boundary_z_ref_pyramid(self, tr, tc, edge, ref_lod):
+        """Get Z values from a pyramid level at a shared boundary.
+
+        Original pyramid-based implementation for in-bounds tiles.
         """
         pyr_level = min(ref_lod, self._max_lod)
         pyr = self._get_pyramid_level(pyr_level)
@@ -1195,21 +1462,34 @@ class TerrainLODManager:
         into a single vertex/index/normal buffer and uploads as one
         GAS.  Empty levels have their batch GAS removed.
 
+        To avoid frame spikes when multiple LODs are dirty (e.g. on
+        camera rotation), at most one non-empty LOD batch is rebuilt
+        per tick.  Empty-LOD removals are always processed immediately
+        since they're cheap.
+
         Returns True if any GAS was added or updated.
         """
         if not self._dirty_lods:
             return False
         changed = False
-        for lod in self._dirty_lods:
+        rebuilt_one = False
+        remaining = set()
+        for lod in sorted(self._dirty_lods):
             batch_gid = _batch_gid(lod)
             tiles = self._lod_tile_meshes.get(lod, {})
             if not tiles:
-                # All tiles left this LOD — remove the batch GAS
+                # All tiles left this LOD — remove the batch GAS (cheap)
                 if batch_gid in self._batch_gids:
                     rtx.remove_geometry(batch_gid)
                     self._batch_gids.discard(batch_gid)
                     changed = True
                 continue
+
+            # Only rebuild one non-empty batch per tick to cap frame time
+            if rebuilt_one:
+                remaining.add(lod)
+                continue
+            rebuilt_one = True
 
             all_verts = []
             all_indices = []
@@ -1231,7 +1511,7 @@ class TerrainLODManager:
             if rc == 0 or rc is None:
                 self._batch_gids.add(batch_gid)
                 changed = True
-        self._dirty_lods.clear()
+        self._dirty_lods = remaining
         return changed
 
     def _get_tile_mesh(self, tr, tc, lod):
@@ -1337,6 +1617,15 @@ class TerrainLODManager:
         if th < 2 or tw < 2:
             return None, None, None
 
+        # Replace NaN values (common at edges from UTM reprojection)
+        # to avoid degenerate triangles and NaN normals.
+        bad = ~np.isfinite(tile)
+        if bad.all():
+            return None, None, None
+        if bad.any():
+            tile = tile.copy()
+            tile[bad] = float(np.nanmean(tile))
+
         # Triangulate using the fast numba/CUDA path
         num_verts = th * tw
         num_tris = (th - 1) * (tw - 1) * 2
@@ -1371,10 +1660,21 @@ class TerrainLODManager:
 
         c0 = tc * ts
         r0 = tr * ts
-        wx0 = c0 * self._psx + self._offset_x
-        wy0 = r0 * self._psy + self._offset_y
-        wx1 = (c0 + ts) * self._psx + self._offset_x
-        wy1 = (r0 + ts) * self._psy + self._offset_y
+
+        # Convert pixel indices to CRS coordinates (e.g. UTM) when
+        # available; otherwise fall back to viewer world-space coords.
+        if self._crs_origin is not None and self._crs_spacing is not None:
+            crs_x0, crs_y0 = self._crs_origin
+            crs_dx, crs_dy = self._crs_spacing
+            wx0 = crs_x0 + c0 * crs_dx
+            wy0 = crs_y0 + r0 * crs_dy
+            wx1 = crs_x0 + (c0 + ts) * crs_dx
+            wy1 = crs_y0 + (r0 + ts) * crs_dy
+        else:
+            wx0 = c0 * self._psx + self._offset_x
+            wy0 = r0 * self._psy + self._offset_y
+            wx1 = (c0 + ts) * self._psx + self._offset_x
+            wy1 = (r0 + ts) * self._psy + self._offset_y
 
         x_min, x_max = min(wx0, wx1), max(wx0, wx1)
         y_min, y_max = min(wy0, wy1), max(wy0, wy1)
@@ -1407,6 +1707,15 @@ class TerrainLODManager:
                 return None, None, None
 
         ts = self._tile_size
+
+        # Replace NaN / extreme values with 0 — NaN creates degenerate
+        # triangles and fill-value leaks produce vertices at -21M Z.
+        bad = ~np.isfinite(tile)
+        if bad.all():
+            return None, None, None
+        if bad.any():
+            tile = tile.copy()
+            tile[bad] = 0.0
 
         # World-space bounds of this tile
         c0 = tc * ts
@@ -1480,6 +1789,7 @@ def _box_downsample_2x(arr):
 def _tile_gid(tr, tc):
     """Geometry ID for a terrain LOD tile."""
     return f'terrain_lod_r{tr}_c{tc}'
+
 
 
 def _batch_gid(lod):

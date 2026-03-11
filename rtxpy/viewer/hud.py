@@ -15,7 +15,9 @@ class HUDState:
         'last_title', 'last_subtitle',
         'minimap_background', 'minimap_scale_x', 'minimap_scale_y',
         'minimap_has_tiles', 'minimap_rect',
+        'minimap_world_extent',
         'minimap_style', 'minimap_layer', 'minimap_colors',
+        'minimap_bg_extent', 'minimap_last_stream_time',
     )
 
     def __init__(self, title='rtxpy', subtitle=None, legend=None):
@@ -37,6 +39,9 @@ class HUDState:
         self.minimap_scale_y = 1.0
         self.minimap_has_tiles = False
         self.minimap_rect = None
+        self.minimap_world_extent = None  # (wx_min, wy_min, wx_max, wy_max)
         self.minimap_style = None
         self.minimap_layer = None
         self.minimap_colors = None
+        self.minimap_bg_extent = None  # (wx_min, wy_min, wx_max, wy_max)
+        self.minimap_last_stream_time = 0.0

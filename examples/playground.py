@@ -259,7 +259,6 @@ if __name__ == "__main__":
         weather_data=weather,
         hydro_data=hydro,
         fog_density=3.0,
-        lod=True,
         repl=True,
     )
 

@@ -29,6 +29,7 @@ from .viewer.observers import ObserverManager, Observer, OBSERVER_COLORS
 from .viewer.wind import WindState
 from .viewer.cloud import CloudState
 from .viewer.hydro import HydroState
+from .viewer.hydro_manager import HydroManager
 from .viewer.hud import HUDState
 from .viewer.keybindings import MOVEMENT_KEYS, SHIFT_BINDINGS, KEY_BINDINGS, SPECIAL_BINDINGS
 
@@ -160,442 +161,6 @@ if has_cupy:
                 cuda.atomic.add(output, (py, px, 0), contrib * color_r)
                 cuda.atomic.add(output, (py, px, 1), contrib * color_g)
                 cuda.atomic.add(output, (py, px, 2), contrib * color_b)
-
-
-    @cuda.jit
-    def _hydro_splat_kernel(
-        trails,       # (N*T, 2) float32 — (row, col) per trail point
-        ages,         # (N,) int32 — per-particle age
-        lifetimes,    # (N,) int32 — per-particle lifetime
-        colors,       # (N, 3) float32 — per-particle (r, g, b)
-        radii,        # (N,) int32 — per-particle splat radius
-        trail_len,    # int32 scalar — trail points per particle
-        base_alpha,   # float32 scalar — base alpha intensity
-        min_vis_age,  # int32 scalar — minimum visible age
-        ref_depth,    # float32 scalar — depth-scaling reference distance
-        terrain,      # (tH, tW) float32 — terrain elevation
-        depth_t,      # (sh, sw) float32 — ray-trace t-values for occlusion
-        output,       # (sh, sw, 3) float32 — frame buffer (atomic add)
-        # Camera basis — scalar args to avoid tiny GPU allocations
-        cam_x, cam_y, cam_z,
-        fwd_x, fwd_y, fwd_z,
-        rgt_x, rgt_y, rgt_z,
-        up_x, up_y, up_z,
-        # Projection params
-        fov_scale, aspect_ratio,
-        # Terrain/world params
-        psx, psy, ve, subsample_f, min_depth, max_depth,
-    ):
-        idx = cuda.grid(1)
-        if idx >= trails.shape[0]:
-            return
-
-        # Compute alpha on-GPU from per-particle ages/lifetimes
-        pidx = idx // trail_len
-        tidx = idx % trail_len
-        age = ages[pidx]
-        lifetime = lifetimes[pidx]
-
-        # Trail point not yet laid down
-        if age <= tidx:
-            return
-
-        # Fade in / fade out / trail decay
-        fade_in = (age - min_vis_age) * 0.1
-        if fade_in < 0.0:
-            fade_in = 0.0
-        elif fade_in > 1.0:
-            fade_in = 1.0
-        fade_out = (lifetime - age) * 0.05
-        if fade_out < 0.0:
-            fade_out = 0.0
-        elif fade_out > 1.0:
-            fade_out = 1.0
-        # Quadratic trail decay — comet-tail effect
-        t = float(tidx) / float(trail_len)
-        trail_fade = (1.0 - t) * (1.0 - t)
-        a = base_alpha * fade_in * fade_out * trail_fade
-
-        # Head glow: bright spark at particle position
-        if tidx == 0:
-            a = a * 1.5
-
-        if a < 1e-6:
-            return
-
-        row = trails[idx, 0]
-        col = trails[idx, 1]
-
-        # Terrain Z lookup (nearest-neighbor, clamped)
-        tH = terrain.shape[0]
-        tW = terrain.shape[1]
-        sr = int(row / subsample_f)
-        sc = int(col / subsample_f)
-        if sr < 0:
-            sr = 0
-        elif sr >= tH:
-            sr = tH - 1
-        if sc < 0:
-            sc = 0
-        elif sc >= tW:
-            sc = tW - 1
-        z_raw = terrain[sr, sc]
-        if z_raw != z_raw:  # NaN check
-            z_raw = 0.0
-        z_val = z_raw * ve + 3.0
-
-        # World position
-        wx = col * psx
-        wy = row * psy
-
-        # Camera-relative
-        dx = wx - cam_x
-        dy = wy - cam_y
-        dz = z_val - cam_z
-
-        # Depth along forward axis
-        depth = dx * fwd_x + dy * fwd_y + dz * fwd_z
-        if depth <= min_depth:
-            return
-        if max_depth > 0.0 and depth > max_depth:
-            return
-
-        # Depth-scaled alpha: closer = brighter, farther = fainter.
-        # Prevents zoomed-out over-saturation from dense overlapping particles.
-        depth_scale = ref_depth / (depth + ref_depth)
-        a = a * depth_scale
-
-        if a < 1e-6:
-            return
-
-        inv_depth = 1.0 / (depth + 1e-10)
-        u_cam = dx * rgt_x + dy * rgt_y + dz * rgt_z
-        v_cam = dx * up_x + dy * up_y + dz * up_z
-        u_ndc = u_cam * inv_depth / (fov_scale * aspect_ratio)
-        v_ndc = v_cam * inv_depth / fov_scale
-
-        sh = output.shape[0]
-        sw = output.shape[1]
-        sx = int((u_ndc + 1.0) * 0.5 * sw)
-        sy = int((1.0 - v_ndc) * 0.5 * sh)
-
-        if sx < 0 or sx >= sw or sy < 0 or sy >= sh:
-            return
-
-        # Depth test: cull particles occluded by terrain.
-        # Convert ray t-value at this pixel to forward depth, then compare
-        # to the particle's forward depth (already computed as `depth`).
-        if depth_t.shape[0] > 0:
-            t_val = depth_t[sy, sx]
-            if t_val > 0.0 and t_val < 1.0e20:
-                # Forward depth = t / sqrt(1 + u_cam^2 + v_cam^2)
-                u_px = (2.0 * float(sx) / float(sw) - 1.0) * fov_scale * aspect_ratio
-                v_px = (1.0 - 2.0 * float(sy) / float(sh)) * fov_scale
-                inv_cos = math.sqrt(1.0 + u_px * u_px + v_px * v_px)
-                terrain_fwd = t_val / inv_cos
-                if depth > terrain_fwd:
-                    return
-
-        # Per-particle color and radius
-        color_r = colors[pidx, 0]
-        color_g = colors[pidx, 1]
-        color_b = colors[pidx, 2]
-        r = radii[pidx]
-        if r < 1:
-            r = 1
-        # Head glow: +1px radius halo at particle position
-        if tidx == 0:
-            r = r + 1
-
-        # Circular stamp splat
-        for offy in range(-r, r + 1):
-            for offx in range(-r, r + 1):
-                dist_sq = offx * offx + offy * offy
-                if dist_sq > r * r:
-                    continue
-                falloff = 1.0 - math.sqrt(dist_sq) / r
-                px = sx + offx
-                py = sy + offy
-                if px < 0 or px >= sw or py < 0 or py >= sh:
-                    continue
-                contrib = a * falloff
-                cuda.atomic.add(output, (py, px, 0), contrib * color_r)
-                cuda.atomic.add(output, (py, px, 1), contrib * color_g)
-                cuda.atomic.add(output, (py, px, 2), contrib * color_b)
-
-
-    @cuda.jit
-    def _hydro_advect_kernel(
-        # Particle state (GPU-resident, modified in-place)
-        particles,      # (N, 2) float32 — (row, col) positions
-        ages,           # (N,) int32
-        lifetimes,      # (N,) int32
-        trails,         # (N, T, 2) float32 — trail history
-        particle_accum, # (N,) float32 — max-tracked stream weight
-        particle_raw_order,  # (N,) int32 — max-tracked raw Strahler order
-        colors,         # (N, 3) float32 — per-particle RGB
-        radii,          # (N,) int32 — per-particle splat radius
-        # Grid textures (GPU-resident, read-only)
-        flow_u,         # (H, W) float32 — MFD flow col-component
-        flow_v,         # (H, W) float32 — MFD flow row-component
-        slope_mag,      # (H, W) float32 — normalized slope
-        stream_order,   # (H, W) float32 — normalized stream order (or empty)
-        stream_order_raw,  # (H, W) int32 — raw Strahler order (or empty)
-        accum_norm,     # (H, W) float32 — normalized flow accumulation
-        # Palette for color lookup (9, 3) float32
-        palette,        # (9, 3) float32 — stream order color palette
-        # Output: respawn flags
-        respawn_flags,  # (N,) int32 — 1 if particle needs respawn
-        # Scalar params
-        speed, dt_scale, trail_len,
-        has_so,         # int32: 1 if stream_order is valid
-        has_slope,      # int32: 1 if slope_mag is valid
-        has_raw_order,  # int32: 1 if stream_order_raw / particle_raw_order valid
-        # RNG seed
-        rng_base,       # int64 — base seed for per-particle RNG
-    ):
-        """Advect one hydro particle: bilinear flow lookup, trail shift, respawn detection."""
-        i = cuda.grid(1)
-        N = particles.shape[0]
-        if i >= N:
-            return
-
-        H = flow_u.shape[0]
-        W = flow_u.shape[1]
-
-        row = particles[i, 0]
-        col = particles[i, 1]
-
-        # Shift trail buffer: slot 0 = current pos (before advection)
-        t = trail_len - 1
-        while t > 0:
-            trails[i, t, 0] = trails[i, t - 1, 0]
-            trails[i, t, 1] = trails[i, t - 1, 1]
-            t -= 1
-        trails[i, 0, 0] = row
-        trails[i, 0, 1] = col
-
-        # Bilinear interpolation of MFD flow vectors
-        r_clean = row
-        c_clean = col
-        if r_clean != r_clean:
-            r_clean = 0.0
-        if c_clean != c_clean:
-            c_clean = 0.0
-        if r_clean < 0.0:
-            r_clean = 0.0
-        elif r_clean > H - 1.0:
-            r_clean = H - 1.0
-        if c_clean < 0.0:
-            c_clean = 0.0
-        elif c_clean > W - 1.0:
-            c_clean = W - 1.0
-
-        r0 = int(r_clean)
-        c0 = int(c_clean)
-        if r0 > H - 2:
-            r0 = H - 2
-        if c0 > W - 2:
-            c0 = W - 2
-        if r0 < 0:
-            r0 = 0
-        if c0 < 0:
-            c0 = 0
-        r1 = r0 + 1
-        c1 = c0 + 1
-
-        dr = r_clean - float(r0)
-        dc = c_clean - float(c0)
-        w00 = (1.0 - dr) * (1.0 - dc)
-        w01 = (1.0 - dr) * dc
-        w10 = dr * (1.0 - dc)
-        w11 = dr * dc
-
-        u_val = (flow_u[r0, c0] * w00 + flow_u[r0, c1] * w01 +
-                 flow_u[r1, c0] * w10 + flow_u[r1, c1] * w11)
-        v_val = (flow_v[r0, c0] * w00 + flow_v[r0, c1] * w01 +
-                 flow_v[r1, c0] * w10 + flow_v[r1, c1] * w11)
-
-        # Integer indices for grid lookups
-        ri = int(r_clean)
-        ci = int(c_clean)
-        if ri > H - 1:
-            ri = H - 1
-        if ci > W - 1:
-            ci = W - 1
-        if ri < 0:
-            ri = 0
-        if ci < 0:
-            ci = 0
-
-        # Max-track stream order / accumulation
-        if has_so:
-            cur_val = stream_order[ri, ci]
-        else:
-            cur_val = accum_norm[ri, ci]
-        old_val = particle_accum[i]
-        if cur_val > old_val:
-            particle_accum[i] = cur_val
-            # Update raw order
-            if has_raw_order:
-                cur_raw = stream_order_raw[ri, ci]
-                if cur_raw > particle_raw_order[i]:
-                    particle_raw_order[i] = cur_raw
-            # Recompute color + radius from new weight
-            if has_raw_order:
-                raw_o = particle_raw_order[i]
-                idx = raw_o
-                if idx < 1:
-                    idx = 1
-                if idx > 8:
-                    idx = 8
-                colors[i, 0] = palette[idx, 0]
-                colors[i, 1] = palette[idx, 1]
-                colors[i, 2] = palette[idx, 2]
-                rad = raw_o + 1
-                if rad < 2:
-                    rad = 2
-                if rad > 5:
-                    rad = 5
-                radii[i] = rad
-            else:
-                a_val = particle_accum[i]
-                colors[i, 0] = 0.02 + a_val * 0.43
-                colors[i, 1] = 0.10 + a_val * 0.65
-                colors[i, 2] = 0.55 + a_val * 0.40
-                rad = 2 + int(a_val * 3.0)
-                if rad < 2:
-                    rad = 2
-                if rad > 5:
-                    rad = 5
-                radii[i] = rad
-
-        # Simple xorshift64 RNG seeded per-particle per-frame
-        s = rng_base * 2654435761 + i * 1442695040888963407
-        s = s ^ (s >> 17)
-        s = s * 6364136223846793005
-        s = s ^ (s >> 31)
-        # Two uniform floats in [-0.1, 0.1] for jitter
-        jitter_r = ((s & 0xFFFF) / 65535.0 - 0.5) * 0.2
-        s = s * 6364136223846793005 + 1
-        s = s ^ (s >> 31)
-        jitter_c = ((s & 0xFFFF) / 65535.0 - 0.5) * 0.2
-
-        # Slope-based speed
-        slope_f = 1.0
-        if has_slope:
-            slope_f = 0.3 + 0.7 * slope_mag[ri, ci]
-
-        # Advect
-        particles[i, 0] = row + (v_val + jitter_r) * speed * dt_scale * slope_f
-        particles[i, 1] = col + (u_val + jitter_c) * speed * dt_scale * slope_f
-
-        # Age
-        ages[i] = ages[i] + 1
-
-        # Respawn detection: OOB, aged-out, stuck
-        new_r = particles[i, 0]
-        new_c = particles[i, 1]
-        is_nan = (new_r != new_r) or (new_c != new_c)
-        is_oob = is_nan or new_r < 0.0 or new_r >= H or new_c < 0.0 or new_c >= W
-        is_old = ages[i] >= lifetimes[i]
-        is_stuck = (u_val * u_val + v_val * v_val) < 1e-6
-        if is_oob or is_old or is_stuck:
-            respawn_flags[i] = 1
-        else:
-            respawn_flags[i] = 0
-
-
-    @cuda.jit
-    def _hydro_respawn_kernel(
-        # Particle state (GPU-resident, modified in-place)
-        particles,      # (N, 2) float32
-        ages,           # (N,) int32
-        lifetimes,      # (N,) int32
-        trails,         # (N, T, 2) float32
-        particle_accum, # (N,) float32
-        particle_raw_order,  # (N,) int32
-        colors,         # (N, 3) float32
-        radii,          # (N,) int32
-        # Respawn data (uploaded from CPU)
-        respawn_indices,  # (M,) int32 — which particles to respawn
-        spawn_rows,       # (M,) float32 — new row positions
-        spawn_cols,       # (M,) float32 — new col positions
-        new_lifetimes,    # (M,) int32
-        # Grid lookups
-        stream_order,     # (H, W) float32
-        stream_order_raw, # (H, W) int32
-        accum_norm,       # (H, W) float32
-        palette,          # (9, 3) float32
-        # Scalars
-        trail_len, has_so, has_raw_order,
-    ):
-        """Apply respawn: reset position, age, trails, color/radius for respawned particles."""
-        m = cuda.grid(1)
-        if m >= respawn_indices.shape[0]:
-            return
-
-        i = respawn_indices[m]
-        new_r = spawn_rows[m]
-        new_c = spawn_cols[m]
-        H = stream_order.shape[0] if has_so else accum_norm.shape[0]
-        W = stream_order.shape[1] if has_so else accum_norm.shape[1]
-
-        particles[i, 0] = new_r
-        particles[i, 1] = new_c
-        ages[i] = 0
-        lifetimes[i] = new_lifetimes[m]
-
-        # Reset trails to new position
-        for t in range(trail_len):
-            trails[i, t, 0] = new_r
-            trails[i, t, 1] = new_c
-
-        # Look up stream weight at spawn point
-        ri = int(new_r)
-        ci = int(new_c)
-        if ri < 0:
-            ri = 0
-        if ri >= H:
-            ri = H - 1
-        if ci < 0:
-            ci = 0
-        if ci >= W:
-            ci = W - 1
-
-        if has_so:
-            val = stream_order[ri, ci]
-        else:
-            val = accum_norm[ri, ci]
-        particle_accum[i] = val
-
-        if has_raw_order:
-            raw_o = stream_order_raw[ri, ci]
-            particle_raw_order[i] = raw_o
-            idx = raw_o
-            if idx < 1:
-                idx = 1
-            if idx > 8:
-                idx = 8
-            colors[i, 0] = palette[idx, 0]
-            colors[i, 1] = palette[idx, 1]
-            colors[i, 2] = palette[idx, 2]
-            rad = raw_o + 1
-            if rad < 2:
-                rad = 2
-            if rad > 5:
-                rad = 5
-            radii[i] = rad
-        else:
-            colors[i, 0] = 0.02 + val * 0.43
-            colors[i, 1] = 0.10 + val * 0.65
-            colors[i, 2] = 0.55 + val * 0.40
-            rad = 2 + int(val * 3.0)
-            if rad < 2:
-                rad = 2
-            if rad > 5:
-                rad = 5
-            radii[i] = rad
 
 
     @cuda.jit
@@ -1177,8 +742,6 @@ class _MeshChunkManager:
             viewer._geometry_layer_idx = 0
 
         for geom_id in viewer._all_geometries:
-            if geom_id == 'terrain':
-                continue
             if layer_name == 'none':
                 rtx.set_geometry_visible(geom_id, False)
             elif layer_name == 'all':
@@ -1790,10 +1353,8 @@ class InteractiveViewer:
     - [/]: Decrease/increase observer height
     - R: Decrease terrain resolution (coarser, up to 8x subsample)
     - Shift+R: Increase terrain resolution (finer, down to 1x)
-    - Shift+A: Toggle distance-based terrain LOD
     - Z: Decrease vertical exaggeration
     - Shift+Z: Increase vertical exaggeration
-    - B: Toggle mesh type (TIN / voxel)
     - Y: Cycle color stretch (linear, sqrt, cbrt, log)
     - T: Toggle shadows
     - 0: Toggle ambient occlusion (progressive)
@@ -1819,7 +1380,6 @@ class InteractiveViewer:
                  render_scale: float = 0.5, key_repeat_interval: float = 0.05,
                  rtx: 'RTX' = None,
                  pixel_spacing_x: float = 1.0, pixel_spacing_y: float = 1.0,
-                 mesh_type: str = 'heightfield',
                  overlay_layers: dict = None,
                  title: str = None,
                  subtitle: str = None,
@@ -1851,8 +1411,6 @@ class InteractiveViewer:
             Must match the spacing used when triangulating terrain. Default 1.0.
         pixel_spacing_y : float, optional
             Y spacing between pixels in world units. Default 1.0.
-        mesh_type : str, optional
-            Mesh generation method: 'tin' or 'voxel'. Default is 'tin'.
         """
         if not has_cupy:
             raise ImportError(
@@ -1863,7 +1421,7 @@ class InteractiveViewer:
         # Terrain state (raster, spacing, elevation stats, mesh caches)
         self.terrain = TerrainState(
             raster, pixel_spacing_x=pixel_spacing_x,
-            pixel_spacing_y=pixel_spacing_y, mesh_type=mesh_type,
+            pixel_spacing_y=pixel_spacing_y,
             subsample=subsample, skirt=skirt,
         )
 
@@ -1970,6 +1528,12 @@ class InteractiveViewer:
 
         # Hydro flow particle state
         self.hydro = HydroState()
+        self.hydro_mgr = HydroManager(self.hydro)
+
+        # Per-tile overlay compositing (created when LOD is enabled)
+        self._overlay_tile_mgr = None
+        # Per-tile basemap texture compositing (created when LOD is enabled)
+        self._texture_tile_mgr = None
 
         # GTFS-RT realtime vehicle overlay state
         self._gtfs_rt_url = None
@@ -2097,76 +1661,10 @@ class InteractiveViewer:
             else:
                 self._overlay_layers = dict(self._base_overlay_layers)
 
-        # Build terrain geometry if RTX exists but has no terrain.
-        # Without this, render() falls into the auto-VE / prepare_mesh path
-        # which computes vertical_exaggeration from pixel dimensions (not world
-        # units), producing wrong results when pixel_spacing != 1.
-        if rtx is not None and not rtx.has_geometry('terrain'):
-            from . import mesh as mesh_mod
-            if mesh_type == 'heightfield':
-                rtx.add_heightfield_geometry(
-                    'terrain', terrain_np, H, W,
-                    spacing_x=self.pixel_spacing_x,
-                    spacing_y=self.pixel_spacing_y,
-                    ve=1.0,
-                )
-                if self.terrain_skirt:
-                    sv, si = mesh_mod.build_terrain_skirt(
-                        terrain_np, H, W, scale=1.0,
-                        pixel_spacing_x=self.pixel_spacing_x,
-                        pixel_spacing_y=self.pixel_spacing_y)
-                    rtx.add_geometry('terrain_skirt', sv, si)
-                cache_key = (self.subsample_factor, mesh_type)
-                self._terrain_mesh_cache[cache_key] = (
-                    None, None, terrain_np.copy(), None,
-                )
-            else:
-                terrain_normals = None
-                if mesh_type == 'voxel':
-                    nv = H * W * 8
-                    nt = H * W * 12
-                    verts = np.zeros(nv * 3, dtype=np.float32)
-                    idxs = np.zeros(nt * 3, dtype=np.int32)
-                    base_elev = float(np.nanmin(terrain_np))
-                    mesh_mod.voxelate_terrain(verts, idxs, raster, scale=1.0,
-                                              base_elevation=base_elev)
-                else:
-                    nv = H * W
-                    nt = (H - 1) * (W - 1) * 2
-                    verts = np.zeros(nv * 3, dtype=np.float32)
-                    idxs = np.zeros(nt * 3, dtype=np.int32)
-                    mesh_mod.triangulate_terrain(verts, idxs, raster, scale=1.0)
-
-                    # Compute smooth normals for TIN
-                    terrain_normals = mesh_mod.compute_terrain_normals(
-                        raster, H, W,
-                        psx=self.pixel_spacing_x,
-                        psy=self.pixel_spacing_y)
-
-                    # Add skirt for TIN meshes
-                    if self.terrain_skirt:
-                        verts, idxs = mesh_mod.add_terrain_skirt(
-                            verts, idxs, H, W)
-                        terrain_normals = np.concatenate([
-                            terrain_normals,
-                            mesh_mod.compute_skirt_normals(H, W)])
-
-                if self.pixel_spacing_x != 1.0 or self.pixel_spacing_y != 1.0:
-                    verts[0::3] *= self.pixel_spacing_x
-                    verts[1::3] *= self.pixel_spacing_y
-
-                cache_key = (self.subsample_factor, mesh_type)
-                self._terrain_mesh_cache[cache_key] = (
-                    verts.copy(), idxs.copy(), terrain_np.copy(),
-                    terrain_normals.copy() if terrain_normals is not None else None,
-                )
-
-                # Only pass grid_dims for TIN meshes without skirt —
-                # cluster GAS requires regular grid triangle layout.
-                gd = (H, W) if mesh_type != 'voxel' and not self.terrain_skirt else None
-                rtx.add_geometry('terrain', verts, idxs,
-                                 grid_dims=gd,
-                                 normals=terrain_normals)
+        # Enable LOD terrain immediately — no single-GAS terrain is built.
+        # LOD tiles are created lazily during the first update() call.
+        if rtx is not None:
+            self._enable_terrain_lod()
 
     # ------------------------------------------------------------------
     # Delegation properties — InputState
@@ -2733,6 +2231,14 @@ class InteractiveViewer:
         self.hud.minimap_rect = value
 
     @property
+    def _minimap_world_extent(self):
+        return self.hud.minimap_world_extent
+
+    @_minimap_world_extent.setter
+    def _minimap_world_extent(self, value):
+        self.hud.minimap_world_extent = value
+
+    @property
     def _minimap_style(self):
         return self.hud.minimap_style
 
@@ -2755,6 +2261,22 @@ class InteractiveViewer:
     @_minimap_colors.setter
     def _minimap_colors(self, value):
         self.hud.minimap_colors = value
+
+    @property
+    def _minimap_bg_extent(self):
+        return self.hud.minimap_bg_extent
+
+    @_minimap_bg_extent.setter
+    def _minimap_bg_extent(self, value):
+        self.hud.minimap_bg_extent = value
+
+    @property
+    def _minimap_last_stream_time(self):
+        return self.hud.minimap_last_stream_time
+
+    @_minimap_last_stream_time.setter
+    def _minimap_last_stream_time(self, value):
+        self.hud.minimap_last_stream_time = value
 
     # ------------------------------------------------------------------
     # Delegation properties — WindState
@@ -3645,14 +3167,6 @@ class InteractiveViewer:
         self.terrain.subsample_factor = value
 
     @property
-    def _terrain_mesh_cache(self):
-        return self.terrain._terrain_mesh_cache
-
-    @_terrain_mesh_cache.setter
-    def _terrain_mesh_cache(self, value):
-        self.terrain._terrain_mesh_cache = value
-
-    @property
     def _baked_mesh_cache(self):
         return self.terrain._baked_mesh_cache
 
@@ -3676,13 +3190,6 @@ class InteractiveViewer:
     def _gpu_base_terrain(self, value):
         self.terrain._gpu_base_terrain = value
 
-    @property
-    def mesh_type(self):
-        return self.terrain.mesh_type
-
-    @mesh_type.setter
-    def mesh_type(self, value):
-        self.terrain.mesh_type = value
 
     @property
     def terrain_skirt(self):
@@ -3899,9 +3406,6 @@ class InteractiveViewer:
             res += f" ({self.subsample_factor}\u00d7 sub)"
         parts.append(res)
 
-        # Mesh type
-        parts.append(self.mesh_type.upper())
-
         # Terrain color layer
         terrain_name = self._terrain_layer_order[self._terrain_layer_idx]
         if terrain_name != 'elevation' and terrain_name in self._overlay_layers:
@@ -3963,6 +3467,91 @@ class InteractiveViewer:
 
         return '  \u2502  '.join(parts)
 
+    @staticmethod
+    def _elevation_to_minimap_rgba(terrain_small):
+        """Convert a 2D elevation array to an RGBA minimap image.
+
+        Parameters
+        ----------
+        terrain_small : ndarray, shape (H, W), float32
+            Elevation data (may contain NaN for water/nodata).
+
+        Returns
+        -------
+        rgba : ndarray, shape (H, W, 4), float32
+            RGBA minimap image with hillshade and water coloring.
+        water : ndarray, shape (H, W), bool
+            Water mask (NaN pixels).
+        """
+        new_h, new_w = terrain_small.shape
+
+        # Water mask: only NaN (not <= 0, which catches valid terrain)
+        water = np.isnan(terrain_small)
+
+        # Fill NaNs for gradient computation — use edge extrapolation
+        # to avoid step-change gradient artifacts at the data boundary
+        if water.any():
+            terrain_small = terrain_small.copy()
+            # Simple iterative nearest-neighbor fill: propagate valid
+            # values into NaN regions to avoid gradient discontinuities.
+            # Cap iterations — minimap is small (~200px), so 50 is plenty.
+            filled = terrain_small
+            for _ in range(min(50, max(new_h, new_w))):
+                still_nan = np.isnan(filled)
+                if not still_nan.any():
+                    break
+                # Shift in 4 directions and average available neighbors
+                padded = np.pad(filled, 1, mode='edge')
+                neighbors = np.stack([
+                    padded[:-2, 1:-1],  # up
+                    padded[2:, 1:-1],   # down
+                    padded[1:-1, :-2],  # left
+                    padded[1:-1, 2:],   # right
+                ], axis=0)
+                with np.errstate(all='ignore'):
+                    fill_vals = np.nanmean(neighbors, axis=0)
+                filled = np.where(still_nan & np.isfinite(fill_vals),
+                                  fill_vals, filled)
+            terrain_small = filled
+
+        # Hillshade (sun from upper-left)
+        dy, dx = np.gradient(terrain_small)
+        az_rad = np.radians(315)
+        alt_rad = np.radians(45)
+        slp = np.sqrt(dx**2 + dy**2)
+        asp = np.arctan2(-dy, dx)
+        shaded = (np.sin(alt_rad) * np.cos(np.arctan(slp)) +
+                  np.cos(alt_rad) * np.sin(np.arctan(slp)) *
+                  np.cos(az_rad - asp))
+        shaded = np.clip(shaded, 0, 1)
+
+        # Elevation tint: normalise to [0,1] for colour ramp
+        land = ~water
+        emin = np.nanmin(terrain_small[land]) if land.any() else 0
+        emax = np.nanmax(terrain_small[land]) if land.any() else 1
+        erng = emax - emin if emax > emin else 1.0
+        elev_norm = np.clip((terrain_small - emin) / erng, 0, 1)
+
+        # Build RGBA image
+        rgba = np.zeros((new_h, new_w, 4), dtype=np.float32)
+
+        # Grayscale hillshade base for all land
+        grey = shaded * 0.5 + elev_norm * 0.3 + 0.1
+        grey = np.clip(grey, 0, 1)
+        for c in range(3):
+            rgba[:, :, c] = grey
+        rgba[:, :, 3] = 1.0
+
+        # Water (NaN): dark blue-black
+        rgba[water, 0] = 0.08
+        rgba[water, 1] = 0.10
+        rgba[water, 2] = 0.18
+        rgba[water, 3] = 0.7
+
+        rgba[:, :, :3] = np.clip(rgba[:, :, :3], 0, 1)
+
+        return rgba, water
+
     def _compute_minimap_background(self):
         """Compute a stylised RGBA minimap image.
 
@@ -3991,34 +3580,7 @@ class InteractiveViewer:
             terrain_small = terrain_np.copy()
             new_h, new_w = H, W
 
-        # Water mask: NaN or <= 0
-        water = np.isnan(terrain_small) | (terrain_small <= 0)
-
-        # Fill NaNs for gradient computation
-        if water.any():
-            med = np.nanmedian(terrain_small)
-            terrain_small = terrain_small.copy()
-            terrain_small[water] = med if np.isfinite(med) else 0.0
-
-        # Hillshade (sun from upper-left)
-        dy, dx = np.gradient(terrain_small)
-        az_rad = np.radians(315)
-        alt_rad = np.radians(45)
-        slp = np.sqrt(dx**2 + dy**2)
-        asp = np.arctan2(-dy, dx)
-        shaded = (np.sin(alt_rad) * np.cos(np.arctan(slp)) +
-                  np.cos(alt_rad) * np.sin(np.arctan(slp)) *
-                  np.cos(az_rad - asp))
-        shaded = np.clip(shaded, 0, 1)
-
-        # Elevation tint: normalise to [0,1] for colour ramp
-        emin = np.nanmin(terrain_small[~water]) if (~water).any() else 0
-        emax = np.nanmax(terrain_small[~water]) if (~water).any() else 1
-        erng = emax - emin if emax > emin else 1.0
-        elev_norm = np.clip((terrain_small - emin) / erng, 0, 1)
-
-        # Build RGBA image
-        rgba = np.zeros((new_h, new_w, 4), dtype=np.float32)
+        rgba, water = self._elevation_to_minimap_rgba(terrain_small)
 
         # Check for categorical overlay layer coloring
         _layer_data = None
@@ -4033,28 +3595,27 @@ class InteractiveViewer:
             else:
                 _layer_data = ld.copy()
 
-        # Grayscale hillshade base for all land
-        grey = shaded * 0.5 + elev_norm * 0.3 + 0.1
-        grey = np.clip(grey, 0, 1)
-        for c in range(3):
-            rgba[:, :, c] = grey
-        rgba[:, :, 3] = 1.0
-
         if _layer_data is not None:
+            # Recompute hillshade for categorical overlay blending
+            ts_filled = terrain_small.copy()
+            if water.any():
+                med = np.nanmedian(ts_filled)
+                ts_filled[water] = med if np.isfinite(med) else 0.0
+            dy, dx = np.gradient(ts_filled)
+            az_rad = np.radians(315)
+            alt_rad = np.radians(45)
+            slp = np.sqrt(dx**2 + dy**2)
+            asp = np.arctan2(-dy, dx)
+            shaded = np.clip(
+                np.sin(alt_rad) * np.cos(np.arctan(slp)) +
+                np.cos(alt_rad) * np.sin(np.arctan(slp)) *
+                np.cos(az_rad - asp), 0, 1)
             # Overlay risk colours on matched pixels; unmatched stays grey
             for val, (r, g, b) in self._minimap_colors.items():
                 mask = np.isclose(_layer_data, float(val), atol=0.1)
                 for c, cv in enumerate((r, g, b)):
                     rgba[:, :, c] = np.where(
                         mask, cv * (shaded * 0.5 + 0.5), rgba[:, :, c])
-
-        # Water: dark blue-black
-        rgba[water, 0] = 0.08
-        rgba[water, 1] = 0.10
-        rgba[water, 2] = 0.18
-        rgba[water, 3] = 0.7
-
-        rgba[:, :, :3] = np.clip(rgba[:, :, :3], 0, 1)
 
         # Blend satellite imagery if tile service has fetched tiles
         if (self._tile_service is not None
@@ -4080,6 +3641,71 @@ class InteractiveViewer:
         self._minimap_background = rgba
         self._minimap_scale_x = new_w / W
         self._minimap_scale_y = new_h / H
+
+    def _compute_streaming_minimap(self, wx_min, wy_min, wx_max, wy_max):
+        """Fetch elevation for a world extent and build a minimap image.
+
+        Uses ``_tile_data_fn`` to fetch elevation covering the full
+        minimap extent (initial terrain + streaming area), then runs
+        the standard hillshade pipeline on it.
+
+        Parameters
+        ----------
+        wx_min, wy_min, wx_max, wy_max : float
+            World-space extent to cover in the minimap.
+        """
+        tile_data_fn = getattr(self, '_tile_data_fn', None)
+        crs_tf = getattr(self, '_minimap_crs_transform', None)
+        if tile_data_fn is None or crs_tf is None:
+            return
+
+        crs_x0, crs_y0, crs_dx, crs_dy = crs_tf
+        psx, psy = self.pixel_spacing_x, self.pixel_spacing_y
+
+        # Convert world coords to CRS coordinates
+        # world coord: wx = col * psx + offset_x
+        # col = (wx - offset_x) / psx
+        # crs_x = crs_x0 + col * crs_dx
+        lod_mgr = getattr(self.terrain, '_terrain_lod_manager', None)
+        ox = lod_mgr._offset_x if lod_mgr is not None else 0.0
+        oy = lod_mgr._offset_y if lod_mgr is not None else 0.0
+
+        col0 = (wx_min - ox) / psx
+        col1 = (wx_max - ox) / psx
+        row0 = (wy_min - oy) / psy
+        row1 = (wy_max - oy) / psy
+
+        cx0 = crs_x0 + col0 * crs_dx
+        cx1 = crs_x0 + col1 * crs_dx
+        cy0 = crs_y0 + row0 * crs_dy
+        cy1 = crs_y0 + row1 * crs_dy
+
+        # tile_data_fn expects (x_min, y_min, x_max, y_max, target_samples)
+        x_min, x_max = min(cx0, cx1), max(cx0, cx1)
+        y_min, y_max = min(cy0, cy1), max(cy0, cy1)
+
+        try:
+            elev = tile_data_fn(x_min, y_min, x_max, y_max, 200)
+        except Exception:
+            return
+        if elev is None:
+            return
+
+        elev = np.asarray(elev, dtype=np.float32)
+        if elev.ndim != 2 or elev.size == 0:
+            return
+
+        rgba, water = self._elevation_to_minimap_rgba(elev)
+
+        if self._minimap_style == 'cyberpunk':
+            rgba = self._apply_cyberpunk_minimap(rgba, water)
+
+        self._minimap_background = rgba
+        self._minimap_bg_extent = (wx_min, wy_min, wx_max, wy_max)
+        # Scale factors map the full bg image to the world extent
+        self._minimap_scale_x = rgba.shape[1] / max(1, wx_max - wx_min)
+        self._minimap_scale_y = rgba.shape[0] / max(1, wy_max - wy_min)
+        self._minimap_last_stream_time = time.monotonic()
 
     def _apply_cyberpunk_minimap(self, rgba, water):
         """Apply a neon-edge cyberpunk filter to the minimap RGBA image.
@@ -4165,11 +3791,10 @@ class InteractiveViewer:
         return result
 
     def _enable_terrain_lod(self):
-        """Switch terrain rendering from single-GAS to per-tile LOD.
+        """Set up per-tile LOD terrain rendering.
 
-        Removes the single ``'terrain'`` (and ``'terrain_skirt'``)
-        geometry and creates a :class:`TerrainLODManager` that renders
-        each tile at a distance-appropriate resolution.
+        Creates a :class:`TerrainLODManager` that renders each tile at
+        a distance-appropriate resolution.  Called once during __init__.
         """
         from .viewer.terrain_lod import TerrainLODManager
 
@@ -4180,6 +3805,34 @@ class InteractiveViewer:
             terrain_np = terrain_data.get()
         else:
             terrain_np = np.asarray(terrain_data)
+
+        # Fill NaN at raster edges (common from UTM reprojection) so both
+        # the LOD tile builder and the render kernel see clean elevation.
+        # Without this, NaN pixels render as blue ocean water.
+        if np.any(np.isnan(terrain_np)):
+            terrain_np = terrain_np.copy()
+            for _ in range(20):
+                still_nan = np.isnan(terrain_np)
+                if not still_nan.any():
+                    break
+                padded = np.pad(terrain_np, 1, mode='edge')
+                neighbors = np.stack([
+                    padded[:-2, 1:-1], padded[2:, 1:-1],
+                    padded[1:-1, :-2], padded[1:-1, 2:],
+                ], axis=0)
+                with np.errstate(all='ignore'):
+                    fill_vals = np.nanmean(neighbors, axis=0)
+                terrain_np = np.where(
+                    still_nan & np.isfinite(fill_vals),
+                    fill_vals, terrain_np)
+            # Update raster so render kernel sees clean data too
+            is_cupy = hasattr(base.data, 'get')
+            if is_cupy:
+                import cupy
+                self.raster = self.raster.copy(
+                    data=cupy.asarray(terrain_np))
+            else:
+                self.raster = self.raster.copy(data=terrain_np)
 
         # Remove the single terrain geometry
         if self.rtx.has_geometry('terrain'):
@@ -4216,21 +3869,168 @@ class InteractiveViewer:
         tile_data_fn = getattr(self, '_tile_data_fn', None)
         if tile_data_fn is not None:
             mgr.set_tile_data_fn(tile_data_fn)
+            # Pass CRS coordinate transform so tile_data_fn receives
+            # actual CRS coordinates (e.g. UTM) instead of viewer
+            # world-space coords (pixel * abs(spacing) + offset).
+            try:
+                x = base.coords['x'].values
+                y = base.coords['y'].values
+                if len(x) >= 2 and len(y) >= 2:
+                    crs_dx = float(x[1] - x[0])
+                    crs_dy = float(y[1] - y[0])
+                    mgr.set_crs_transform(float(x[0]), float(y[0]),
+                                          crs_dx, crs_dy)
+                    self._minimap_crs_transform = (
+                        float(x[0]), float(y[0]), crs_dx, crs_dy)
+            except (KeyError, AttributeError):
+                pass
         self._terrain_lod_manager = mgr
         self.lod_enabled = True
 
-        # Use heightfield ray marching for LOD 0 tiles — bilinear normals
-        # and ~4 bytes/pixel vs ~16 bytes/pixel for explicit triangles.
-        mgr.enable_heightfield_lod0()
+        # Create per-tile overlay and texture managers for LOD-aware compositing
+        from .viewer.overlay_tiles import OverlayTileManager, TextureTileManager
+        self._overlay_tile_mgr = OverlayTileManager(tile_size)
+        self._texture_tile_mgr = TextureTileManager(tile_size)
+        # Register tile lifecycle callbacks so both managers stay
+        # in sync with the LOD tile set automatically.
+        otm = self._overlay_tile_mgr
+        ttm = self._texture_tile_mgr
 
-        # Force initial tile build — no build limit so all tiles appear
-        # on the first frame (no progressive pop-in on enable).
+        # With LOD active, basemap goes through per-tile lazy fetch — stop
+        # any monolithic XYZ tile fetch that was started before LOD enable.
+        if self._tile_service is not None:
+            self._tile_service._generation += 1  # cancel in-flight fetches
+
+        # Lazy per-tile basemap fetching.  Each tile's CRS bounds are
+        # converted to WGS84 and XYZ map tiles are fetched in background
+        # threads, then stored in the TextureTileManager.
+        _crs_origin = mgr._crs_origin      # (crs_x0, crs_y0) or None
+        _crs_spacing = mgr._crs_spacing    # (crs_dx, crs_dy) or None
+        _ts = tile_size
+        _viewer = self
+        from concurrent.futures import ThreadPoolExecutor as _TPE
+        _basemap_executor = _TPE(max_workers=4)
+        _basemap_pending = set()  # tiles currently being fetched
+
+        def _on_tile_added(tr, tc, elev):
+            # Don't call otm/ttm.invalidate() here — set_tile() already
+            # marks dirty when actual data arrives.  Invalidating on
+            # every terrain LOD change forces composite rebuild + GPU
+            # upload every frame during camera movement.
+
+            # Lazy-fetch basemap for this tile in background.
+            # Use elev.shape to get actual tile dimensions (edge tiles
+            # may be smaller than tile_size).
+            if (_crs_origin is not None
+                    and _crs_spacing is not None
+                    and _viewer._tiles_enabled
+                    and _viewer._tile_service is not None
+                    and (tr, tc) not in _basemap_pending
+                    and not ttm.has_tile(tr, tc)):
+                th = elev.shape[0] if elev is not None else _ts
+                tw = elev.shape[1] if elev is not None else _ts
+                _basemap_pending.add((tr, tc))
+                _basemap_executor.submit(
+                    _fetch_tile_basemap, tr, tc, th, tw)
+
+        def _fetch_tile_basemap(tr, tc, th, tw):
+            """Fetch basemap RGB for a single LOD tile and store it."""
+            try:
+                crs_x0, crs_y0 = _crs_origin
+                crs_dx, crs_dy = _crs_spacing
+                c0 = tc * _ts
+                r0 = tr * _ts
+                # CRS bounds: pixel-center to pixel-center so linspace
+                # produces exact pixel coordinates.  Using c0+tw would
+                # overshoot by one pixel and stretch the basemap.
+                cx0 = crs_x0 + c0 * crs_dx
+                cy0 = crs_y0 + r0 * crs_dy
+                cx1 = crs_x0 + (c0 + tw - 1) * crs_dx
+                cy1 = crs_y0 + (r0 + th - 1) * crs_dy
+                x_min, x_max = min(cx0, cx1), max(cx0, cx1)
+                y_min, y_max = min(cy0, cy1), max(cy0, cy1)
+                rgb = _viewer._tile_service.fetch_rgb_for_bounds(
+                    x_min, y_min, x_max, y_max, th, tw)
+                if rgb is not None and not np.all(rgb == 0):
+                    ttm.set_tile(tr, tc, rgb)
+            except Exception:
+                pass
+            finally:
+                _basemap_pending.discard((tr, tc))
+
+        def _on_tile_removed(tr, tc):
+            # Only remove basemap texture — it's re-fetched lazily
+            # via _on_tile_added when the tile returns.  Overlay data
+            # is bulk-populated from populate_from_array() and won't
+            # be re-created on re-add, so we must keep it.
+            ttm.remove_tile(tr, tc)
+
+        mgr.set_tile_callbacks(
+            on_added=_on_tile_added,
+            on_removed=_on_tile_removed,
+        )
+        # If an overlay already exists, slice it into per-tile chunks
+        if self._active_overlay_data is not None:
+            n_tr = (H + tile_size - 1) // tile_size
+            n_tc = (W + tile_size - 1) // tile_size
+            active_name = None
+            if self._terrain_layer_idx < len(self._terrain_layer_order):
+                active_name = self._terrain_layer_order[
+                    self._terrain_layer_idx]
+            for name, data in self._overlay_layers.items():
+                if name == active_name:
+                    self._overlay_tile_mgr.populate_from_array(
+                        data, tile_size, n_tr, n_tc)
+                    lut = self._overlay_color_luts.get(name)
+                    if lut is not None:
+                        self._overlay_tile_mgr.set_color_lut(lut)
+
+        # Basemap tiles are fetched lazily via _on_tile_added callback —
+        # no monolithic texture slicing needed.
+
+        # Wire LOD manager into HydroManager for streaming support
+        self.hydro_mgr.set_lod_manager(mgr)
+        if tile_data_fn is not None:
+            self.hydro_mgr.set_tile_data_fn(tile_data_fn)
+        try:
+            x = base.coords['x'].values
+            y = base.coords['y'].values
+            if len(x) >= 2 and len(y) >= 2:
+                self.hydro_mgr.set_crs_transform(
+                    float(x[0]), float(y[0]),
+                    float(x[1] - x[0]), float(y[1] - y[0]))
+        except (KeyError, AttributeError):
+            pass
+
+        # When streaming is active, use TIN meshes for ALL tiles (including
+        # LOD 0) so initial-extent and streaming tiles render identically.
+        # Without streaming, heightfield gives better quality for LOD 0.
+        if not mgr._streaming:
+            mgr.enable_heightfield_lod0()
+
+        # Force initial tile build — no build limit so all in-bounds
+        # tiles appear on the first frame (no progressive pop-in on
+        # enable).  Streaming tiles build progressively after launch.
+        # Use terrain center as fallback if camera position isn't set yet
+        # (called from __init__ before run() sets the start position).
+        cam_pos = self.position
+        if cam_pos is None:
+            H, W = self.terrain_shape
+            cx = W * self.pixel_spacing_x * 0.5
+            cy = H * self.pixel_spacing_y * 0.5
+            cam_pos = np.array([cx, cy, 0.0])
         saved_limit = mgr.per_tick_build_limit
+        saved_streaming = mgr._streaming
+        mgr._streaming = False  # only in-bounds tiles on initial build
         mgr.per_tick_build_limit = 10000
-        mgr.update(self.position, self.rtx,
+        mgr.update(cam_pos, self.rtx,
                     ve=self.vertical_exaggeration, force=True,
                     camera_front=self._get_front(), fov=self.camera.fov)
         mgr.per_tick_build_limit = saved_limit
+        mgr._streaming = saved_streaming
+        # Force one more update so streaming tiles begin building
+        if saved_streaming:
+            mgr._last_update_pos = None
         # Enable threaded mesh building for subsequent ticks
         mgr.enable_threaded_building()
         # Batch same-LOD tiles into single GAS entries to reduce IAS count
@@ -4253,16 +4053,13 @@ class InteractiveViewer:
 
         self.subsample_factor = factor
 
-        # If LOD is active, update the LOD manager's base subsample
-        # and force a full tile rebuild instead of the single-GAS path.
-        if self.lod_enabled and self._terrain_lod_manager is not None:
+        # Update LOD manager's base subsample and force tile rebuild
+        if self._terrain_lod_manager is not None:
             self._terrain_lod_manager.set_base_subsample(factor)
             self._terrain_lod_manager.update(
                 self.position, self.rtx,
                 ve=self.vertical_exaggeration, force=True,
                 camera_front=self._get_front(), fov=self.camera.fov)
-            # Still need to update raster/spacing for overlays and re-snapping
-            # but skip the single-terrain GAS rebuild below.
 
         base = self._base_raster
 
@@ -4288,132 +4085,13 @@ class InteractiveViewer:
         self.pixel_spacing_x = self._base_pixel_spacing_x * factor
         self.pixel_spacing_y = self._base_pixel_spacing_y * factor
 
-        # 3. Build or retrieve cached terrain mesh
+        # 3. Get terrain_np for elevation stats
         ve = self.vertical_exaggeration
-        cache_key = (factor, self.mesh_type)
-
-        # When LOD is active, tiles are built by the LOD manager.
-        # We still need terrain_np for elevation stats (computed below).
-        _lod_active = (self.lod_enabled and self._terrain_lod_manager is not None)
-        if _lod_active:
-            terrain_data = sub.data
-            if hasattr(terrain_data, 'get'):
-                terrain_np = terrain_data.get()
-            else:
-                terrain_np = np.asarray(terrain_data)
-        elif self.mesh_type == 'heightfield':
-            # Heightfield path: no triangle mesh needed
-            if cache_key in self._terrain_mesh_cache:
-                _, _, terrain_np, _ = self._terrain_mesh_cache[cache_key]
-            else:
-                terrain_data = sub.data
-                if hasattr(terrain_data, 'get'):
-                    terrain_np = terrain_data.get()
-                else:
-                    terrain_np = np.asarray(terrain_data)
-                self._terrain_mesh_cache[cache_key] = (
-                    None, None, terrain_np.copy(), None,
-                )
-
-            if self.rtx is not None:
-                self.rtx.add_heightfield_geometry(
-                    'terrain', terrain_np, H, W,
-                    spacing_x=self.pixel_spacing_x,
-                    spacing_y=self.pixel_spacing_y,
-                    ve=ve,
-                )
-                if self.terrain_skirt:
-                    sv, si = mesh_mod.build_terrain_skirt(
-                        terrain_np, H, W, scale=ve,
-                        pixel_spacing_x=self.pixel_spacing_x,
-                        pixel_spacing_y=self.pixel_spacing_y)
-                    self.rtx.add_geometry('terrain_skirt', sv, si)
-                elif self.rtx.has_geometry('terrain_skirt'):
-                    self.rtx.remove_geometry('terrain_skirt')
+        terrain_data = sub.data
+        if hasattr(terrain_data, 'get'):
+            terrain_np = terrain_data.get()
         else:
-            if cache_key in self._terrain_mesh_cache:
-                # Cache hit — reuse pre-built mesh (stored at scale=1.0)
-                verts_base, indices, terrain_np, normals_base = self._terrain_mesh_cache[cache_key]
-                vertices = verts_base.copy()
-                if ve != 1.0:
-                    vertices[2::3] *= ve
-                # Transform normals for VE
-                if normals_base is not None and ve != 1.0:
-                    terrain_normals = normals_base.copy()
-                    terrain_normals[2::3] /= ve
-                    ln = np.sqrt(terrain_normals[0::3]**2 + terrain_normals[1::3]**2 + terrain_normals[2::3]**2)
-                    ln[ln < 1e-10] = 1.0
-                    terrain_normals[0::3] /= ln
-                    terrain_normals[1::3] /= ln
-                    terrain_normals[2::3] /= ln
-                else:
-                    terrain_normals = normals_base
-            else:
-                # Cache miss — build mesh at scale=1.0 and cache it
-                terrain_data = sub.data
-                if hasattr(terrain_data, 'get'):
-                    terrain_np = terrain_data.get()
-                else:
-                    terrain_np = np.asarray(terrain_data)
-
-                terrain_normals = None
-                if self.mesh_type == 'voxel':
-                    num_verts = H * W * 8
-                    num_tris = H * W * 12
-                    vertices = np.zeros(num_verts * 3, dtype=np.float32)
-                    indices = np.zeros(num_tris * 3, dtype=np.int32)
-                    base_elev = float(np.nanmin(terrain_np))
-                    mesh_mod.voxelate_terrain(vertices, indices, sub, scale=1.0,
-                                              base_elevation=base_elev)
-                else:
-                    num_verts = H * W
-                    num_tris = (H - 1) * (W - 1) * 2
-                    vertices = np.zeros(num_verts * 3, dtype=np.float32)
-                    indices = np.zeros(num_tris * 3, dtype=np.int32)
-                    mesh_mod.triangulate_terrain(vertices, indices, sub, scale=1.0)
-
-                    terrain_normals = mesh_mod.compute_terrain_normals(
-                        sub, H, W,
-                        psx=self.pixel_spacing_x,
-                        psy=self.pixel_spacing_y)
-
-                    if self.terrain_skirt:
-                        vertices, indices = mesh_mod.add_terrain_skirt(
-                            vertices, indices, H, W)
-                        terrain_normals = np.concatenate([
-                            terrain_normals,
-                            mesh_mod.compute_skirt_normals(H, W)])
-
-                # Scale x,y to world units
-                if self.pixel_spacing_x != 1.0 or self.pixel_spacing_y != 1.0:
-                    vertices[0::3] *= self.pixel_spacing_x
-                    vertices[1::3] *= self.pixel_spacing_y
-
-                # Store in cache (scale=1.0, x/y already scaled)
-                self._terrain_mesh_cache[cache_key] = (
-                    vertices.copy(), indices.copy(), terrain_np.copy(),
-                    terrain_normals.copy() if terrain_normals is not None else None,
-                )
-
-                # Apply VE to this copy
-                if ve != 1.0:
-                    vertices[2::3] *= ve
-                    if terrain_normals is not None:
-                        terrain_normals = terrain_normals.copy()
-                        terrain_normals[2::3] /= ve
-                        ln = np.sqrt(terrain_normals[0::3]**2 + terrain_normals[1::3]**2 + terrain_normals[2::3]**2)
-                        ln[ln < 1e-10] = 1.0
-                        terrain_normals[0::3] /= ln
-                        terrain_normals[1::3] /= ln
-                        terrain_normals[2::3] /= ln
-
-            # 4. Replace terrain geometry (add_geometry overwrites existing key
-            #    in-place, preserving dict insertion order and instance IDs)
-            if self.rtx is not None:
-                gd = (H, W) if self.mesh_type != 'voxel' and not self.terrain_skirt else None
-                self.rtx.add_geometry('terrain', vertices, indices,
-                                      grid_dims=gd,
-                                      normals=terrain_normals)
+            terrain_np = np.asarray(terrain_data)
 
         self.elev_min = float(np.nanmin(terrain_np)) * ve
         self.elev_max = float(np.nanmax(terrain_np)) * ve
@@ -4480,8 +4158,6 @@ class InteractiveViewer:
                 self._gpu_terrain = gpu_terrain
             from .viewer.terrain_lod import is_terrain_lod_gid
             for geom_id in self.rtx.list_geometries():
-                if geom_id == 'terrain' or geom_id == 'terrain_skirt':
-                    continue
                 if is_terrain_lod_gid(geom_id):
                     continue
                 # Baked meshes — re-snap Z to new terrain surface + VE
@@ -4575,6 +4251,7 @@ class InteractiveViewer:
                 self._update_observer_drone_for(obs)
 
         # 9. Recompute minimap
+        self._minimap_bg_extent = None
         self._compute_minimap_background()
 
         # 10. Clear viewshed cache (no longer matches terrain)
@@ -4601,130 +4278,19 @@ class InteractiveViewer:
         from . import mesh as mesh_mod
 
         self.vertical_exaggeration = ve
-        H, W = self.terrain_shape
-        cache_key = (self.subsample_factor, self.mesh_type)
 
-        # If LOD is active, force re-upload of all tiles with new VE.
-        # The unscaled tile mesh cache is still valid — only clear
-        # _tile_lods to force re-upload, not the mesh cache itself.
-        if self.lod_enabled and self._terrain_lod_manager is not None:
+        # Force re-upload of all LOD tiles with new VE
+        if self._terrain_lod_manager is not None:
             self._terrain_lod_manager._tile_lods.clear()
             self._terrain_lod_manager.update(
                 self.position, self.rtx, ve=ve, force=True,
                 camera_front=self._get_front(), fov=self.camera.fov)
-            # Still need terrain_np for elevation stats below
-            terrain_data = self.raster.data
-            if hasattr(terrain_data, 'get'):
-                terrain_np = terrain_data.get()
-            else:
-                terrain_np = np.asarray(terrain_data)
-        elif self.mesh_type == 'heightfield':
-            # Heightfield path: rebuild GAS with new VE
-            if cache_key in self._terrain_mesh_cache:
-                _, _, terrain_np, _ = self._terrain_mesh_cache[cache_key]
-            else:
-                terrain_data = self.raster.data
-                if hasattr(terrain_data, 'get'):
-                    terrain_np = terrain_data.get()
-                else:
-                    terrain_np = np.asarray(terrain_data)
-                self._terrain_mesh_cache[cache_key] = (
-                    None, None, terrain_np.copy(), None,
-                )
 
-            if self.rtx is not None:
-                self.rtx.add_heightfield_geometry(
-                    'terrain', terrain_np, H, W,
-                    spacing_x=self.pixel_spacing_x,
-                    spacing_y=self.pixel_spacing_y,
-                    ve=ve,
-                )
-                if self.terrain_skirt:
-                    sv, si = mesh_mod.build_terrain_skirt(
-                        terrain_np, H, W, scale=ve,
-                        pixel_spacing_x=self.pixel_spacing_x,
-                        pixel_spacing_y=self.pixel_spacing_y)
-                    self.rtx.add_geometry('terrain_skirt', sv, si)
-                elif self.rtx.has_geometry('terrain_skirt'):
-                    self.rtx.remove_geometry('terrain_skirt')
+        terrain_data = self.raster.data
+        if hasattr(terrain_data, 'get'):
+            terrain_np = terrain_data.get()
         else:
-            if cache_key in self._terrain_mesh_cache:
-                verts_base, indices, terrain_np, normals_base = self._terrain_mesh_cache[cache_key]
-                vertices = verts_base.copy()
-                if ve != 1.0:
-                    vertices[2::3] *= ve
-                if normals_base is not None and ve != 1.0:
-                    terrain_normals = normals_base.copy()
-                    terrain_normals[2::3] /= ve
-                    ln = np.sqrt(terrain_normals[0::3]**2 + terrain_normals[1::3]**2 + terrain_normals[2::3]**2)
-                    ln[ln < 1e-10] = 1.0
-                    terrain_normals[0::3] /= ln
-                    terrain_normals[1::3] /= ln
-                    terrain_normals[2::3] /= ln
-                else:
-                    terrain_normals = normals_base
-            else:
-                terrain_data = self.raster.data
-                if hasattr(terrain_data, 'get'):
-                    terrain_np = terrain_data.get()
-                else:
-                    terrain_np = np.asarray(terrain_data)
-
-                terrain_normals = None
-                if self.mesh_type == 'voxel':
-                    nv = H * W * 8
-                    nt = H * W * 12
-                    vertices = np.zeros(nv * 3, dtype=np.float32)
-                    indices = np.zeros(nt * 3, dtype=np.int32)
-                    base_elev = float(np.nanmin(terrain_np))
-                    mesh_mod.voxelate_terrain(vertices, indices, self.raster,
-                                              scale=1.0, base_elevation=base_elev)
-                else:
-                    nv = H * W
-                    nt = (H - 1) * (W - 1) * 2
-                    vertices = np.zeros(nv * 3, dtype=np.float32)
-                    indices = np.zeros(nt * 3, dtype=np.int32)
-                    mesh_mod.triangulate_terrain(vertices, indices, self.raster,
-                                                 scale=1.0)
-
-                    terrain_normals = mesh_mod.compute_terrain_normals(
-                        self.raster, H, W,
-                        psx=self.pixel_spacing_x,
-                        psy=self.pixel_spacing_y)
-
-                    if self.terrain_skirt:
-                        vertices, indices = mesh_mod.add_terrain_skirt(
-                            vertices, indices, H, W)
-                        terrain_normals = np.concatenate([
-                            terrain_normals,
-                            mesh_mod.compute_skirt_normals(H, W)])
-
-                if self.pixel_spacing_x != 1.0 or self.pixel_spacing_y != 1.0:
-                    vertices[0::3] *= self.pixel_spacing_x
-                    vertices[1::3] *= self.pixel_spacing_y
-
-                self._terrain_mesh_cache[cache_key] = (
-                    vertices.copy(), indices.copy(), terrain_np.copy(),
-                    terrain_normals.copy() if terrain_normals is not None else None,
-                )
-
-                if ve != 1.0:
-                    vertices[2::3] *= ve
-                    if terrain_normals is not None:
-                        terrain_normals = terrain_normals.copy()
-                        terrain_normals[2::3] /= ve
-                        ln = np.sqrt(terrain_normals[0::3]**2 + terrain_normals[1::3]**2 + terrain_normals[2::3]**2)
-                        ln[ln < 1e-10] = 1.0
-                        terrain_normals[0::3] /= ln
-                        terrain_normals[1::3] /= ln
-                        terrain_normals[2::3] /= ln
-
-            # Replace terrain geometry (preserves dict insertion order)
-            if self.rtx is not None:
-                gd = (H, W) if self.mesh_type != 'voxel' and not self.terrain_skirt else None
-                self.rtx.add_geometry('terrain', vertices, indices,
-                                      grid_dims=gd,
-                                      normals=terrain_normals)
+            terrain_np = np.asarray(terrain_data)
 
         # Update elevation stats (scaled)
         self.elev_min = float(np.nanmin(terrain_np)) * ve
@@ -4749,8 +4315,6 @@ class InteractiveViewer:
                 self._gpu_terrain = gpu_terrain
             from .viewer.terrain_lod import is_terrain_lod_gid
             for geom_id in self.rtx.list_geometries():
-                if geom_id == 'terrain' or geom_id == 'terrain_skirt':
-                    continue
                 if is_terrain_lod_gid(geom_id):
                     continue
                 # Baked meshes (merged buildings/curves) — re-snap Z to terrain + VE
@@ -4913,23 +4477,82 @@ class InteractiveViewer:
         mm_h, mm_w = mm_bg.shape[:2]
         fh, fw = img.shape[:2]
 
-        # Size minimap: match legend height if available, else ~20% of frame
+        # Size minimap: match legend height if available, else ~20% of frame.
+        # Use initial terrain aspect ratio (not background image shape)
+        # so dimensions stay fixed even when streaming changes the bg.
+        H_t, W_t = self.terrain_shape
+        terrain_aspect = W_t / max(1, H_t)
         if self._legend_rgba is not None:
             target_h = self._legend_rgba.shape[0]
         else:
             target_w = max(40, int(fw * 0.2))
-            scale = target_w / mm_w
-            target_h = max(20, int(mm_h * scale))
-        # Derive width from height to preserve aspect ratio
-        aspect = mm_w / mm_h
-        target_w = max(20, int(target_h * aspect))
+            target_h = max(20, int(target_w / terrain_aspect))
+        target_w = max(20, int(target_h * terrain_aspect))
         target_w = min(target_w, fw)
         target_h = min(target_h, fh)
 
-        # Nearest-neighbour resize
+        # --- World extent for coordinate mapping ---
+        # When LOD streaming is active, extend beyond initial terrain
+        # to include camera position so the dot stays visible.
+        H, W = self.terrain_shape
+        psx, psy = self.pixel_spacing_x, self.pixel_spacing_y
+        terrain_wx = W * psx
+        terrain_wy = H * psy
+
+        lod_mgr = getattr(self.terrain, '_terrain_lod_manager', None)
+        streaming = (lod_mgr is not None
+                     and getattr(lod_mgr, '_streaming', False))
+
+        if streaming:
+            cam_x, cam_y = self.position[0], self.position[1]
+            # Desired extent: union of terrain bounds and camera + margin
+            margin = max(terrain_wx, terrain_wy) * 0.5
+            wx_min = min(0.0, cam_x - margin)
+            wy_min = min(0.0, cam_y - margin)
+            wx_max = max(terrain_wx, cam_x + margin)
+            wy_max = max(terrain_wy, cam_y + margin)
+
+            # Check if streaming minimap recompute is needed:
+            # - No extent yet (first time)
+            # - Camera outside inner 60% of current extent AND 2s throttle
+            bg_ext = self._minimap_bg_extent
+            now = time.monotonic()
+            throttle_ok = (now - self._minimap_last_stream_time >= 2.0)
+            need_recompute = (bg_ext is None)
+            if not need_recompute and throttle_ok:
+                # Recompute if camera is outside inner 60% of extent
+                bw = bg_ext[2] - bg_ext[0]
+                bh = bg_ext[3] - bg_ext[1]
+                inner_margin_x = bw * 0.2
+                inner_margin_y = bh * 0.2
+                need_recompute = (
+                    cam_x < bg_ext[0] + inner_margin_x
+                    or cam_x > bg_ext[2] - inner_margin_x
+                    or cam_y < bg_ext[1] + inner_margin_y
+                    or cam_y > bg_ext[3] - inner_margin_y)
+
+            if need_recompute:
+                self._compute_streaming_minimap(
+                    wx_min, wy_min, wx_max, wy_max)
+                # Re-read background after streaming recompute
+                mm_bg = self._minimap_background
+                mm_h, mm_w = mm_bg.shape[:2]
+
+            # Use streaming extent for coordinate mapping
+            if self._minimap_bg_extent is not None:
+                wx_min, wy_min, wx_max, wy_max = self._minimap_bg_extent
+        else:
+            wx_min, wy_min = 0.0, 0.0
+            wx_max, wy_max = terrain_wx, terrain_wy
+
+        wx_range = wx_max - wx_min
+        wy_range = wy_max - wy_min
+
+        # Resize background to target dimensions (fixed size, no aspect
+        # ratio adjustment — keeps minimap dimensions stable)
         y_idx = np.linspace(0, mm_h - 1, target_h).astype(int)
         x_idx = np.linspace(0, mm_w - 1, target_w).astype(int)
-        bg_resized = mm_bg[np.ix_(y_idx, x_idx)].copy()  # (th, tw, 4)
+        bg_resized = mm_bg[np.ix_(y_idx, x_idx)].copy()
 
         # Placement: flush bottom-right
         y0 = fh - target_h
@@ -4941,16 +4564,13 @@ class InteractiveViewer:
         region = img[y0:y0+target_h, x0:x0+target_w]
         region[:] = region * (1 - alpha) + rgb * alpha
 
-        # Store minimap rect for click-to-teleport
+        # Store minimap rect and world extent for click-to-teleport
         self._minimap_rect = (x0, y0, target_w, target_h)
+        self._minimap_world_extent = (wx_min, wy_min, wx_max, wy_max)
 
-        # --- Terrain footprint (visible area quad) ---
-        H, W = self.terrain_shape
-        cam_col = self.position[0] / self.pixel_spacing_x
-        cam_row = self.position[1] / self.pixel_spacing_y
-        # Minimap local coords
-        lx = cam_col / W * target_w
-        ly = cam_row / H * target_h
+        # --- Camera position in minimap-local coords ---
+        lx = (self.position[0] - wx_min) / wx_range * target_w
+        ly = (self.position[1] - wy_min) / wy_range * target_h
 
         ve = self.vertical_exaggeration
         terrain_z = self._get_terrain_z(self.position[0], self.position[1]) * ve
@@ -4992,8 +4612,8 @@ class InteractiveViewer:
                 mm_corners = []
                 break
             # Convert world XY to minimap-local coords
-            mcol = hit[0] / self.pixel_spacing_x / W * target_w
-            mrow = hit[1] / self.pixel_spacing_y / H * target_h
+            mcol = (hit[0] - wx_min) / wx_range * target_w
+            mrow = (hit[1] - wy_min) / wy_range * target_h
             mm_corners.append((mcol, mrow))
 
         if len(mm_corners) == 4:
@@ -5031,8 +4651,8 @@ class InteractiveViewer:
             if obs.position is None:
                 continue
             obs_x, obs_y = obs.position
-            obs_lx = (obs_x / self.pixel_spacing_x) / W * target_w
-            obs_ly = (obs_y / self.pixel_spacing_y) / H * target_h
+            obs_lx = (obs_x - wx_min) / wx_range * target_w
+            obs_ly = (obs_y - wy_min) / wy_range * target_h
             r = 4 if slot == self._active_observer else 2
             self._draw_dot(img, obs_lx, obs_ly, x0, y0, target_w, target_h,
                            color=np.array(obs.color), radius=r)
@@ -6111,72 +5731,22 @@ class InteractiveViewer:
     def _action_toggle_hydro(self):
         self._toggle_hydro()
 
-    _STREAM_ORDER_PALETTE = np.array([
-        [0.0,  0.0,  0.0 ],  # 0: unused
-        [0.50, 0.80, 1.00],  # 1: pale sky blue (headwaters)
-        [0.38, 0.68, 0.98],  # 2: light blue
-        [0.28, 0.55, 0.95],  # 3: sky blue
-        [0.18, 0.42, 0.90],  # 4: medium blue
-        [0.10, 0.30, 0.85],  # 5: royal blue
-        [0.06, 0.20, 0.78],  # 6: deep blue
-        [0.03, 0.12, 0.70],  # 7: dark blue
-        [0.01, 0.06, 0.60],  # 8: navy (major rivers)
-    ], dtype=np.float32)
+    # Delegate palette/helpers to hydro_manager module
+    from .viewer.hydro_manager import (
+        STREAM_ORDER_PALETTE as _STREAM_ORDER_PALETTE,
+        build_stream_palette_lut as _build_stream_palette_lut_fn,
+        color_from_order as _hydro_color_from_order_fn,
+        radius_from_order as _hydro_radius_from_order_fn,
+    )
 
-    @staticmethod
-    def _build_stream_palette_lut(max_order):
-        """Build a 256-entry color LUT for stream order overlay rendering.
-
-        Maps normalized [0,1] overlay values back to integer orders
-        and looks up the categorical palette color.
-        """
-        palette = InteractiveViewer._STREAM_ORDER_PALETTE
-        lut = np.zeros((256, 3), dtype=np.float32)
-        denom = max(max_order - 1, 1)
-        for i in range(256):
-            # Reverse the normalization: order = 1 + norm * (max_order - 1)
-            order = int(round(1 + (i / 255.0) * denom))
-            order = max(1, min(8, order))
-            lut[i] = palette[order]
-        return lut
-
-    @staticmethod
-    def _hydro_color_from_order(order_norm, raw_order=None):
-        """Map stream order → (R, G, B) per particle.
-
-        If *raw_order* is provided, uses categorical palette keyed by
-        integer Strahler order.  Otherwise falls back to continuous
-        blue gradient from normalized [0,1] order.
-        """
-        if raw_order is not None:
-            idx = np.clip(raw_order, 1, 8).astype(int)
-            colors = InteractiveViewer._STREAM_ORDER_PALETTE[idx].copy()
-        else:
-            colors = np.empty((len(order_norm), 3), dtype=np.float32)
-            colors[:, 0] = 0.02 + order_norm * 0.43   # R: 0.02 → 0.45
-            colors[:, 1] = 0.10 + order_norm * 0.65   # G: 0.10 → 0.75
-            colors[:, 2] = 0.55 + order_norm * 0.40   # B: 0.55 → 0.95
-        colors = np.clip(colors, 0.0, 1.0)
-        return colors
-
-    @staticmethod
-    def _hydro_radius_from_order(order_norm, raw_order=None):
-        """Map stream order → radius (2–5) per particle.
-
-        If *raw_order* is provided, uses integer order + 1 directly
-        (clamped 2–5).  Otherwise uses continuous mapping.
-        """
-        if raw_order is not None:
-            return np.clip(raw_order + 1, 2, 5).astype(np.int32)
-        return np.clip(2 + (order_norm * 3).astype(np.int32),
-                       2, 5).astype(np.int32)
+    _build_stream_palette_lut = staticmethod(_build_stream_palette_lut_fn)
+    _hydro_color_from_order = staticmethod(_hydro_color_from_order_fn)
+    _hydro_radius_from_order = staticmethod(_hydro_radius_from_order_fn)
 
     def _init_hydro(self, flow_accum, **kwargs):
         """Initialize hydro flow particles using MFD flow direction.
 
-        Uses Multiple Flow Direction (MFD) to compute flow vectors from
-        terrain elevation, distributing flow to all downhill neighbors
-        proportional to slope (Freeman 1991).
+        Delegates to ``self.hydro_mgr.init_from_flow()``.
 
         Parameters
         ----------
@@ -6188,500 +5758,111 @@ class InteractiveViewer:
             stream_order (array), flow_dir_mfd (xrspatial MFD fractions,
             shape (8,H,W)), elevation (conditioned DEM for manual MFD).
         """
-        # Accept CuPy or NumPy arrays — init builds numpy, then uploads to GPU
-        if hasattr(flow_accum, 'get'):
-            flow_accum = flow_accum.get()
-        flow_accum = np.asarray(flow_accum, dtype=np.float64)
-        H, W = flow_accum.shape
-
-        # Stream order grid (optional but strongly recommended)
-        stream_order = kwargs.pop('stream_order', None)
-        if stream_order is not None:
-            if hasattr(stream_order, 'get'):
-                stream_order = stream_order.get()
-            stream_order = np.asarray(stream_order, dtype=np.float64)
-            # Replace NaN with 0 (non-stream cells)
-            stream_order = np.nan_to_num(stream_order, nan=0.0)
-        has_stream_order = stream_order is not None and (stream_order > 0).any()
-
-        # Mark hydro as initialised (don't hold the full grids —
-        # particle advection uses _hydro_flow_u_px / _hydro_flow_v_px).
-        self._hydro_data = True
-
-        # Apply optional overrides
-        for key, attr, conv in [
-            ('n_particles', '_hydro_n_particles', int),
-            ('max_age', None, int),
-            ('trail_len', '_hydro_trail_len', int),
-            ('speed', '_hydro_speed', float),
-            ('accum_threshold', '_hydro_accum_threshold', int),
-            ('color', '_hydro_color', tuple),
-            ('alpha', '_hydro_alpha', float),
-            ('dot_radius', '_hydro_dot_radius', int),
-            ('min_visible_age', None, int),
-        ]:
-            if key in kwargs:
-                val = conv(kwargs[key])
-                if attr:
-                    setattr(self, attr, val)
-                elif key == 'max_age':
-                    self.hydro.hydro_max_age = val
-                elif key == 'min_visible_age':
-                    self.hydro.hydro_min_visible_age = val
-
-        # MFD (Multiple Flow Direction) flow vectors.
-        # Prefer xrspatial MFD fractions (8, H, W) if provided,
-        # otherwise compute manually from elevation.
-        flow_dir_mfd = kwargs.pop('flow_dir_mfd', None)
-
-        sqrt2_inv = 1.0 / np.sqrt(2.0)
-        # xrspatial neighbor order: E, SE, S, SW, W, NW, N, NE
-        # (unit_dr, unit_dc) — row south+, col east+
-        _dir_dr = np.array([0.0, sqrt2_inv, 1.0, sqrt2_inv,
-                            0.0, -sqrt2_inv, -1.0, -sqrt2_inv])
-        _dir_dc = np.array([1.0, sqrt2_inv, 0.0, -sqrt2_inv,
-                            -1.0, -sqrt2_inv, 0.0, sqrt2_inv])
-
-        if flow_dir_mfd is not None:
-            # Convert xrspatial MFD fractions → flow vectors
-            if hasattr(flow_dir_mfd, 'get'):
-                flow_dir_mfd = flow_dir_mfd.get()
-            frac = np.asarray(flow_dir_mfd, dtype=np.float64)  # (8, H, W)
-            frac = np.nan_to_num(frac, nan=0.0)
-            flow_v = np.tensordot(_dir_dr, frac, axes=([0], [0]))
-            flow_u = np.tensordot(_dir_dc, frac, axes=([0], [0]))
-            valid_flow = np.any(frac > 0, axis=0)
-            del frac
-        else:
-            # Manual MFD from elevation (fallback for add_hydro users).
-            # Flow distributed to ALL downhill neighbors proportional
-            # to slope^p (Freeman 1991, p=1.1).
-            elevation = kwargs.pop('elevation', None)
-            if elevation is not None:
-                if hasattr(elevation, 'get'):
-                    elevation = elevation.get()
-                elevation = np.asarray(elevation, dtype=np.float64)
-            else:
-                _elev = self.raster.data
-                if hasattr(_elev, 'get'):
-                    _elev = _elev.get()
-                elevation = np.asarray(_elev, dtype=np.float64)
-
-            nan_mask_elev = np.isnan(elevation)
-            elev_clean = np.where(nan_mask_elev, 1e10, elevation)
-
-            sqrt2 = np.sqrt(2.0)
-            mfd_p = 1.1
-            flow_u = np.zeros((H, W), dtype=np.float64)
-            flow_v = np.zeros((H, W), dtype=np.float64)
-
-            # 8 neighbor offsets: (dr, dc, distance)
-            _nb_offsets = [
-                (-1, -1, sqrt2), (-1,  0, 1.0), (-1,  1, sqrt2),
-                ( 0, -1, 1.0),                  ( 0,  1, 1.0),
-                ( 1, -1, sqrt2), ( 1,  0, 1.0), ( 1,  1, sqrt2),
-            ]
-            # Matching unit vectors (NW, N, NE, W, E, SW, S, SE)
-            _nb_dr = np.array([-sqrt2_inv, -1.0, -sqrt2_inv,
-                                0.0, 0.0,
-                                sqrt2_inv, 1.0, sqrt2_inv])
-            _nb_dc = np.array([-sqrt2_inv, 0.0, sqrt2_inv,
-                               -1.0, 1.0,
-                               -sqrt2_inv, 0.0, sqrt2_inv])
-
-            for k, (dr, dc, dist) in enumerate(_nb_offsets):
-                cr = slice(max(0, -dr), H - max(0, dr))
-                cc = slice(max(0, -dc), W - max(0, dc))
-                nr = slice(max(0, -dr) + dr, H - max(0, dr) + dr)
-                nc = slice(max(0, -dc) + dc, W - max(0, dc) + dc)
-                drop = elev_clean[cr, cc] - elev_clean[nr, nc]
-                slope = np.maximum(drop / dist, 0.0)
-                weight = slope ** mfd_p
-                flow_v[cr, cc] += weight * _nb_dr[k]
-                flow_u[cr, cc] += weight * _nb_dc[k]
-
-            # Suppress flow at NaN-elevation cells
-            flow_u[nan_mask_elev] = 0.0
-            flow_v[nan_mask_elev] = 0.0
-
-        # Normalize to unit vectors
-        mag = np.sqrt(flow_u**2 + flow_v**2)
-        valid_flow = mag > 0
-        flow_u[valid_flow] /= mag[valid_flow]
-        flow_v[valid_flow] /= mag[valid_flow]
-
-        self._hydro_flow_u_px = flow_u.astype(np.float32)
-        self._hydro_flow_v_px = flow_v.astype(np.float32)
-
-        # Normalize accumulation: log10(clip(fa, 1)), scale to [0,1]
-        fa_clipped = np.clip(flow_accum, 1, None)
-        log_fa = np.log10(fa_clipped)
-        threshold = np.log10(max(self._hydro_accum_threshold, 1))
-        log_max = log_fa.max()
-        if log_max > threshold:
-            accum_norm = np.clip((log_fa - threshold) / (log_max - threshold), 0, 1)
-        else:
-            accum_norm = np.zeros_like(log_fa)
-        self._hydro_flow_accum_norm = accum_norm.astype(np.float32)
-
-        # Store stream order grids
-        if has_stream_order:
-            max_order = stream_order.max()
-            so_norm = (stream_order / max(max_order, 1)).astype(np.float32)
-            self._hydro_stream_order = so_norm
-            self._hydro_stream_order_raw = stream_order.astype(np.int32)
-            print(f"  Stream order: max {int(max_order)}, "
-                  f"{int((stream_order > 0).sum())} stream cells")
-        else:
-            self._hydro_stream_order = None
-            self._hydro_stream_order_raw = None
-
-        # Accept and store stream_link grid
-        stream_link_grid = kwargs.pop('stream_link', None)
-        if stream_link_grid is not None:
-            if hasattr(stream_link_grid, 'get'):
-                stream_link_grid = stream_link_grid.get()
-            self._hydro_stream_link = np.nan_to_num(
-                np.asarray(stream_link_grid, dtype=np.float64), nan=0.0
-            ).astype(np.int32)
-        else:
-            self._hydro_stream_link = None
-
-        # Build spawn probabilities — stream-order weighted if available
-        if has_stream_order:
-            # Spawn on stream cells, weighted by sqrt(order) — much
-            # flatter than order^2, giving real coverage to headwaters
-            spawn_weights = np.where(stream_order > 0,
-                                     np.sqrt(stream_order), 0.0)
-            spawn_weights[~valid_flow] = 0.0
-        else:
-            spawn_weights = accum_norm.copy()
-            spawn_weights[~valid_flow] = 0.0
-
-        flat_weights = spawn_weights.ravel()
-        valid_mask = flat_weights > 0
-        valid_indices = np.nonzero(valid_mask)[0]
-        if len(valid_indices) > 0:
-            valid_probs = flat_weights[valid_indices].astype(np.float64)
-            valid_probs /= valid_probs.sum()
-        else:
-            valid_flow_flat = valid_flow.ravel()
-            valid_indices = np.nonzero(valid_flow_flat)[0]
-            if len(valid_indices) > 0:
-                valid_probs = np.ones(len(valid_indices), dtype=np.float64)
-                valid_probs /= valid_probs.sum()
-            else:
-                valid_indices = np.arange(H * W)
-                valid_probs = np.ones(H * W, dtype=np.float64) / (H * W)
-        self._hydro_spawn_indices = valid_indices
-        self._hydro_spawn_valid_probs = valid_probs
-
-        # Spawn initial particles
-        N = self._hydro_n_particles
-        chosen = np.random.choice(len(valid_indices), N, p=valid_probs)
-        indices = valid_indices[chosen]
-        rows = (indices // W).astype(np.float32) + np.random.uniform(-0.5, 0.5, N).astype(np.float32)
-        cols = (indices % W).astype(np.float32) + np.random.uniform(-0.5, 0.5, N).astype(np.float32)
-        rows = np.clip(rows, 0, H - 1)
-        cols = np.clip(cols, 0, W - 1)
-
-        self._hydro_particles = np.column_stack([rows, cols]).astype(np.float32)
-        self._hydro_ages = np.random.randint(0, self._hydro_max_age, N).astype(np.int32)
-        self._hydro_lifetimes = np.random.randint(
-            self._hydro_max_age // 2, self._hydro_max_age, N).astype(np.int32)
-        self._hydro_trails = np.zeros(
-            (N, self._hydro_trail_len, 2), dtype=np.float32)
-        for t in range(self._hydro_trail_len):
-            self._hydro_trails[:, t, :] = self._hydro_particles
-
-        # Compute terrain slope magnitude for speed modulation
         terrain_data = self.raster.data
-        if hasattr(terrain_data, 'get'):
-            elev = terrain_data.get().astype(np.float64)
-        else:
-            elev = np.asarray(terrain_data, dtype=np.float64)
-        grad_row, grad_col = np.gradient(np.nan_to_num(elev, nan=0.0))
-        slope_mag = np.sqrt(grad_row**2 + grad_col**2).astype(np.float32)
-        p95 = np.percentile(slope_mag[slope_mag > 0], 95) if (slope_mag > 0).any() else 1.0
-        slope_norm = np.clip(slope_mag / max(p95, 1e-6), 0, 1).astype(np.float32)
-        self._hydro_slope_mag = slope_norm
-
-        # Per-particle visual properties from stream order (or accum fallback)
-        r_idx = np.clip(np.floor(rows).astype(int), 0, H - 1)
-        c_idx = np.clip(np.floor(cols).astype(int), 0, W - 1)
-        if has_stream_order:
-            order_val = so_norm[r_idx, c_idx].astype(np.float32)
-            raw_order = self._hydro_stream_order_raw[r_idx, c_idx]
-        else:
-            order_val = accum_norm[r_idx, c_idx].astype(np.float32)
-            raw_order = None
-        self._hydro_particle_accum = order_val
-        self._hydro_particle_raw_order = raw_order
-        self._hydro_particle_colors = self._hydro_color_from_order(
-            order_val, raw_order=raw_order)
-        self._hydro_particle_radii = self._hydro_radius_from_order(
-            order_val, raw_order=raw_order)
-
-        # Min render distance and depth-scaled alpha reference
-        world_diag = np.sqrt((W * self._base_pixel_spacing_x)**2 +
-                             (H * self._base_pixel_spacing_y)**2)
-        self._hydro_min_depth = 1.0  # metres — allow building-level zoom
-        self._hydro_max_depth = world_diag * 0.35  # fade out in middle distance
-        self._hydro_ref_depth = world_diag * 0.15
-
-        # Upload all particle + grid arrays to GPU for GPU-resident advection
-        if has_cupy:
-            self._d_hydro_particles = cp.asarray(self._hydro_particles)
-            self._d_hydro_ages = cp.asarray(self._hydro_ages)
-            self._d_hydro_lifetimes = cp.asarray(self._hydro_lifetimes)
-            self._d_hydro_trails = cp.asarray(self._hydro_trails)
-            self._d_hydro_colors = cp.asarray(self._hydro_particle_colors)
-            self._d_hydro_radii = cp.asarray(self._hydro_particle_radii)
-            self._d_hydro_particle_accum = cp.asarray(self._hydro_particle_accum)
-            if self._hydro_particle_raw_order is not None:
-                self._d_hydro_particle_raw_order = cp.asarray(
-                    self._hydro_particle_raw_order)
-            else:
-                self._d_hydro_particle_raw_order = cp.zeros(N, dtype=cp.int32)
-            self._d_hydro_flow_u = cp.asarray(self._hydro_flow_u_px)
-            self._d_hydro_flow_v = cp.asarray(self._hydro_flow_v_px)
-            if self._hydro_slope_mag is not None:
-                self._d_hydro_slope_mag = cp.asarray(self._hydro_slope_mag)
-            else:
-                self._d_hydro_slope_mag = cp.empty((0, 0), dtype=cp.float32)
-            if self._hydro_stream_order is not None:
-                self._d_hydro_stream_order = cp.asarray(self._hydro_stream_order)
-            else:
-                self._d_hydro_stream_order = cp.empty((0, 0), dtype=cp.float32)
-            if self._hydro_stream_order_raw is not None:
-                self._d_hydro_stream_order_raw = cp.asarray(
-                    self._hydro_stream_order_raw)
-            else:
-                self._d_hydro_stream_order_raw = cp.empty((0, 0), dtype=cp.int32)
-            self._d_hydro_accum_norm = cp.asarray(self._hydro_flow_accum_norm)
-            self._d_hydro_palette = cp.asarray(self._STREAM_ORDER_PALETTE)
-            self._d_hydro_respawn_flags = cp.zeros(N, dtype=cp.int32)
-
-        print(f"  Hydro flow initialized on {H}x{W} grid "
-              f"({N} particles, threshold={self._hydro_accum_threshold})")
+        self.hydro_mgr.init_from_flow(
+            flow_accum, terrain_data,
+            self._base_pixel_spacing_x, self._base_pixel_spacing_y,
+            **kwargs)
 
     def _compute_hydro_from_terrain(self):
         """Compute hydrological flow from current terrain on GPU.
 
-        Uses xrspatial MFD functions (GPU-native) to compute flow
-        direction, accumulation, stream order, and stream link from
-        the current terrain elevation.  Called lazily when hydro is
-        first enabled or after a terrain reload.
-
+        Delegates to ``self.hydro_mgr.compute_from_terrain()``.
         Returns True on success, False on failure.
         """
+        self.hydro_mgr.set_terrain_ref(
+            None, self._base_pixel_spacing_x, self._base_pixel_spacing_y)
         try:
-            from xrspatial import fill as _fill
-            from xrspatial import flow_direction_mfd as _fd_mfd
-            from xrspatial import flow_accumulation_mfd as _fa_mfd
-            from xrspatial import stream_order_mfd as _so_mfd
-            from xrspatial import stream_link_mfd as _sl_mfd
-        except ImportError:
-            print("Hydro requires xrspatial: pip install xrspatial")
+            result = self.hydro_mgr.compute_from_terrain(self.raster)
+        except Exception as exc:
+            print(f"Hydro computation failed: {exc}")
             return False
-        try:
-            from scipy.ndimage import uniform_filter
-        except ImportError:
-            print("Hydro requires scipy: pip install scipy")
+        if result is None:
             return False
-
-        print("Computing hydrological flow on GPU...")
-        terrain = self.raster
-        data = terrain.data
-        is_cupy = hasattr(data, 'get')
-
-        # Condition DEM: ocean/nodata → low sentinel
-        elev_np = data.get() if is_cupy else np.array(data)
-        elev_np = elev_np.astype(np.float32)
-        ocean = (elev_np == 0.0) | np.isnan(elev_np)
-        elev_np[ocean] = -100.0
-
-        # Smooth to remove noise pits
-        smoothed = uniform_filter(elev_np, size=15, mode='nearest')
-        smoothed[ocean] = -100.0
-        del elev_np
-
-        # Fill depressions + resolve flats
-        if is_cupy:
-            sm = cp.asarray(smoothed)
-        else:
-            sm = smoothed
-        del smoothed
-
-        filled = _fill(terrain.copy(data=sm))
-        fill_depth = filled.data - sm
-        resolved = filled.data + fill_depth * 0.01
-        del filled, fill_depth, sm
-
-        # Jitter to break remaining ties
-        if is_cupy:
-            cp.random.seed(0)
-            resolved += cp.random.uniform(
-                0, 0.0001, resolved.shape, dtype=cp.float32)
-            resolved[cp.asarray(ocean)] = -100.0
-        else:
-            np.random.seed(0)
-            resolved += np.random.uniform(
-                0, 0.0001, resolved.shape).astype(np.float32)
-            resolved[ocean] = -100.0
-
-        # Compute MFD flow direction and accumulation
-        resolved_da = terrain.copy(data=resolved)
-        fd_mfd = _fd_mfd(resolved_da)
-        fa_mfd = _fa_mfd(fd_mfd)
-        del resolved_da, resolved
-
-        # Stream order and link
-        so = _so_mfd(fd_mfd, fa_mfd, threshold=50)
-        sl = _sl_mfd(fd_mfd, fa_mfd, threshold=50)
-
-        # Mask ocean cells
-        fa_out = fa_mfd.data
-        fd_out = fd_mfd.data       # (8, H, W)
-        so_out = so.data
-        sl_out = sl.data
-        xp = cp if is_cupy else np
-        if is_cupy:
-            ocean_gpu = cp.asarray(ocean)
-            fa_out[ocean_gpu] = cp.nan
-            fd_out[:, ocean_gpu] = cp.nan
-            so_out[ocean_gpu] = cp.nan
-            sl_out[ocean_gpu] = cp.nan
-        else:
-            fa_out[ocean] = np.nan
-            fd_out[:, ocean] = np.nan
-            so_out[ocean] = np.nan
-            sl_out[ocean] = np.nan
-
-        sl_clean = xp.nan_to_num(sl_out, nan=0.0).astype(xp.float32)
-
-        # Initialize hydro particles with MFD results
-        self._init_hydro(
-            fa_out,
-            flow_dir_mfd=fd_out,
-            stream_order=so_out,
-            stream_link=sl_clean,
-        )
 
         # Register stream_link overlay with palette coloring
-        if self._hydro_stream_order_raw is not None:
-            max_order = int(self._hydro_stream_order_raw.max())
-            palette_lut = InteractiveViewer._build_stream_palette_lut(
-                max_order)
-            sl_np = sl_clean.get() if is_cupy else np.asarray(sl_clean)
-            so_raw = self._hydro_stream_order_raw.astype(np.float32)
-            sl_color = np.where(
-                (sl_np <= 0) | (so_raw <= 0),
-                np.float32(np.nan), so_raw)
-            _add_overlay(self, 'stream_link', sl_color,
-                         color_lut=palette_lut)
-
-        H, W = terrain.shape
-        print(f"  Hydro flow computed on GPU "
-              f"({H}x{W} grid, MFD)")
+        if 'stream_link_overlay' in result:
+            overlay = result['stream_link_overlay']
+            _add_overlay(self, 'stream_link', overlay,
+                         color_lut=result['palette_lut'])
+            # Populate per-tile overlay manager for LOD rendering
+            if self._overlay_tile_mgr is not None:
+                mgr = self._terrain_lod_manager
+                ts = mgr._tile_size if mgr is not None else 128
+                H, W = overlay.shape
+                n_tr = (H + ts - 1) // ts
+                n_tc = (W + ts - 1) // ts
+                self._overlay_tile_mgr.populate_from_array(
+                    overlay, ts, n_tr, n_tc)
+                self._overlay_tile_mgr.set_color_lut(
+                    result['palette_lut'])
+                n_tiles = len(self._overlay_tile_mgr._tile_overlays)
+                print(f"  Overlay tiles: {n_tiles}/{n_tr*n_tc} "
+                      f"(ts={ts}, grid={n_tr}x{n_tc}, "
+                      f"overlay={H}x{W})")
+        else:
+            print("  Warning: no stream_link_overlay in hydro result")
         return True
 
-    def _update_hydro_particles(self):
-        """Advect hydro particles one tick on GPU using CUDA kernels.
+    def _transfer_streaming_overlay(self):
+        """Transfer pending streaming stream overlay to the overlay tile mgr.
 
-        Two-pass approach:
-        1. GPU advection kernel: bilinear flow lookup, trail shift, advection,
-           age increment, stream order max-tracking, color/radius update,
-           respawn flag detection — all per-particle in parallel.
-        2. CPU respawn batch: read back respawn flags, sample spawn pool
-           (weighted probability), upload new positions → GPU respawn kernel
-           resets trails/age/color/radius.
+        Called after hydro_mgr.check_streaming_result().  Only sets tiles
+        that are outside the initial terrain grid (streaming tiles) to
+        avoid overwriting the more accurate xrspatial-computed overlay.
         """
-        if not has_cupy or self._d_hydro_flow_u is None or self._d_hydro_particles is None:
+        otm = self._overlay_tile_mgr
+        if otm is None:
+            return
+        # Only transfer when overlay is the active layer
+        if self._active_overlay_data is None:
+            return
+        overlay, win_r0, win_c0 = self.hydro_mgr.pop_streaming_overlay()
+        if overlay is None:
             return
 
-        N = self._d_hydro_particles.shape[0]
-        H, W = self._d_hydro_flow_u.shape
+        mgr = self._terrain_lod_manager
+        if mgr is None:
+            return
 
-        has_so = 1 if (self._hydro_stream_order is not None) else 0
-        has_slope = 1 if (self._hydro_slope_mag is not None) else 0
-        has_raw = 1 if (self._hydro_stream_order_raw is not None) else 0
+        ts = mgr._tile_size
+        n_tr_initial = mgr._n_tile_rows
+        n_tc_initial = mgr._n_tile_cols
+        ov_h, ov_w = overlay.shape
 
-        speed = float(self._hydro_speed)
+        # Slice overlay into per-tile chunks, only for streaming tiles
+        count = 0
+        # Tile range covered by this window
+        tr_start = win_r0 // ts
+        tc_start = win_c0 // ts
+        tr_end = (win_r0 + ov_h + ts - 1) // ts
+        tc_end = (win_c0 + ov_w + ts - 1) // ts
+
+        for tr in range(tr_start, tr_end):
+            for tc in range(tc_start, tc_end):
+                # Skip initial-grid tiles — they have accurate overlay
+                if 0 <= tr < n_tr_initial and 0 <= tc < n_tc_initial:
+                    continue
+                # Extract tile region from overlay
+                r0 = tr * ts - win_r0
+                c0 = tc * ts - win_c0
+                r1 = min(r0 + ts, ov_h)
+                c1 = min(c0 + ts, ov_w)
+                if r0 < 0 or c0 < 0 or r1 <= r0 or c1 <= c0:
+                    continue
+                tile_data = overlay[r0:r1, c0:c1]
+                if np.all(np.isnan(tile_data)):
+                    continue
+                otm.set_tile(tr, tc, tile_data.copy())
+                count += 1
+
+        if count > 0:
+            print(f"  Streaming overlay: {count} tiles added")
+
+    def _update_hydro_particles(self):
+        """Advect hydro particles one tick on GPU.  Delegates to HydroManager."""
         dt_scale = float(getattr(self, '_dt_scale', 1.0))
-        trail_len = int(self._hydro_trail_len)
-        rng_base = np.random.randint(0, 2**62)
-
-        threadsperblock = 256
-        blockspergrid = (N + threadsperblock - 1) // threadsperblock
-
-        _hydro_advect_kernel[blockspergrid, threadsperblock](
-            self._d_hydro_particles,
-            self._d_hydro_ages,
-            self._d_hydro_lifetimes,
-            self._d_hydro_trails,
-            self._d_hydro_particle_accum,
-            self._d_hydro_particle_raw_order,
-            self._d_hydro_colors,
-            self._d_hydro_radii,
-            self._d_hydro_flow_u,
-            self._d_hydro_flow_v,
-            self._d_hydro_slope_mag,
-            self._d_hydro_stream_order,
-            self._d_hydro_stream_order_raw,
-            self._d_hydro_accum_norm,
-            self._d_hydro_palette,
-            self._d_hydro_respawn_flags,
-            speed, dt_scale, trail_len,
-            has_so, has_slope, has_raw,
-            rng_base,
-        )
-
-        # Read back respawn flags and handle respawns on CPU
-        respawn_flags = self._d_hydro_respawn_flags.get()
-        respawn_idx = np.nonzero(respawn_flags)[0]
-        n_respawn = len(respawn_idx)
-
-        if n_respawn > 0:
-            chosen = np.random.choice(
-                len(self._hydro_spawn_indices), n_respawn,
-                p=self._hydro_spawn_valid_probs)
-            flat_indices = self._hydro_spawn_indices[chosen]
-            spawn_rows = (flat_indices // W).astype(np.float32) + \
-                np.random.uniform(-0.5, 0.5, n_respawn).astype(np.float32)
-            spawn_cols = (flat_indices % W).astype(np.float32) + \
-                np.random.uniform(-0.5, 0.5, n_respawn).astype(np.float32)
-            spawn_rows = np.clip(spawn_rows, 0, H - 1)
-            spawn_cols = np.clip(spawn_cols, 0, W - 1)
-            new_lifetimes = np.random.randint(
-                self._hydro_max_age // 2, self._hydro_max_age,
-                n_respawn).astype(np.int32)
-
-            d_respawn_idx = cp.asarray(respawn_idx.astype(np.int32))
-            d_spawn_rows = cp.asarray(spawn_rows)
-            d_spawn_cols = cp.asarray(spawn_cols)
-            d_new_lifetimes = cp.asarray(new_lifetimes)
-
-            blocks_r = (n_respawn + threadsperblock - 1) // threadsperblock
-            _hydro_respawn_kernel[blocks_r, threadsperblock](
-                self._d_hydro_particles,
-                self._d_hydro_ages,
-                self._d_hydro_lifetimes,
-                self._d_hydro_trails,
-                self._d_hydro_particle_accum,
-                self._d_hydro_particle_raw_order,
-                self._d_hydro_colors,
-                self._d_hydro_radii,
-                d_respawn_idx,
-                d_spawn_rows,
-                d_spawn_cols,
-                d_new_lifetimes,
-                self._d_hydro_stream_order,
-                self._d_hydro_stream_order_raw,
-                self._d_hydro_accum_norm,
-                self._d_hydro_palette,
-                trail_len, has_so, has_raw,
-            )
+        self.hydro_mgr.update_particles(dt_scale=dt_scale)
 
     def _draw_hydro_on_frame(self, img):
         """Project hydro particles to screen space and draw on rendered frame.
@@ -6840,78 +6021,23 @@ class InteractiveViewer:
         return img
 
     def _splat_hydro_gpu(self, d_frame):
-        """Project and splat hydro particles on GPU via Numba CUDA kernel.
-
-        All particle state is GPU-resident — no per-frame CPU→GPU uploads.
-        Trails are reshaped on GPU (zero-copy) from (N, T, 2) → (N*T, 2).
-
-        Parameters
-        ----------
-        d_frame : cupy.ndarray, shape (H, W, 3)
-            GPU frame buffer (float32 0-1). Modified in-place via atomic add.
-        """
-        if self._d_hydro_particles is None or self._d_hydro_trails is None:
-            return
-
-        from .analysis.render import _compute_camera_basis
-
-        N = self._d_hydro_particles.shape[0]
-        trail_len = self._hydro_trail_len
-        total = N * trail_len
-
-        cam_pos = self.position
-        look_at = self._get_look_at()
-        forward, right, cam_up = _compute_camera_basis(
-            tuple(cam_pos), tuple(look_at), (0, 0, 1),
-        )
-        fov_scale = math.tan(math.radians(self.fov) / 2.0)
-        aspect_ratio = d_frame.shape[1] / d_frame.shape[0]
-
-        # Flatten trails on GPU: (N, T, 2) → (N*T, 2) — zero-copy reshape
-        d_trails_flat = self._d_hydro_trails.reshape(-1, 2)
-
-        # GPU terrain
+        """Project and splat hydro particles on GPU.  Delegates to HydroManager."""
         terrain_data = self.raster.data
-        if not isinstance(terrain_data, cp.ndarray):
+        if has_cupy and not isinstance(terrain_data, cp.ndarray):
             terrain_data = cp.asarray(terrain_data)
 
-        # Depth buffer for occlusion culling (populated by _update_frame)
         depth_t = getattr(self, '_d_depth_t', None)
-        if depth_t is None:
-            depth_t = cp.empty((0, 0), dtype=cp.float32)
 
-        # Single kernel launch — alpha computed on GPU
-        threadsperblock = 256
-        blockspergrid = (total + threadsperblock - 1) // threadsperblock
-
-        _hydro_splat_kernel[blockspergrid, threadsperblock](
-            d_trails_flat,
-            self._d_hydro_ages,
-            self._d_hydro_lifetimes,
-            self._d_hydro_colors,
-            self._d_hydro_radii,
-            trail_len,
-            float(self._hydro_alpha),
-            int(self._hydro_min_visible_age),
-            float(self._hydro_ref_depth),
-            terrain_data,
-            depth_t,
+        self.hydro_mgr.splat_gpu(
             d_frame,
-            float(cam_pos[0]), float(cam_pos[1]), float(cam_pos[2]),
-            float(forward[0]), float(forward[1]), float(forward[2]),
-            float(right[0]), float(right[1]), float(right[2]),
-            float(cam_up[0]), float(cam_up[1]), float(cam_up[2]),
-            float(fov_scale), float(aspect_ratio),
-            float(self._base_pixel_spacing_x),
-            float(self._base_pixel_spacing_y),
-            float(self.vertical_exaggeration),
-            float(self.subsample_factor),
-            float(self._hydro_min_depth),
-            float(self._hydro_max_depth),
+            camera_pos=self.position,
+            look_at=self._get_look_at(),
+            fov=self.fov,
+            ve=self.vertical_exaggeration,
+            subsample_factor=self.subsample_factor,
+            terrain_gpu=terrain_data,
+            depth_t=depth_t,
         )
-
-        # Clamp output
-        cp.clip(d_frame, 0, 1, out=d_frame)
 
     # ------------------------------------------------------------------
     # GTFS-RT realtime vehicle overlay
@@ -7141,25 +6267,17 @@ class InteractiveViewer:
 
     def _action_toggle_terrain_vis(self):
         from .viewer.terrain_lod import is_terrain_lod_gid
-        entry = self.rtx._geom_state.gas_entries.get('terrain')
-        if entry is not None:
-            vis = not entry.visible
-            self.rtx.set_geometry_visible('terrain', vis)
+        # Toggle all LOD terrain tiles together
+        vis = None
+        for gid in self.rtx.list_geometries():
+            if is_terrain_lod_gid(gid):
+                if vis is None:
+                    e = self.rtx._geom_state.gas_entries.get(gid)
+                    vis = not e.visible if e is not None else True
+                self.rtx.set_geometry_visible(gid, vis)
+        if vis is not None:
             print(f"Terrain {'shown' if vis else 'hidden'}")
             self._needs_render = True
-        elif self.lod_enabled:
-            # Single-pass: determine visibility from first LOD tile,
-            # then toggle all in the same iteration.
-            vis = None
-            for gid in self.rtx.list_geometries():
-                if is_terrain_lod_gid(gid):
-                    if vis is None:
-                        e = self.rtx._geom_state.gas_entries.get(gid)
-                        vis = not e.visible if e is not None else True
-                    self.rtx.set_geometry_visible(gid, vis)
-            if vis is not None:
-                print(f"Terrain {'shown' if vis else 'hidden'}")
-                self._needs_render = True
 
     def _action_toggle_gtfs_rt(self):
         self._toggle_gtfs_rt()
@@ -7247,12 +6365,6 @@ class InteractiveViewer:
         print(f"Color stretch: {self.color_stretch}")
         self._update_frame()
 
-    def _action_cycle_mesh_type(self):
-        cycle = {'tin': 'voxel', 'voxel': 'heightfield', 'heightfield': 'tin'}
-        self.mesh_type = cycle.get(self.mesh_type, 'tin')
-        self._rebuild_vertical_exaggeration(self.vertical_exaggeration)
-        print(f"Mesh type: {self.mesh_type}")
-
     def _action_cycle_basemap_fwd(self):
         self._cycle_basemap()
 
@@ -7289,26 +6401,6 @@ class InteractiveViewer:
         new_factor = max(1, self.subsample_factor // 2)
         if new_factor != self.subsample_factor:
             self._rebuild_at_resolution(new_factor)
-
-    def _action_toggle_terrain_lod(self):
-        """Toggle distance-based terrain LOD on/off."""
-        if self.rtx is None:
-            return
-
-        if self.lod_enabled:
-            # Disable LOD — remove tile geometries, restore single terrain
-            if self._terrain_lod_manager is not None:
-                self._terrain_lod_manager.remove_all(self.rtx)
-                self._terrain_lod_manager.shutdown()
-                self._terrain_lod_manager = None
-            self.lod_enabled = False
-            # Rebuild the single terrain geometry
-            self._rebuild_at_resolution(self.subsample_factor)
-            print("Terrain LOD: OFF")
-        else:
-            # Enable LOD — replace single terrain with tiled LOD
-            self._enable_terrain_lod()
-            print(f"Terrain LOD: ON ({self._terrain_lod_manager.get_stats()})")
 
     def _action_ve_down(self):
         new_ve = max(0.1, round(self.vertical_exaggeration - 0.1, 1))
@@ -7659,11 +6751,8 @@ class InteractiveViewer:
         # Clear all terrain caches (old window geometry is stale)
         self.terrain.clear_all_caches()
 
-        # --- Rebuild terrain mesh ---
-        # When LOD is active, update the LOD manager with new terrain
-        # instead of building a single GAS (which would conflict with
-        # the LOD tile GAS entries).
-        if self.lod_enabled and self._terrain_lod_manager is not None:
+        # --- Rebuild terrain mesh via LOD manager ---
+        if self._terrain_lod_manager is not None:
             mgr = self._terrain_lod_manager
             mgr.set_terrain(terrain_np, offset_x=offset_x, offset_y=offset_y)
             # Force immediate full tile rebuild
@@ -7673,89 +6762,6 @@ class InteractiveViewer:
                         ve=ve, force=True,
                         camera_front=self._get_front(), fov=self.camera.fov)
             mgr.per_tick_build_limit = saved_limit
-        else:
-            # Non-LOD path: build single terrain GAS with offset
-            from . import mesh as mesh_mod
-
-            H, W = new_H, new_W
-            cache_key = (self.subsample_factor, self.mesh_type)
-
-            if self.mesh_type == 'heightfield':
-                if self.rtx is not None:
-                    self.rtx.add_heightfield_geometry(
-                        'terrain', terrain_np, H, W,
-                        spacing_x=psx,
-                        spacing_y=psy,
-                        ve=ve,
-                    )
-                    if self.terrain_skirt:
-                        sv, si = mesh_mod.build_terrain_skirt(
-                            terrain_np, H, W, scale=ve,
-                            pixel_spacing_x=psx,
-                            pixel_spacing_y=psy)
-                        self.rtx.add_geometry('terrain_skirt', sv, si)
-                    elif self.rtx.has_geometry('terrain_skirt'):
-                        self.rtx.remove_geometry('terrain_skirt')
-                self._terrain_mesh_cache[cache_key] = (None, None, terrain_np.copy(), None)
-            else:
-                terrain_normals = None
-                if self.mesh_type == 'voxel':
-                    num_verts = H * W * 8
-                    num_tris = H * W * 12
-                    vertices = np.zeros(num_verts * 3, dtype=np.float32)
-                    indices = np.zeros(num_tris * 3, dtype=np.int32)
-                    base_elev = float(np.nanmin(terrain_np))
-                    mesh_mod.voxelate_terrain(vertices, indices, new_raster, scale=1.0,
-                                              base_elevation=base_elev)
-                else:
-                    num_verts = H * W
-                    num_tris = (H - 1) * (W - 1) * 2
-                    vertices = np.zeros(num_verts * 3, dtype=np.float32)
-                    indices = np.zeros(num_tris * 3, dtype=np.int32)
-                    mesh_mod.triangulate_terrain(vertices, indices, new_raster, scale=1.0)
-
-                    terrain_normals = mesh_mod.compute_terrain_normals(
-                        new_raster, H, W, psx=psx, psy=psy)
-
-                    if self.terrain_skirt:
-                        vertices, indices = mesh_mod.add_terrain_skirt(
-                            vertices, indices, H, W)
-                        terrain_normals = np.concatenate([
-                            terrain_normals,
-                            mesh_mod.compute_skirt_normals(H, W)])
-
-                # Scale x,y to world units + apply world offset
-                vertices[0::3] = vertices[0::3] * psx + offset_x
-                vertices[1::3] = vertices[1::3] * psy + offset_y
-
-                # Apply vertical exaggeration
-                if ve != 1.0:
-                    vertices[2::3] *= ve
-
-                # Cache the new mesh (normals stored at VE=1.0)
-                base_verts = vertices.copy()
-                if ve != 1.0:
-                    base_verts[2::3] /= ve
-                base_normals = terrain_normals.copy() if terrain_normals is not None else None
-                self._terrain_mesh_cache[cache_key] = (
-                    base_verts, indices.copy(), terrain_np.copy(), base_normals)
-
-                # Transform normals for current VE
-                if ve != 1.0 and terrain_normals is not None:
-                    terrain_normals = terrain_normals.copy()
-                    terrain_normals[2::3] /= ve
-                    ln = np.sqrt(terrain_normals[0::3]**2 + terrain_normals[1::3]**2 + terrain_normals[2::3]**2)
-                    ln[ln < 1e-10] = 1.0
-                    terrain_normals[0::3] /= ln
-                    terrain_normals[1::3] /= ln
-                    terrain_normals[2::3] /= ln
-
-                # Replace terrain geometry
-                if self.rtx is not None:
-                    gd = (H, W) if self.mesh_type != 'voxel' and not self.terrain_skirt else None
-                    self.rtx.add_geometry('terrain', vertices, indices,
-                                          grid_dims=gd,
-                                          normals=terrain_normals)
 
         # Reinitialize hydro for new terrain
         if new_hydro is not None and self._hydro_data is not None:
@@ -7775,6 +6781,7 @@ class InteractiveViewer:
         # under the camera (keeps altitude above ground consistent).
 
         # Refresh minimap
+        self._minimap_bg_extent = None
         self._compute_minimap_background()
 
         self._last_reload_time = time.time()
@@ -7924,6 +6931,11 @@ class InteractiveViewer:
                 self._update_wind_particles()
                 self._splat_wind_gpu(self._d_wind_scratch)
             if self._hydro_enabled and self._hydro_particles is not None:
+                self.hydro_mgr.check_streaming_result()
+                self._transfer_streaming_overlay()
+                cam_r = self.position[1] / self._base_pixel_spacing_y
+                cam_c = self.position[0] / self._base_pixel_spacing_x
+                self.hydro_mgr.update_streaming_window(cam_r, cam_c)
                 self._update_hydro_particles()
                 self._splat_hydro_gpu(self._d_wind_scratch)
             if self._clouds_enabled and self._rain_particles is not None:
@@ -7977,6 +6989,8 @@ class InteractiveViewer:
 
         if provider == 'none':
             self._tiles_enabled = False
+            if self._texture_tile_mgr is not None:
+                self._texture_tile_mgr.clear()
             print("Basemap: none")
         else:
             from .tiles import XYZTileService
@@ -7987,14 +7001,26 @@ class InteractiveViewer:
                     self._tile_service = XYZTileService(
                         url_template=provider, raster=self._base_raster,
                     )
-                    self._tile_service.fetch_visible_tiles()
             else:
                 self._tile_service = XYZTileService(
                     url_template=provider, raster=self._base_raster,
                 )
-                self._tile_service.fetch_visible_tiles()
             self._tiles_enabled = True
             print(f"Basemap: {provider}")
+            # When LOD active, clear and re-fetch basemap lazily per tile.
+            # When LOD not active, use monolithic fetch.
+            if (self._texture_tile_mgr is not None
+                    and self.lod_enabled
+                    and self._terrain_lod_manager is not None):
+                self._texture_tile_mgr.clear()
+                # Re-fire tile callbacks for all visible tiles so basemap
+                # gets fetched for them in background threads.
+                mgr = self._terrain_lod_manager
+                if mgr._on_tile_added is not None:
+                    for (tr, tc) in list(mgr._tile_lods.keys()):
+                        mgr._fire_tile_added(tr, tc)
+            else:
+                self._tile_service.fetch_visible_tiles()
 
         self._update_frame()
 
@@ -8031,7 +7057,7 @@ class InteractiveViewer:
             for geom_id in self._all_geometries:
                 parts = geom_id.rsplit('_', 1)
                 base_name = parts[0] if len(parts) == 2 and parts[1].isdigit() else geom_id
-                if base_name == layer_name or geom_id == layer_name or geom_id == 'terrain':
+                if base_name == layer_name or geom_id == layer_name:
                     self.rtx.set_geometry_visible(geom_id, True)
                     visible_count += 1
                 else:
@@ -8881,9 +7907,21 @@ class InteractiveViewer:
         if self.viewshed_enabled and self._viewshed_cache is not None:
             viewshed_data = self._viewshed_cache
 
-        # Get tile texture for screenshot if enabled
+        # Basemap texture for screenshot
         rgb_texture = None
-        if self._tiles_enabled and self._tile_service is not None:
+        _tex_off_y = 0
+        _tex_off_x = 0
+        if (self._texture_tile_mgr is not None
+                and self.lod_enabled
+                and self._terrain_lod_manager is not None):
+            visible = set(self._terrain_lod_manager._tile_lods.keys())
+            d_tex, tex_r, tex_c = self._texture_tile_mgr.get_composite(
+                visible)
+            if d_tex is not None:
+                rgb_texture = d_tex
+                _tex_off_y = tex_r
+                _tex_off_x = tex_c
+        elif self._tiles_enabled and self._tile_service is not None:
             rgb_texture = self._tile_service.get_gpu_texture()
             if rgb_texture is not None and self.subsample_factor > 1:
                 f = self.subsample_factor
@@ -8916,6 +7954,27 @@ class InteractiveViewer:
             _cloud_fog_map = self._d_cloud_fog_map
             _cloud_fog_density = 12.0 / self._scene_diagonal
 
+        # Resolve overlay: per-tile composite when LOD active,
+        # else monolithic array.  Used by both screenshot and live paths.
+        _ov_data = self._active_overlay_data
+        _ov_lut = self._active_overlay_color_lut
+        _ov_off_y = 0
+        _ov_off_x = 0
+        if (self._overlay_tile_mgr is not None
+                and self._active_overlay_data is not None
+                and self.lod_enabled
+                and self._terrain_lod_manager is not None):
+            visible = set(self._terrain_lod_manager._tile_lods.keys())
+            d_comp, off_r, off_c = self._overlay_tile_mgr.get_composite(
+                visible)
+            if d_comp is not None:
+                _ov_data = d_comp
+                _ov_off_y = off_r
+                _ov_off_x = off_c
+                lut = self._overlay_tile_mgr.color_lut
+                if lut is not None:
+                    _ov_lut = lut
+
         render_kwargs = dict(
             camera_position=tuple(self.position),
             look_at=tuple(self._get_look_at()),
@@ -8938,10 +7997,14 @@ class InteractiveViewer:
             color_stretch=self.color_stretch,
             color_range=self._land_color_range,
             rgb_texture=rgb_texture,
-            overlay_data=self._active_overlay_data,
+            rgb_texture_offset_y=_tex_off_y,
+            rgb_texture_offset_x=_tex_off_x,
+            overlay_data=_ov_data,
             overlay_alpha=self._overlay_alpha,
             overlay_as_water=self._overlay_as_water,
-            overlay_color_lut=self._active_overlay_color_lut,
+            overlay_color_lut=_ov_lut,
+            overlay_offset_y=_ov_off_y,
+            overlay_offset_x=_ov_off_x,
             geometry_colors=geometry_colors,
             cloud_fog_map=_cloud_fog_map,
             cloud_fog_density=_cloud_fog_density,
@@ -9030,12 +8093,23 @@ class InteractiveViewer:
                 if self.frame_count % 100 == 0:  # Only print occasionally
                     print(f"[DEBUG] Viewshed enabled but cache is None")
 
-        # Get GPU texture from tile service if enabled
+        # Basemap texture — per-tile composite when LOD active,
+        # else monolithic GPU texture from tile service.
         rgb_texture = None
-        if self._tiles_enabled and self._tile_service is not None:
+        _tex_off_y = 0
+        _tex_off_x = 0
+        if (self._texture_tile_mgr is not None
+                and self.lod_enabled
+                and self._terrain_lod_manager is not None):
+            visible = set(self._terrain_lod_manager._tile_lods.keys())
+            d_tex, tex_r, tex_c = self._texture_tile_mgr.get_composite(
+                visible)
+            if d_tex is not None:
+                rgb_texture = d_tex
+                _tex_off_y = tex_r
+                _tex_off_x = tex_c
+        elif self._tiles_enabled and self._tile_service is not None:
             rgb_texture = self._tile_service.get_gpu_texture()
-            # Tile texture is always at base resolution — stride-subsample
-            # to match the current (possibly subsampled) raster
             if rgb_texture is not None and self.subsample_factor > 1:
                 f = self.subsample_factor
                 rgb_texture = rgb_texture[::f, ::f, :]
@@ -9091,6 +8165,27 @@ class InteractiveViewer:
             # Spatial frequency: ~12 cloud cells across scene
             _cloud_fog_density = 12.0 / self._scene_diagonal
 
+        # Resolve overlay: per-tile composite when LOD active,
+        # else monolithic array.
+        _ov_data = self._active_overlay_data
+        _ov_lut = self._active_overlay_color_lut
+        _ov_off_y = 0
+        _ov_off_x = 0
+        if (self._overlay_tile_mgr is not None
+                and self._active_overlay_data is not None
+                and self.lod_enabled
+                and self._terrain_lod_manager is not None):
+            visible = set(self._terrain_lod_manager._tile_lods.keys())
+            d_comp, off_r, off_c = self._overlay_tile_mgr.get_composite(
+                visible)
+            if d_comp is not None:
+                _ov_data = d_comp
+                _ov_off_y = off_r
+                _ov_off_x = off_c
+                lut = self._overlay_tile_mgr.color_lut
+                if lut is not None:
+                    _ov_lut = lut
+
         d_output = render(
             self.raster,
             camera_position=tuple(self.position),
@@ -9111,15 +8206,19 @@ class InteractiveViewer:
             observer_position=observer_pos,
             pixel_spacing_x=self.pixel_spacing_x,
             pixel_spacing_y=self.pixel_spacing_y,
-            mesh_type=self.mesh_type,
+            mesh_type='heightfield',
             color_data=self._active_color_data,
             color_stretch=self.color_stretch,
             color_range=self._land_color_range,
             rgb_texture=rgb_texture,
-            overlay_data=self._active_overlay_data,
+            rgb_texture_offset_y=_tex_off_y,
+            rgb_texture_offset_x=_tex_off_x,
+            overlay_data=_ov_data,
             overlay_alpha=self._overlay_alpha,
             overlay_as_water=self._overlay_as_water,
-            overlay_color_lut=self._active_overlay_color_lut,
+            overlay_color_lut=_ov_lut,
+            overlay_offset_y=_ov_off_y,
+            overlay_offset_x=_ov_off_x,
             geometry_colors=geometry_colors,
             ao_samples=ao_samples,
             ao_radius=self.ao_radius,
@@ -9273,6 +8372,11 @@ class InteractiveViewer:
 
         # GPU hydro: advect + splat on GPU
         if self._hydro_enabled and self._hydro_particles is not None:
+            self.hydro_mgr.check_streaming_result()
+            self._transfer_streaming_overlay()
+            cam_r = self.position[1] / self._base_pixel_spacing_y
+            cam_c = self.position[0] / self._base_pixel_spacing_x
+            self.hydro_mgr.update_streaming_window(cam_r, cam_c)
             self._update_hydro_particles()
             self._splat_hydro_gpu(d_display)
 
@@ -9418,14 +8522,18 @@ class InteractiveViewer:
                 frame_x = xpos * self.render_width / max(1, self.width)
                 frame_y = ypos * self.render_height / max(1, self.height)
                 if (mx0 <= frame_x < mx0 + mw and my0 <= frame_y < my0 + mh):
-                    # Convert minimap-local → terrain pixel → world XY
+                    # Convert minimap-local → world XY
                     local_x = frame_x - mx0
                     local_y = frame_y - my0
-                    H, W = self.terrain_shape
-                    terrain_col = local_x / mw * W
-                    terrain_row = local_y / mh * H
-                    world_x = terrain_col * self.pixel_spacing_x
-                    world_y = terrain_row * self.pixel_spacing_y
+                    ext = self._minimap_world_extent
+                    if ext is not None:
+                        wx_min, wy_min, wx_max, wy_max = ext
+                        world_x = wx_min + local_x / mw * (wx_max - wx_min)
+                        world_y = wy_min + local_y / mh * (wy_max - wy_min)
+                    else:
+                        H, W = self.terrain_shape
+                        world_x = local_x / mw * W * self.pixel_spacing_x
+                        world_y = local_y / mh * H * self.pixel_spacing_y
                     self.position[0] = world_x
                     self.position[1] = world_y
                     self._update_frame()
@@ -9751,7 +8859,6 @@ class InteractiveViewer:
                 ("Y", "Cycle color stretch"),
                 (", / .", "Overlay alpha"),
                 ("R / Shift+R", "Resolution down / up"),
-                ("Shift+A", "Toggle terrain LOD"),
                 ("Z / Shift+Z", "Vert. exag. down / up"),
                 ("B", "Toggle TIN / Voxel"),
                 ("T", "Toggle shadows"),
@@ -10103,6 +9210,7 @@ class InteractiveViewer:
         self._render_help_text()
 
         # --- Initialize minimap ---
+        self._minimap_bg_extent = None
         self._compute_minimap_background()
 
         # --- GLFW callbacks ---
@@ -10165,11 +9273,6 @@ class InteractiveViewer:
 
         # Render the initial frame so the window isn't blank
         self._tick()
-
-        # Enable terrain LOD if requested at startup
-        if getattr(self, '_deferred_lod', False):
-            self._deferred_lod = False
-            self._enable_terrain_lod()
 
         # --- REPL thread ---
         if self._repl:
@@ -10284,7 +9387,6 @@ def explore(raster, width: int = 800, height: int = 600,
             key_repeat_interval: float = 0.05,
             rtx: 'RTX' = None,
             pixel_spacing_x: float = 1.0, pixel_spacing_y: float = 1.0,
-            mesh_type: str = 'heightfield',
             overlay_layers: dict = None,
             color_stretch: str = 'linear',
             title: str = None,
@@ -10317,7 +9419,6 @@ def explore(raster, width: int = 800, height: int = 600,
             minimap_colors: dict = None,
             info_text: str = None,
             skirt: bool = True,
-            lod: bool = False,
             repl: bool = False,
             tour=None):
     """
@@ -10353,8 +9454,6 @@ def explore(raster, width: int = 800, height: int = 600,
         Must match the spacing used when triangulating terrain. Default 1.0.
     pixel_spacing_y : float, optional
         Y spacing between pixels in world units. Default 1.0.
-    mesh_type : str, optional
-        Mesh generation method: 'tin' or 'voxel'. Default is 'tin'.
     scene_zarr : str or Path, optional
         Path to a zarr store with a ``meshes/`` group. When provided,
         mesh chunks are loaded dynamically based on camera position
@@ -10414,10 +9513,8 @@ def explore(raster, width: int = 800, height: int = 600,
     - [/]: Decrease/increase observer height
     - R: Decrease terrain resolution (coarser, up to 8x subsample)
     - Shift+R: Increase terrain resolution (finer, down to 1x)
-    - Shift+A: Toggle distance-based terrain LOD
     - Z: Decrease vertical exaggeration
     - Shift+Z: Increase vertical exaggeration
-    - B: Toggle mesh type (TIN / voxel)
     - Y: Cycle color stretch (linear, sqrt, cbrt, log)
     - T: Toggle shadows
     - 0: Toggle ambient occlusion (progressive)
@@ -10460,7 +9557,6 @@ def explore(raster, width: int = 800, height: int = 600,
         rtx=rtx,
         pixel_spacing_x=pixel_spacing_x,
         pixel_spacing_y=pixel_spacing_y,
-        mesh_type=mesh_type,
         overlay_layers=overlay_layers,
         title=title,
         subtitle=subtitle,
@@ -10608,10 +9704,6 @@ def explore(raster, width: int = 800, height: int = 600,
         for geom_id in viewer._all_geometries:
             if geom_id != 'terrain':
                 rtx.set_geometry_visible(geom_id, False)
-    # Enable terrain LOD at startup if requested
-    if lod:
-        viewer._deferred_lod = True
-
     if tour is not None:
         repl = True
     viewer._repl = repl

@@ -1445,23 +1445,31 @@ class TestEdgeStitching:
         np.testing.assert_allclose(verts[2::3], verts_ve1[2::3] * 2.0,
                                    rtol=1e-5)
 
-    def test_stitch_streaming_tile_skipped(self):
-        """Out-of-bounds (streaming) tiles should not be stitched."""
+    def test_stitch_streaming_tile_with_cached_neighbor(self):
+        """Out-of-bounds (streaming) tiles stitch to in-bounds neighbors."""
         terrain = self._make_terrain(128, 128)
         mgr = TerrainLODManager(terrain, tile_size=64,
                                 pixel_spacing_x=1.0, pixel_spacing_y=1.0)
-        # (-1, 0) is out of bounds
-        mgr._tile_lods = {(-1, 0): 1, (0, 0): 2}
-        # _needs_stitch should return False for out-of-bounds check
-        # (it's the in_bounds check in _prepare_tile that skips stitching)
-        mesh_data = mgr._build_tile_mesh(0, 0, 1)
+        # Tile (2, 0) is out of bounds (only 2 tile rows: 0, 1)
+        # Tile (1, 0) is in-bounds and at coarser LOD
+        mgr._tile_lods = {(2, 0): 0, (1, 0): 2}
+        # Build a mesh for tile (1, 0) to use as reference
+        mesh_data_ref = mgr._build_tile_mesh(1, 0, 0)
+        assert mesh_data_ref is not None
+        # Cache it so the stitch code can find it
+        mgr._tile_cache[(1, 0, 0, 1)] = mesh_data_ref
+        # Build an in-bounds mesh and pretend it's for tile (2, 0)
+        mesh_data = mgr._build_tile_mesh(0, 0, 0)
         assert mesh_data is not None
         verts_orig = mesh_data[0].copy()
-        # Simulate prepare for an OOB tile — stitching should be skipped
-        verts, _, _ = mgr._prepare_tile(mesh_data, -1, 0, 1, ve=1.0,
-                                         own=False)
-        np.testing.assert_array_equal(verts[2::3], verts_orig[2::3],
-                                      err_msg="OOB tile should not be stitched")
+        # Prepare for OOB tile — stitching should now happen via
+        # pyramid (neighbor (1,0) is in-bounds)
+        verts, _, _ = mgr._prepare_tile(mesh_data, 2, 0, 0, ve=1.0,
+                                         own=True)
+        # Top boundary of tile (2,0) should be modified to match
+        # the bottom of tile (1,0)
+        assert not np.array_equal(verts[2::3], verts_orig[2::3]), \
+            "OOB tile should be stitched to in-bounds neighbor"
 
     def test_stitched_z_matches_coarser_pyramid(self):
         """Stitched boundary Z values should match interpolated coarser pyramid."""
@@ -1793,3 +1801,76 @@ class TestMeshChunkSimplification:
             assert n <= prev_n, \
                 f"LOD {level} has {n} tris, more than LOD {level-1} ({prev_n})"
             prev_n = n
+
+
+# ---------------------------------------------------------------------------
+# Tile lifecycle callbacks
+# ---------------------------------------------------------------------------
+
+class TestTileCallbacks:
+    """Tests for set_tile_callbacks tile lifecycle notifications."""
+
+    @staticmethod
+    def _make_terrain(rows, cols):
+        np.random.seed(42)
+        return np.random.rand(rows, cols).astype(np.float32) * 100
+
+    def test_on_added_called_for_each_tile(self):
+        """on_added should fire for every tile built on first update."""
+        terrain = self._make_terrain(256, 256)
+        rtx = _FakeRTX()
+        added = []
+        mgr = TerrainLODManager(
+            terrain, tile_size=128,
+            pixel_spacing_x=1.0, pixel_spacing_y=1.0,
+            max_lod=2, lod_distance_factor=3.0,
+        )
+        mgr.set_tile_callbacks(
+            on_added=lambda tr, tc, elev: added.append((tr, tc, elev)),
+        )
+        mgr.per_tick_build_limit = 100
+        mgr.update(np.array([128, 128, 100]), rtx, force=True)
+        # Should have at least one tile added
+        assert len(added) > 0
+        # Each callback should receive (tr, tc, elevation_tile)
+        for tr, tc, elev in added:
+            assert isinstance(tr, (int, np.integer))
+            assert isinstance(tc, (int, np.integer))
+
+    def test_on_removed_called_on_eviction(self):
+        """on_removed should fire when tiles leave the distance range."""
+        terrain = self._make_terrain(512, 512)
+        rtx = _FakeRTX()
+        removed = []
+        mgr = TerrainLODManager(
+            terrain, tile_size=128,
+            pixel_spacing_x=1.0, pixel_spacing_y=1.0,
+            max_lod=3, lod_distance_factor=1.0,
+        )
+        mgr.set_tile_callbacks(
+            on_removed=lambda tr, tc: removed.append((tr, tc)),
+        )
+        mgr.per_tick_build_limit = 100
+        # Build near corner
+        mgr.update(np.array([0, 0, 0]), rtx, force=True)
+        tiles_before = set(mgr._tile_lods.keys())
+        assert len(tiles_before) > 0
+        # Move far away so original tiles leave range
+        mgr.update(np.array([10000, 10000, 0]), rtx, force=True)
+        assert len(removed) > 0
+        # Every removed tile should have been in tiles_before
+        for tr, tc in removed:
+            assert (tr, tc) in tiles_before
+
+    def test_callbacks_not_called_when_none(self):
+        """No error when callbacks are not set."""
+        terrain = self._make_terrain(256, 256)
+        rtx = _FakeRTX()
+        mgr = TerrainLODManager(
+            terrain, tile_size=128,
+            pixel_spacing_x=1.0, pixel_spacing_y=1.0,
+        )
+        mgr.per_tick_build_limit = 100
+        # Should not raise
+        mgr.update(np.array([128, 128, 100]), rtx, force=True)
+        mgr.update(np.array([10000, 10000, 0]), rtx, force=True)

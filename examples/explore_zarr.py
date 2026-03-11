@@ -587,7 +587,6 @@ if __name__ == "__main__":
         color_stretch='cbrt',
         tile_data_fn=tile_fn,
         hydro_data=hydro,
-        lod=True,
         repl=True,
     )
 

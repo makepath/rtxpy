@@ -2592,7 +2592,7 @@ class RTXAccessor:
     def explore(self, width=800, height=600, render_scale=0.5,
                 start_position=None, look_at=None, key_repeat_interval=0.05,
                 pixel_spacing_x=None, pixel_spacing_y=None,
-                mesh_type='heightfield', color_stretch='linear', title=None,
+                color_stretch='linear', title=None,
                 subsample=1, wind_data=None, weather_data=None,
                 hydro_data=None, gtfs_data=None,
                 terrain_loader=None, tile_data_fn=None,
@@ -2600,7 +2600,6 @@ class RTXAccessor:
                 fog_density=0.0, fog_color=(0.7, 0.8, 0.9),
                 colormap=None, sun_azimuth=None, sun_altitude=None,
                 shadows=None, ambient=None,
-                lod=False,
                 repl=False, tour=None):
         """Launch an interactive terrain viewer with keyboard controls.
 
@@ -2633,9 +2632,6 @@ class RTXAccessor:
         pixel_spacing_y : float, optional
             Y spacing between pixels in world units. If None, uses the value
             from the last triangulate() call (default 1.0).
-        mesh_type : str, optional
-            Mesh generation method: 'tin' or 'voxel'.
-            Default is 'tin'.
         subsample : int, optional
             Initial terrain subsample factor (1, 2, 4, 8).  Full-resolution
             data is preserved; press Shift+R / R to change at runtime.
@@ -2696,23 +2692,6 @@ class RTXAccessor:
         spacing_x = pixel_spacing_x if pixel_spacing_x is not None else self._pixel_spacing_x
         spacing_y = pixel_spacing_y if pixel_spacing_y is not None else self._pixel_spacing_y
 
-        # Rebuild terrain geometry if mesh_type doesn't match current state
-        current_mesh_type = getattr(self, '_terrain_mesh_type', 'heightfield')
-        if mesh_type != current_mesh_type and 'terrain' in (self._rtx.list_geometries() or []):
-            self._rtx.remove_geometry('terrain')
-            if mesh_type == 'heightfield':
-                self.heightfield(geometry_id='terrain',
-                                 pixel_spacing_x=spacing_x,
-                                 pixel_spacing_y=spacing_y)
-            elif mesh_type == 'voxel':
-                self.voxelate(geometry_id='terrain',
-                              pixel_spacing_x=spacing_x,
-                              pixel_spacing_y=spacing_y)
-            else:
-                self.triangulate(geometry_id='terrain',
-                                 pixel_spacing_x=spacing_x,
-                                 pixel_spacing_y=spacing_y)
-
         # Pass geometry color builder if any colors are set
         geometry_colors_builder = None
         if self._geometry_colors:
@@ -2729,7 +2708,6 @@ class RTXAccessor:
             rtx=self._rtx,
             pixel_spacing_x=spacing_x,
             pixel_spacing_y=spacing_y,
-            mesh_type=mesh_type,
             color_stretch=color_stretch,
             title=title,
             tile_service=getattr(self, '_tile_service', None),
@@ -2754,7 +2732,6 @@ class RTXAccessor:
             sun_altitude=sun_altitude,
             shadows=shadows,
             ambient=ambient,
-            lod=lod,
             repl=repl,
             tour=tour,
         )
@@ -3067,7 +3044,7 @@ class RTXDatasetAccessor:
     def explore(self, z, width=800, height=600, render_scale=0.5,
                 start_position=None, look_at=None, key_repeat_interval=0.05,
                 pixel_spacing_x=None, pixel_spacing_y=None,
-                mesh_type='heightfield', color_stretch='linear', title=None,
+                color_stretch='linear', title=None,
                 subtitle=None, legend=None,
                 subsample=1, wind_data=None, weather_data=None,
                 hydro_data=None,
@@ -3080,7 +3057,6 @@ class RTXDatasetAccessor:
                 shadows=None, ambient=None,
                 minimap_style=None, minimap_layer=None,
                 minimap_colors=None, info_text=None,
-                lod=False,
                 repl=False, tour=None):
         """Launch an interactive terrain viewer with Dataset variables as
         overlay layers cycled with the G key.
@@ -3112,8 +3088,6 @@ class RTXDatasetAccessor:
             X spacing between pixels in world units. Default is 1.0.
         pixel_spacing_y : float, optional
             Y spacing between pixels in world units. Default is 1.0.
-        mesh_type : str, optional
-            Mesh generation method: 'tin' or 'voxel'. Default is 'tin'.
         repl : bool, optional
             If True, start an interactive Python REPL alongside the
             viewer.  Default is False.
@@ -3171,7 +3145,6 @@ class RTXDatasetAccessor:
             rtx=terrain_da.rtx._rtx,
             pixel_spacing_x=spacing_x,
             pixel_spacing_y=spacing_y,
-            mesh_type=mesh_type,
             overlay_layers=overlay_layers,
             color_stretch=color_stretch,
             title=title,
@@ -3203,7 +3176,6 @@ class RTXDatasetAccessor:
             minimap_layer=minimap_layer,
             minimap_colors=minimap_colors,
             info_text=info_text,
-            lod=lod,
             repl=repl,
             tour=tour,
         )
