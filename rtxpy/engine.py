@@ -1598,7 +1598,7 @@ class InteractiveViewer:
                 new_data = self._base_raster.data.copy()
                 new_data[cp.asarray(ocean_fill)] = cp.nan
             else:
-                new_data = self._base_raster.data.copy()
+                new_data = base_np.copy()
                 new_data[ocean_fill] = np.nan
             self._base_raster = self._base_raster.copy(data=new_data)
             # Re-derive working raster from updated base
