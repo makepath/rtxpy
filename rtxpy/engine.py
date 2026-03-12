@@ -4035,7 +4035,10 @@ class InteractiveViewer:
         mgr.enable_threaded_building()
         # Batch same-LOD tiles into single GAS entries to reduce IAS count
         mgr.enable_batched_upload()
-        self._update_frame()
+        # Only render if camera position has been initialised (run() sets it).
+        # During __init__ the position is still None.
+        if self.position is not None:
+            self._update_frame()
 
     def _rebuild_at_resolution(self, factor):
         """Rebuild terrain mesh at a different subsample factor.
