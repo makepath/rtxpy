@@ -99,17 +99,46 @@ extern "C" __global__ void __closesthit__chit()
 
     float3 n;
     if (optixIsTriangleHit()) {
-        float3 data[3];
-        // Always use the 4-parameter overload for backward compatibility.
-        // The parameterless overload (OptiX 9.1+) requires ABI version 99,
-        // which needs driver 570+.  The 4-param form works on all versions.
-        OptixTraversableHandle gas = optixGetGASTraversableHandle();
-        unsigned int sbtIdx = optixGetSbtGASIndex();
-        float time = optixGetRayTime();
-        optixGetTriangleVertexData(gas, primIdx, sbtIdx, time, data);
-        float3 AB = data[1] - data[0];
-        float3 AC = data[2] - data[0];
-        n = normalize(cross(AB, AC));
+        // Check for per-vertex smooth normals for this instance
+        bool has_smooth = false;
+        if (params.smooth_normal_table != 0) {
+            unsigned int instId = optixGetInstanceId();
+            unsigned long long normals_ptr = params.smooth_normal_table[2 * instId];
+            if (normals_ptr != 0) {
+                has_smooth = true;
+                unsigned long long indices_ptr = params.smooth_normal_table[2 * instId + 1];
+                const float* norms = reinterpret_cast<const float*>(normals_ptr);
+                const int*   idx   = reinterpret_cast<const int*>(indices_ptr);
+
+                // Barycentric interpolation of vertex normals
+                const float2 bary = optixGetTriangleBarycentrics();
+                const float w0 = 1.0f - bary.x - bary.y;
+                const float w1 = bary.x;
+                const float w2 = bary.y;
+
+                const int i0 = idx[primIdx * 3];
+                const int i1 = idx[primIdx * 3 + 1];
+                const int i2 = idx[primIdx * 3 + 2];
+
+                n = normalize(make_float3(
+                    w0 * norms[i0 * 3]     + w1 * norms[i1 * 3]     + w2 * norms[i2 * 3],
+                    w0 * norms[i0 * 3 + 1] + w1 * norms[i1 * 3 + 1] + w2 * norms[i2 * 3 + 1],
+                    w0 * norms[i0 * 3 + 2] + w1 * norms[i1 * 3 + 2] + w2 * norms[i2 * 3 + 2]
+                ));
+            }
+        }
+
+        if (!has_smooth) {
+            // Flat shading fallback: face normal from triangle vertices
+            float3 data[3];
+            OptixTraversableHandle gas = optixGetGASTraversableHandle();
+            unsigned int sbtIdx = optixGetSbtGASIndex();
+            float time = optixGetRayTime();
+            optixGetTriangleVertexData(gas, primIdx, sbtIdx, time, data);
+            float3 AB = data[1] - data[0];
+            float3 AC = data[2] - data[0];
+            n = normalize(cross(AB, AC));
+        }
     } else {
         // Round curve tube: use face-up normal for terrain roads/rivers
         n = make_float3(0.0f, 0.0f, 1.0f);

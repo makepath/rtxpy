@@ -56,6 +56,39 @@ def chunks_for_pixel_window(yi0, yi1, xi0, xi1, chunk_h, chunk_w):
             for cc in range(cc0, cc1 + 1)]
 
 
+def chunks_for_world_rect(x0, y0, x1, y1, psx, psy, chunk_h, chunk_w,
+                          elev_shape):
+    """Map a world-coordinate rectangle to overlapping chunk indices.
+
+    Parameters
+    ----------
+    x0, y0 : float
+        Lower-left corner in world coordinates.
+    x1, y1 : float
+        Upper-right corner in world coordinates.
+    psx, psy : float
+        Pixel spacing (world units per pixel).
+    chunk_h, chunk_w : int
+        Chunk size in pixels (rows, cols).
+    elev_shape : tuple of int
+        ``(H, W)`` of the elevation grid.
+
+    Returns
+    -------
+    list of (int, int)
+        List of ``(chunk_row, chunk_col)`` tuples overlapping the rect.
+    """
+    H, W = elev_shape
+    # World coords -> pixel coords (clamp to grid)
+    xi0 = max(int(x0 / psx), 0)
+    xi1 = min(int(x1 / psx) + 1, W)
+    yi0 = max(int(y0 / psy), 0)
+    yi1 = min(int(y1 / psy) + 1, H)
+    if xi0 >= xi1 or yi0 >= yi1:
+        return []
+    return chunks_for_pixel_window(yi0, yi1, xi0, xi1, chunk_h, chunk_w)
+
+
 def save_meshes_to_zarr(zarr_path, meshes, colors, pixel_spacing,
                         elevation_shape, elevation_chunks,
                         curves=None, spheres=None):

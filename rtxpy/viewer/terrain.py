@@ -14,9 +14,9 @@ class TerrainState:
         'pixel_spacing_x', 'pixel_spacing_y',
         '_base_pixel_spacing_x', '_base_pixel_spacing_y',
         'subsample_factor',
-        '_terrain_mesh_cache', '_baked_mesh_cache',
+        '_baked_mesh_cache',
         '_gpu_terrain', '_gpu_base_terrain',
-        'mesh_type', '_water_mask',
+        '_water_mask',
         'vertical_exaggeration', '_land_color_range',
         'terrain_skirt',
         '_terrain_loader',
@@ -24,19 +24,20 @@ class TerrainState:
         '_coord_step_x', '_coord_step_y',
         '_reload_cooldown', '_last_reload_time',
         '_terrain_reload_future', '_terrain_reload_pool',
+        # World-space offset: keeps camera stable across terrain reloads
+        '_world_offset_x', '_world_offset_y',
         # LOD state
         'lod_enabled', '_terrain_lod_manager',
     )
 
     def __init__(self, raster, pixel_spacing_x=1.0, pixel_spacing_y=1.0,
-                 mesh_type='heightfield', subsample=1, skirt=True):
+                 subsample=1, skirt=True):
         self.raster = raster
         self._base_raster = raster
         self.pixel_spacing_x = pixel_spacing_x
         self.pixel_spacing_y = pixel_spacing_y
         self._base_pixel_spacing_x = pixel_spacing_x
         self._base_pixel_spacing_y = pixel_spacing_y
-        self.mesh_type = mesh_type
         self.subsample_factor = max(1, int(subsample))
         self.vertical_exaggeration = 1.0
         self.terrain_skirt = skirt
@@ -50,7 +51,6 @@ class TerrainState:
         self._water_mask = None
 
         # Mesh caches
-        self._terrain_mesh_cache = {}
         self._baked_mesh_cache = {}
         self._gpu_terrain = None
         self._gpu_base_terrain = None
@@ -66,6 +66,22 @@ class TerrainState:
         self._terrain_reload_future = None
         self._terrain_reload_pool = None
 
+        # World-space offset for stable camera across terrain reloads
+        self._world_offset_x = 0.0
+        self._world_offset_y = 0.0
+
         # LOD
         self.lod_enabled = False
         self._terrain_lod_manager = None
+
+    def clear_all_caches(self):
+        """Clear all terrain mesh caches (baked meshes and LOD tiles).
+
+        Call this when terrain data or resolution changes to ensure no
+        stale geometry survives across the different caching layers.
+        """
+        self._baked_mesh_cache.clear()
+        if self._terrain_lod_manager is not None:
+            self._terrain_lod_manager._tile_cache.clear()
+            self._terrain_lod_manager._tile_lods.clear()
+            self._terrain_lod_manager._pyramid_cache.clear()

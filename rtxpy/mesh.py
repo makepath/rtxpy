@@ -133,6 +133,152 @@ def triangulate_terrain(verts, triangles, terrain, scale=1.0):
     return 0
 
 
+def compute_terrain_normals(terrain, H, W, psx=1.0, psy=1.0):
+    """Compute smooth vertex normals for a regular-grid terrain.
+
+    Uses central differences on the elevation grid to compute per-vertex
+    normals analytically.  This is much faster than the generic
+    face-weighted accumulation in :func:`compute_vertex_normals` and
+    produces identical results for regular grids.
+
+    Parameters
+    ----------
+    terrain : array-like
+        2-D elevation array of shape ``(H, W)``.
+    H, W : int
+        Grid dimensions.
+    psx, psy : float
+        World-space pixel spacing in X and Y.
+
+    Returns
+    -------
+    np.ndarray
+        Flat float32 normal buffer, shape ``(H * W * 3,)``, with the
+        same vertex ordering as :func:`triangulate_terrain`.
+    """
+    data = np.asarray(terrain, dtype=np.float32)
+
+    # Central differences with forward/backward at edges
+    # dz/dx: gradient in column direction (maps to X)
+    dz_dx = np.empty_like(data)
+    dz_dx[:, 1:-1] = (data[:, 2:] - data[:, :-2]) / (2.0 * psx)
+    dz_dx[:, 0] = (data[:, 1] - data[:, 0]) / psx
+    dz_dx[:, -1] = (data[:, -1] - data[:, -2]) / psx
+
+    # dz/dy: gradient in row direction (maps to Y)
+    dz_dy = np.empty_like(data)
+    dz_dy[1:-1, :] = (data[2:, :] - data[:-2, :]) / (2.0 * psy)
+    dz_dy[0, :] = (data[1, :] - data[0, :]) / psy
+    dz_dy[-1, :] = (data[-1, :] - data[-2, :]) / psy
+
+    # Normal = normalize(-dz/dx, -dz/dy, 1)
+    normals = np.empty(H * W * 3, dtype=np.float32)
+    nx = -dz_dx.ravel()
+    ny = -dz_dy.ravel()
+    nz = np.ones(H * W, dtype=np.float32)
+
+    # Handle NaN elevations: use flat up normal
+    nan_mask = np.isnan(data.ravel())
+    nx[nan_mask] = 0.0
+    ny[nan_mask] = 0.0
+
+    length = np.sqrt(nx * nx + ny * ny + nz * nz)
+    length[length < 1e-10] = 1.0
+    normals[0::3] = nx / length
+    normals[1::3] = ny / length
+    normals[2::3] = nz / length
+
+    return normals
+
+
+def compute_vertex_normals(vertices, indices):
+    """Compute area-weighted smooth vertex normals for a triangle mesh.
+
+    For each vertex, sums the face normals of all adjacent triangles
+    (weighted by triangle area), then normalizes.  Vertices with no
+    adjacent triangles get a default up-facing normal ``(0, 0, 1)``.
+
+    Parameters
+    ----------
+    vertices : np.ndarray
+        Flat float32 vertex buffer, shape ``(N * 3,)``.
+    indices : np.ndarray
+        Flat int32 index buffer, shape ``(M * 3,)``.
+
+    Returns
+    -------
+    np.ndarray
+        Flat float32 normal buffer, shape ``(N * 3,)``.
+    """
+    verts = np.asarray(vertices, dtype=np.float32)
+    idx = np.asarray(indices, dtype=np.int32)
+    num_verts = len(verts) // 3
+    num_tris = len(idx) // 3
+
+    # Reshape for vectorized access
+    v = verts.reshape(-1, 3)
+    f = idx.reshape(-1, 3)
+
+    # Triangle vertices
+    v0 = v[f[:, 0]]
+    v1 = v[f[:, 1]]
+    v2 = v[f[:, 2]]
+
+    # Face normals (area-weighted — cross product magnitude = 2 * area)
+    e1 = v1 - v0
+    e2 = v2 - v0
+    fn = np.cross(e1, e2)  # (num_tris, 3)
+
+    # Accumulate onto vertices using bincount (much faster than np.add.at)
+    all_idx = np.concatenate([f[:, 0], f[:, 1], f[:, 2]])
+    all_fn = np.tile(fn, (3, 1))  # same face normal for each corner vertex
+    normals = np.zeros((num_verts, 3), dtype=np.float64)
+    for c in range(3):
+        normals[:, c] = np.bincount(all_idx, weights=all_fn[:, c],
+                                    minlength=num_verts)
+
+    # Normalize
+    length = np.sqrt(np.sum(normals * normals, axis=1))
+    length[length < 1e-10] = 1.0
+    normals /= length[:, np.newaxis]
+
+    # Default up-facing for isolated vertices
+    zero_mask = np.all(normals == 0.0, axis=1)
+    normals[zero_mask] = [0.0, 0.0, 1.0]
+
+    return normals.astype(np.float32).ravel()
+
+
+def compute_skirt_normals(H, W):
+    """Compute outward-facing normals for skirt bottom vertices.
+
+    The perimeter layout matches :func:`add_terrain_skirt`: top row
+    (W verts), right column (H-1),
+    bottom row reversed (W-1), left column reversed (H-2).
+
+    Parameters
+    ----------
+    H, W : int
+        Grid dimensions of the terrain tile.
+
+    Returns
+    -------
+    np.ndarray
+        Flat float32 normal buffer, shape ``((2*(H+W)-4) * 3,)``.
+    """
+    n_perim = 2 * (H + W) - 4
+    normals = np.zeros((n_perim, 3), dtype=np.float32)
+    off = 0
+    normals[off:off + W, 1] = -1.0             # top edge: (0, -1, 0)
+    off += W
+    normals[off:off + H - 1, 0] = 1.0          # right edge: (1, 0, 0)
+    off += H - 1
+    normals[off:off + W - 1, 1] = 1.0          # bottom edge: (0, 1, 0)
+    off += W - 1
+    normals[off:off + H - 2, 0] = -1.0         # left edge: (-1, 0, 0)
+    return normals.ravel()
+
+
 def add_terrain_skirt(vertices, indices, H, W, skirt_depth=None):
     """Add a vertical skirt around the edges of a TIN terrain mesh.
 

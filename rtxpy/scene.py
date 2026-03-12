@@ -353,9 +353,7 @@ def _has_baked_meshes_da(da):
 
 def _save_wind(store, wind_data, bounds):
     """Write wind group per scene zarr spec."""
-    if 'wind' in store:
-        del store['wind']
-    wg = store.create_group('wind')
+    wg = store.create_group('wind', overwrite=True)
 
     u = np.asarray(wind_data['u'], dtype=np.float32)
     v = np.asarray(wind_data['v'], dtype=np.float32)
@@ -380,9 +378,7 @@ def _save_wind(store, wind_data, bounds):
 
 def _save_weather(store, weather_data, bounds):
     """Write weather group per scene zarr spec."""
-    if 'weather' in store:
-        del store['weather']
-    wg = store.create_group('weather')
+    wg = store.create_group('weather', overwrite=True)
 
     for key in ('cloud_cover', 'temperature', 'humidity',
                 'pressure', 'precipitation'):
@@ -415,9 +411,7 @@ def _save_weather(store, weather_data, bounds):
 
 def _save_hydro(store, hydro_data):
     """Write hydro group per scene zarr spec."""
-    if 'hydro' in store:
-        del store['hydro']
-    hg = store.create_group('hydro')
+    hg = store.create_group('hydro', overwrite=True)
 
     for key in ('flow_accum', 'flow_dir_mfd', 'stream_order', 'stream_link'):
         if key in hydro_data:
@@ -489,9 +483,7 @@ def _save_roughness(store, dem, tile_size=64):
             if mask.any():
                 roughness[tr, tc] = float(np.std(residuals[mask]))
 
-    if 'elevation_roughness' in store:
-        del store['elevation_roughness']
-    rg = store.create_group('elevation_roughness')
+    rg = store.create_group('elevation_roughness', overwrite=True)
     rg.create_array('values', data=roughness,
                      chunks=roughness.shape, compressors=_BLOSC)
     rg.attrs['tile_size'] = tile_size

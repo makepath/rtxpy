@@ -45,3 +45,4 @@ examples/.ipynb_checkpoints/
 conda-output/
 examples/cache/
 *gtfs.json
+.claude/worktrees/

@@ -1098,8 +1098,10 @@ def _shade_terrain_kernel(
     pixel_spacing_x, pixel_spacing_y,
     color_stretch,
     rgb_texture,
+    rgb_texture_offset_y, rgb_texture_offset_x,
     overlay_data, overlay_alpha, overlay_min, overlay_range,
     overlay_as_water, overlay_color_lut,
+    overlay_offset_y, overlay_offset_x,
     instance_ids, geometry_colors,
     primitive_ids, point_colors, point_color_offsets,
     ao_factor, gi_color, gi_intensity,
@@ -1213,10 +1215,12 @@ def _shade_terrain_kernel(
 
                     if tex_h > 1:
                         # Sample RGB directly from tile texture
-                        if elev_y >= 0 and elev_y < tex_h and elev_x >= 0 and elev_x < tex_w:
-                            base_r = rgb_texture[elev_y, elev_x, 0]
-                            base_g = rgb_texture[elev_y, elev_x, 1]
-                            base_b = rgb_texture[elev_y, elev_x, 2]
+                        tex_y = elev_y - rgb_texture_offset_y
+                        tex_x = elev_x - rgb_texture_offset_x
+                        if tex_y >= 0 and tex_y < tex_h and tex_x >= 0 and tex_x < tex_w:
+                            base_r = rgb_texture[tex_y, tex_x, 0]
+                            base_g = rgb_texture[tex_y, tex_x, 1]
+                            base_b = rgb_texture[tex_y, tex_x, 2]
                         else:
                             base_r = 0.3
                             base_g = 0.3
@@ -1261,8 +1265,10 @@ def _shade_terrain_kernel(
                     ov_h = overlay_data.shape[0]
                     ov_w = overlay_data.shape[1]
                     if ov_h > 1 and overlay_alpha > 0.0:
-                        if elev_y >= 0 and elev_y < ov_h and elev_x >= 0 and elev_x < ov_w:
-                            ov_val = overlay_data[elev_y, elev_x]
+                        ov_y = elev_y - overlay_offset_y
+                        ov_x = elev_x - overlay_offset_x
+                        if ov_y >= 0 and ov_y < ov_h and ov_x >= 0 and ov_x < ov_w:
+                            ov_val = overlay_data[ov_y, ov_x]
                             if not math.isnan(ov_val):
                                 if overlay_as_water and ov_val > 0.5:
                                     # Flood water shader — same look as ocean
@@ -1417,10 +1423,12 @@ def _shade_terrain_kernel(
                     tex_h = rgb_texture.shape[0]
                     tex_w = rgb_texture.shape[1]
 
-                    if tex_h > 1 and refl_ey >= 0 and refl_ey < tex_h and refl_ex >= 0 and refl_ex < tex_w:
-                        refl_r = rgb_texture[refl_ey, refl_ex, 0]
-                        refl_g = rgb_texture[refl_ey, refl_ex, 1]
-                        refl_b = rgb_texture[refl_ey, refl_ex, 2]
+                    refl_tex_y = refl_ey - rgb_texture_offset_y
+                    refl_tex_x = refl_ex - rgb_texture_offset_x
+                    if tex_h > 1 and refl_tex_y >= 0 and refl_tex_y < tex_h and refl_tex_x >= 0 and refl_tex_x < tex_w:
+                        refl_r = rgb_texture[refl_tex_y, refl_tex_x, 0]
+                        refl_g = rgb_texture[refl_tex_y, refl_tex_x, 1]
+                        refl_b = rgb_texture[refl_tex_y, refl_tex_x, 2]
                     elif refl_ey >= 0 and refl_ey < elev_h and refl_ex >= 0 and refl_ex < elev_w:
                         refl_elev = elevation_data[refl_ey, refl_ex]
                         if elev_range > 0:
@@ -1889,10 +1897,12 @@ def _shade_terrain(
     color_stretch=0,
     sky_color=(-1.0, 0.0, 0.0),
     rgb_texture=None,
+    rgb_texture_offset_y=0, rgb_texture_offset_x=0,
     overlay_data=None, overlay_alpha=0.5,
     overlay_min=0.0, overlay_range=1.0,
     overlay_as_water=False,
     overlay_color_lut=None,
+    overlay_offset_y=0, overlay_offset_x=0,
     instance_ids=None, geometry_colors=None,
     primitive_ids=None, point_colors=None, point_color_offsets=None,
     ao_factor=None, gi_color=None, gi_intensity=2.0,
@@ -2012,8 +2022,10 @@ def _shade_terrain(
         pixel_spacing_x, pixel_spacing_y,
         color_stretch,
         rgb_texture,
+        np.int32(rgb_texture_offset_y), np.int32(rgb_texture_offset_x),
         overlay_data, overlay_alpha, overlay_min, overlay_range,
         overlay_as_water, overlay_color_lut,
+        np.int32(overlay_offset_y), np.int32(overlay_offset_x),
         instance_ids, geometry_colors,
         primitive_ids, point_colors, point_color_offsets,
         ao_factor, gi_color, np.float32(gi_intensity),
@@ -2144,10 +2156,14 @@ def render(
     color_stretch: str = 'linear',
     sky_color: Optional[Tuple[float, float, float]] = None,
     rgb_texture=None,
+    rgb_texture_offset_y: int = 0,
+    rgb_texture_offset_x: int = 0,
     overlay_data=None,
     overlay_alpha: float = 0.5,
     overlay_as_water: bool = False,
     overlay_color_lut=None,
+    overlay_offset_y: int = 0,
+    overlay_offset_x: int = 0,
     geometry_colors=None,
     ao_samples: int = 0,
     ao_radius: Optional[float] = None,
@@ -2537,10 +2553,14 @@ def render(
         stretch_int,
         sky_color=(-1.0, 0.0, 0.0) if sky_color is None else sky_color,
         rgb_texture=rgb_texture,
+        rgb_texture_offset_y=rgb_texture_offset_y,
+        rgb_texture_offset_x=rgb_texture_offset_x,
         overlay_data=d_overlay, overlay_alpha=overlay_alpha,
         overlay_min=ov_min, overlay_range=ov_range,
         overlay_as_water=overlay_as_water,
         overlay_color_lut=overlay_color_lut,
+        overlay_offset_y=overlay_offset_y,
+        overlay_offset_x=overlay_offset_x,
         instance_ids=d_instance_ids, geometry_colors=geometry_colors,
         primitive_ids=d_primitive_ids,
         point_colors=d_point_colors,
