@@ -24,7 +24,8 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
-from ..lod import (compute_lod_distances,
+from ..lod import (box_downsample_2x as _box_downsample_2x,
+                    compute_lod_distances,
                     compute_lod_level_with_hysteresis,
                     compute_tile_roughness)
 
@@ -36,10 +37,13 @@ class TerrainLODManager:
     ----------
     terrain_np : np.ndarray
         Full-resolution elevation array, shape ``(H, W)``.
+        Ignored when *chunk_source* is provided.
     tile_size : int
         Tile edge length in full-resolution pixels (default 128).
+        Ignored when *chunk_source* is provided (chunk shape is used).
     pixel_spacing_x, pixel_spacing_y : float
         World-space size of one raster pixel.
+        Ignored when *chunk_source* is provided.
     max_lod : int
         Maximum LOD level.  Level *k* subsamples the tile by ``2^k``.
     lod_distance_factor : float
@@ -48,10 +52,14 @@ class TerrainLODManager:
     base_subsample : int
         Global base subsample factor (from R/Shift+R).  LOD 0 uses
         this value; LOD *k* uses ``base_subsample * 2^k``.
+    chunk_source : ChunkDataSource or None
+        When provided, terrain data is read from this source instead
+        of *terrain_np*.  The source's chunk grid defines the tile
+        grid, and its pixel spacing overrides *pixel_spacing_x/y*.
     """
 
     __slots__ = (
-        '_terrain_np', '_tile_size', '_psx', '_psy',
+        '_terrain_np', '_chunk_source', '_tile_size', '_psx', '_psy',
         '_max_lod', '_lod_distances', '_lod_distance_factor',
         '_H', '_W', '_n_tile_rows', '_n_tile_cols',
         '_tile_centers', '_tile_lods', '_tile_cache',
@@ -71,13 +79,34 @@ class TerrainLODManager:
         '_hf_enabled', '_hf_gid', '_hf_dirty', '_hf_tile_size',
         '_build_retries',
         '_on_tile_added', '_on_tile_removed',
+        '_scene_mesh_mgr',
     )
 
-    def __init__(self, terrain_np, tile_size=128,
+    def __init__(self, terrain_np=None, tile_size=128,
                  pixel_spacing_x=1.0, pixel_spacing_y=1.0,
                  max_lod=3, lod_distance_factor=3.0,
-                 base_subsample=1):
-        self._terrain_np = terrain_np
+                 base_subsample=1, chunk_source=None):
+
+        # --- Resolve data source ---
+        self._chunk_source = chunk_source
+
+        if chunk_source is not None:
+            # Chunk source drives grid geometry
+            H, W = chunk_source.shape
+            ch, cw = chunk_source.chunk_shape
+            tile_size = ch  # one chunk = one tile
+            psx, psy = chunk_source.pixel_spacing
+            pixel_spacing_x = psx
+            pixel_spacing_y = psy
+            # Keep terrain_np as None — all reads go through chunk_source
+            self._terrain_np = None
+        elif terrain_np is not None:
+            H, W = terrain_np.shape
+            self._terrain_np = terrain_np
+        else:
+            raise ValueError(
+                "Either terrain_np or chunk_source must be provided")
+
         self._tile_size = tile_size
         self._psx = pixel_spacing_x
         self._psy = pixel_spacing_y
@@ -85,7 +114,6 @@ class TerrainLODManager:
         self._lod_distance_factor = lod_distance_factor
         self._base_subsample = base_subsample
 
-        H, W = terrain_np.shape
         self._H = H
         self._W = W
         self._n_tile_rows = (H + tile_size - 1) // tile_size
@@ -96,18 +124,24 @@ class TerrainLODManager:
         self._offset_x = 0.0
         self._offset_y = 0.0
 
-        # Streaming: when set, tiles outside terrain_np bounds are fetched
-        # from this callback instead of from the pyramid cache.
+        # Streaming: when chunk_source.supports_streaming is True, OR when
+        # set_tile_data_fn() provides a callback, tiles outside the initial
+        # grid are fetched on demand.
         self._tile_data_fn = None
-        self._streaming = False
+        self._streaming = (chunk_source is not None
+                           and chunk_source.supports_streaming)
         self._tile_data_cache = {}  # cache_key -> np.ndarray (prefetched I/O)
         self._io_futures = {}       # cache_key -> Future (in-flight prefetches)
         # CRS coordinate origin and signed spacing — used to convert pixel
-        # indices to CRS coordinates for tile_data_fn calls.  Without this,
-        # the callback receives viewer world-space coords (pixel * abs(spacing))
-        # which are NOT valid CRS coordinates (UTM easting/northing).
-        self._crs_origin = None   # (crs_x0, crs_y0) or None
-        self._crs_spacing = None  # (crs_dx, crs_dy) signed, or None
+        # indices to CRS coordinates for tile_data_fn calls.  When a
+        # chunk_source provides crs_transform, it is used automatically.
+        crs = chunk_source.crs_transform if chunk_source is not None else None
+        if crs is not None:
+            self._crs_origin = (crs[0], crs[1])
+            self._crs_spacing = (crs[2], crs[3])
+        else:
+            self._crs_origin = None   # (crs_x0, crs_y0) or None
+            self._crs_spacing = None  # (crs_dx, crs_dy) signed, or None
 
         # Pre-compute tile centres in world coordinates
         self._tile_centers = {}
@@ -185,6 +219,10 @@ class TerrainLODManager:
         self._on_tile_added = None    # fn(tr, tc, elevation_tile)
         self._on_tile_removed = None  # fn(tr, tc)
 
+        # Scene mesh manager: placed geometry loaded from scene zarr,
+        # driven by the same tile visibility as terrain LOD.
+        self._scene_mesh_mgr = None  # set via set_scene_zarr()
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -226,6 +264,30 @@ class TerrainLODManager:
         """
         self._on_tile_added = on_added
         self._on_tile_removed = on_removed
+
+    def set_scene_zarr(self, zarr_path):
+        """Attach a scene zarr store for placed geometry loading.
+
+        When set, placed geometry (buildings, roads, etc.) from the
+        zarr store is loaded and unloaded in sync with terrain tile
+        visibility.  The LOD manager's per-tile LOD assignments drive
+        mesh simplification.
+
+        Parameters
+        ----------
+        zarr_path : str or None
+            Path to the scene zarr store, or ``None`` to detach.
+        """
+        if zarr_path is None:
+            self._scene_mesh_mgr = None
+            return
+        from .scene_meshes import SceneMeshManager
+        self._scene_mesh_mgr = SceneMeshManager(zarr_path)
+
+    @property
+    def scene_mesh_manager(self):
+        """The :class:`SceneMeshManager` if a scene zarr is attached."""
+        return self._scene_mesh_mgr
 
     def enable_heightfield_lod0(self, hf_tile_size=32):
         """Use heightfield ray marching for LOD 0 in-bounds tiles.
@@ -283,6 +345,8 @@ class TerrainLODManager:
             self._base_subsample = factor
             self._cancel_pending()
             self._pyramid_cache.clear()
+            if self._chunk_source is not None:
+                self._chunk_source.clear_caches()
             self._tile_cache.clear()
             self._tile_data_cache.clear()
             self._lod_tile_meshes.clear()
@@ -395,13 +459,40 @@ class TerrainLODManager:
                 cy = (r0 + r1) * 0.5 * self._psy + oy
                 self._tile_centers[(tr, tc)] = (cx, cy)
 
-    def set_terrain(self, terrain_np, offset_x=None, offset_y=None):
-        """Replace the terrain data (e.g. after dynamic reload)."""
-        self._terrain_np = terrain_np
-        H, W = terrain_np.shape
+    def set_terrain(self, terrain_np=None, offset_x=None, offset_y=None,
+                     chunk_source=None):
+        """Replace the terrain data (e.g. after dynamic reload).
+
+        Parameters
+        ----------
+        terrain_np : np.ndarray or None
+            New elevation array.  Ignored when *chunk_source* is given.
+        offset_x, offset_y : float or None
+            World-space offset to apply.
+        chunk_source : ChunkDataSource or None
+            New chunk source.  When given, replaces the existing source
+            and *terrain_np* is ignored.
+        """
+        if chunk_source is not None:
+            self._chunk_source = chunk_source
+            self._terrain_np = None
+            H, W = chunk_source.shape
+            ts = chunk_source.chunk_shape[0]
+            self._tile_size = ts
+            psx, psy = chunk_source.pixel_spacing
+            self._psx = psx
+            self._psy = psy
+        elif terrain_np is not None:
+            self._terrain_np = terrain_np
+            if self._chunk_source is not None:
+                self._chunk_source.set_terrain(terrain_np)
+            H, W = terrain_np.shape
+            ts = self._tile_size
+        else:
+            return  # nothing to do
+
         self._H = H
         self._W = W
-        ts = self._tile_size
         if self._streaming:
             self._n_tile_rows = H // ts
             self._n_tile_cols = W // ts
@@ -416,6 +507,8 @@ class TerrainLODManager:
         self._compute_all_roughness()
         self._cancel_pending()
         self._pyramid_cache.clear()
+        if self._chunk_source is not None:
+            self._chunk_source.clear_caches()
         self._tile_cache.clear()
         self._tile_data_cache.clear()
         self._lod_tile_meshes.clear()
@@ -626,6 +719,19 @@ class TerrainLODManager:
         if self._batched:
             changed |= self._rebuild_batches(rtx)
 
+        # --- Phase F: sync placed geometry visibility ---
+        if self._scene_mesh_mgr is not None:
+            # Build chunk distances from tile centers for load ordering
+            chunk_dists = {}
+            for (tr, tc), _lod in self._tile_lods.items():
+                cx, cy = self._tile_center(tr, tc)
+                dx_t = cx - cam_x
+                dy_t = cy - cam_y
+                chunk_dists[(tr, tc)] = math.sqrt(
+                    dx_t * dx_t + dy_t * dy_t)
+            self._scene_mesh_mgr.update_visibility(
+                self._tile_lods, chunk_distances=chunk_dists)
+
         self._has_in_flight_work = (pending or bool(self._pending_futures)
                              or bool(self._io_futures)
                              or bool(self._dirty_lods))
@@ -701,8 +807,10 @@ class TerrainLODManager:
         Returns (changed, pending) where *changed* is True if any tile
         GAS was added and *pending* is True if work was deferred.
         """
-        # Pre-populate pyramid levels so background threads don't race
-        if self._threaded:
+        # Pre-populate pyramid levels so background threads don't race.
+        # Skip when using chunk_source — reads go through the source,
+        # not the global pyramid.
+        if self._threaded and self._chunk_source is None:
             for lvl in range(self._max_lod + 1):
                 self._get_pyramid_level(lvl)
 
@@ -965,15 +1073,19 @@ class TerrainLODManager:
         gets scale 1.0 (neutral).
         """
         ts = self._tile_size
+        cs = self._chunk_source
         raw = {}
         for tr in range(self._n_tile_rows):
             for tc in range(self._n_tile_cols):
-                r0 = tr * ts
-                c0 = tc * ts
-                r1 = min(r0 + ts, self._H)
-                c1 = min(c0 + ts, self._W)
-                raw[(tr, tc)] = compute_tile_roughness(
-                    self._terrain_np[r0:r1, c0:c1])
+                if cs is not None:
+                    raw[(tr, tc)] = cs.chunk_roughness(tr, tc)
+                else:
+                    r0 = tr * ts
+                    c0 = tc * ts
+                    r1 = min(r0 + ts, self._H)
+                    c1 = min(c0 + ts, self._W)
+                    raw[(tr, tc)] = compute_tile_roughness(
+                        self._terrain_np[r0:r1, c0:c1])
 
         if not raw:
             self._tile_roughness = {}
@@ -986,8 +1098,15 @@ class TerrainLODManager:
         # If the roughest tile is negligible compared to the terrain's
         # elevation range, all tiles are effectively flat — skip
         # adaptation to avoid amplifying float32 noise.
-        elev_range = float(
-            np.nanmax(self._terrain_np) - np.nanmin(self._terrain_np))
+        if cs is not None:
+            stats = cs.elevation_stats()
+            if stats is not None:
+                elev_range = stats[1] - stats[0]
+            else:
+                elev_range = r_max  # fallback
+        else:
+            elev_range = float(
+                np.nanmax(self._terrain_np) - np.nanmin(self._terrain_np))
         roughness_floor = max(1e-4, elev_range * 1e-3)
         if r_max < roughness_floor or r_max - r_min < 1e-10:
             self._tile_roughness = {k: 1.0 for k in raw}
@@ -1042,7 +1161,10 @@ class TerrainLODManager:
         ts = self._tile_size
         in_bounds = (0 <= tr < self._n_tile_rows
                      and 0 <= tc < self._n_tile_cols)
-        if in_bounds:
+        cs = self._chunk_source
+        if in_bounds and cs is not None:
+            elev = cs.read_full_res_chunk(tr, tc)
+        elif in_bounds and self._terrain_np is not None:
             r0, c0 = tr * ts, tc * ts
             r1 = min(r0 + ts, self._H)
             c1 = min(c0 + ts, self._W)
@@ -1531,17 +1653,38 @@ class TerrainLODManager:
 
         in_bounds = (0 <= tr < self._n_tile_rows
                      and 0 <= tc < self._n_tile_cols)
+        cs = self._chunk_source
 
         if in_bounds:
-            # Try requested LOD, fall back to lower levels for small edge tiles
-            for try_lod in range(lod, -1, -1):
-                verts, indices, normals = self._build_tile_mesh(tr, tc, try_lod)
+            if cs is not None:
+                # Chunk source path — unified for in-bounds tiles
+                verts, indices, normals = self._build_tile_mesh_from_source(
+                    tr, tc, lod)
                 if verts is not None:
                     entry = (verts, indices, normals)
                     self._tile_cache[cache_key] = entry
                     return entry
+            else:
+                # Legacy path — try requested LOD, fall back for small tiles
+                for try_lod in range(lod, -1, -1):
+                    verts, indices, normals = self._build_tile_mesh(
+                        tr, tc, try_lod)
+                    if verts is not None:
+                        entry = (verts, indices, normals)
+                        self._tile_cache[cache_key] = entry
+                        return entry
+        elif cs is not None and cs.can_stream(tr, tc):
+            # Chunk source streaming path
+            verts, indices, normals = self._build_tile_mesh_from_source(
+                tr, tc, lod)
+            if verts is not None:
+                entry = (verts, indices, normals)
+                self._tile_cache[cache_key] = entry
+                return entry
         elif self._tile_data_fn is not None:
-            verts, indices, normals = self._build_streaming_tile_mesh(tr, tc, lod)
+            # Legacy streaming path
+            verts, indices, normals = self._build_streaming_tile_mesh(
+                tr, tc, lod)
             if verts is not None:
                 entry = (verts, indices, normals)
                 self._tile_cache[cache_key] = entry
@@ -1555,20 +1698,53 @@ class TerrainLODManager:
         Level 0 is the terrain at ``base_subsample`` resolution.  Each
         subsequent level halves via 2x2 NaN-aware box averaging.
         Evicts cached levels above ``_max_lod`` to bound memory.
+
+        When a chunk_source is active, this method is only used for
+        heightfield and boundary stitching — it assembles the full
+        pyramid from per-chunk reads.  For tile mesh building, use
+        ``_build_tile_mesh_from_source`` which reads individual chunks.
         """
         cached = self._pyramid_cache.get(level)
         if cached is not None:
             return cached
 
-        if level == 0:
-            bs = self._base_subsample
-            if bs > 1:
-                arr = self._terrain_np[::bs, ::bs].copy()
+        if self._terrain_np is not None:
+            if level == 0:
+                bs = self._base_subsample
+                if bs > 1:
+                    arr = self._terrain_np[::bs, ::bs].copy()
+                else:
+                    arr = self._terrain_np
             else:
-                arr = self._terrain_np
+                prev = self._get_pyramid_level(level - 1)
+                arr = _box_downsample_2x(prev)
+        elif self._chunk_source is not None:
+            # Build from chunk source: assemble full array at this LOD
+            # by reading each in-bounds chunk and pasting into a canvas.
+            cs = self._chunk_source
+            bs = self._base_subsample
+            canvas_parts = []
+            for cr in range(cs.n_chunk_rows):
+                row_parts = []
+                for cc in range(cs.n_chunk_cols):
+                    tile = cs.read_chunk(cr, cc, lod=level,
+                                         base_subsample=bs)
+                    if tile is None:
+                        # Estimate expected size from first available tile
+                        ch, cw = cs.chunk_shape
+                        sub = bs * (2 ** level)
+                        eh = max(1, ch // sub)
+                        ew = max(1, cw // sub)
+                        tile = np.full((eh, ew), np.nan, dtype=np.float32)
+                    row_parts.append(tile)
+                if row_parts:
+                    canvas_parts.append(np.concatenate(row_parts, axis=1))
+            if canvas_parts:
+                arr = np.concatenate(canvas_parts, axis=0)
+            else:
+                arr = np.zeros((1, 1), dtype=np.float32)
         else:
-            prev = self._get_pyramid_level(level - 1)
-            arr = _box_downsample_2x(prev)
+            raise RuntimeError("No terrain data available for pyramid")
 
         self._pyramid_cache[level] = arr
 
@@ -1645,6 +1821,81 @@ class TerrainLODManager:
         # The world offset keeps positions stable across terrain reloads.
         verts[0::3] = verts[0::3] * eff_sub * self._psx + c0_full * self._psx + self._offset_x
         verts[1::3] = verts[1::3] * eff_sub * self._psy + r0_full * self._psy + self._offset_y
+
+        return verts, indices, normals
+
+    def _build_tile_mesh_from_source(self, tr, tc, lod):
+        """Build a tile mesh from the chunk data source.
+
+        Unified path that handles both in-bounds and out-of-bounds
+        chunks.  The chunk source provides elevation data at the
+        requested LOD level; this method triangulates, computes
+        normals, and transforms to world coordinates.
+
+        Falls back to lower LOD levels for small edge tiles.
+        """
+        from .. import mesh as mesh_mod
+
+        cs = self._chunk_source
+
+        # Try requested LOD, fall back for tiles too small to triangulate
+        for try_lod in range(lod, -1, -1):
+            tile = cs.read_chunk(tr, tc, lod=try_lod,
+                                 base_subsample=self._base_subsample)
+            if tile is not None and tile.shape[0] >= 2 and tile.shape[1] >= 2:
+                lod = try_lod
+                break
+        else:
+            return None, None, None
+
+        th, tw = tile.shape
+
+        # Replace NaN values to avoid degenerate triangles
+        bad = ~np.isfinite(tile)
+        if bad.all():
+            return None, None, None
+        if bad.any():
+            tile = tile.copy()
+            fill = float(np.nanmean(tile))
+            tile[bad] = fill
+
+        # Triangulate
+        num_verts = th * tw
+        num_tris = (th - 1) * (tw - 1) * 2
+        verts = np.zeros(num_verts * 3, dtype=np.float32)
+        indices = np.zeros(num_tris * 3, dtype=np.int32)
+        mesh_mod.triangulate_terrain(verts, indices, tile, scale=1.0)
+
+        # World-space bounds of this tile
+        ts = self._tile_size
+        c0 = tc * ts
+        r0 = tr * ts
+        wx0 = c0 * self._psx + self._offset_x
+        wy0 = r0 * self._psy + self._offset_y
+        wx1 = (c0 + ts) * self._psx + self._offset_x
+        wy1 = (r0 + ts) * self._psy + self._offset_y
+
+        # Compute smooth normals using effective pixel spacing
+        if tw > 1:
+            eff_psx = (wx1 - wx0) / (tw - 1)
+        else:
+            eff_psx = abs(self._psx)
+        if th > 1:
+            eff_psy = (wy1 - wy0) / (th - 1)
+        else:
+            eff_psy = abs(self._psy)
+        normals = mesh_mod.compute_terrain_normals(
+            tile, th, tw, psx=eff_psx, psy=eff_psy)
+
+        # Transform to world coordinates
+        if tw > 1:
+            verts[0::3] = verts[0::3] / (tw - 1) * (wx1 - wx0) + wx0
+        else:
+            verts[0::3] = (wx0 + wx1) * 0.5
+        if th > 1:
+            verts[1::3] = verts[1::3] / (th - 1) * (wy1 - wy0) + wy0
+        else:
+            verts[1::3] = (wy0 + wy1) * 0.5
 
         return verts, indices, normals
 
@@ -1765,25 +2016,6 @@ class TerrainLODManager:
 # ------------------------------------------------------------------
 # Module-level helpers
 # ------------------------------------------------------------------
-
-
-def _box_downsample_2x(arr):
-    """Downsample a 2D array by 2× using NaN-aware box averaging."""
-    import warnings
-
-    H, W = arr.shape
-    # Trim to even dimensions
-    hh = H - H % 2
-    ww = W - W % 2
-    if hh < 2 or ww < 2:
-        return arr.copy()
-    block = arr[:hh, :ww].reshape(hh // 2, 2, ww // 2, 2)
-    # nanmean emits "Mean of empty slice" for all-NaN blocks (water);
-    # the resulting NaN is correct, so suppress the warning.
-    with warnings.catch_warnings():
-        warnings.simplefilter('ignore', RuntimeWarning)
-        out = np.nanmean(block, axis=(1, 3)).astype(arr.dtype)
-    return out
 
 
 def _tile_gid(tr, tc):

@@ -3790,6 +3790,101 @@ class InteractiveViewer:
         result[:, :, :3] = np.clip(result[:, :, :3], 0, 1)
         return result
 
+    def _update_scene_meshes(self, smm):
+        """Upload scene mesh updates from the SceneMeshManager.
+
+        Handles VE application, GPU upload, geometry color tracking,
+        baked mesh caching, and geometry layer refresh.
+
+        Parameters
+        ----------
+        smm : SceneMeshManager
+            The scene mesh manager with dirty merged buffers.
+
+        Returns
+        -------
+        bool
+            True if any geometry was added or removed.
+        """
+        prev_active = set(smm.active_gids)
+        merged = smm.get_merged()
+        rtx = self.rtx
+        accessor = self._accessor
+        ve = self.vertical_exaggeration
+        changed = False
+
+        # Remove gids no longer present
+        for gid in smm.get_removed_gids(prev_active):
+            if rtx.has_geometry(gid):
+                rtx.remove_geometry(gid)
+                changed = True
+            if accessor is not None:
+                accessor._baked_meshes.pop(gid, None)
+                accessor._geometry_colors.pop(gid, None)
+
+        # Get terrain data for Z re-snap / baked mesh cache
+        base_terrain = self._base_raster.data
+        if hasattr(base_terrain, 'get'):
+            base_terrain_np = base_terrain.get()
+        else:
+            base_terrain_np = np.asarray(base_terrain)
+        base_psx = self._base_pixel_spacing_x
+        base_psy = self._base_pixel_spacing_y
+
+        colors = smm.colors
+
+        # Add/update merged gids
+        for gid, data in merged.items():
+            is_curve = len(data) == 3
+            if is_curve:
+                verts, widths, indices = data
+            else:
+                verts, indices = data
+
+            updated_verts = verts.copy()
+            if ve != 1.0:
+                updated_verts[2::3] *= ve
+
+            if is_curve:
+                rtx.add_curve_geometry(gid, updated_verts, widths, indices)
+            else:
+                rtx.add_geometry(gid, updated_verts, indices)
+            changed = True
+
+            if accessor is not None:
+                accessor._geometry_colors[gid] = colors.get(
+                    gid, (0.6, 0.6, 0.6))
+                orig_base_z = _bilinear_terrain_z(
+                    base_terrain_np, verts[0::3], verts[1::3],
+                    base_psx, base_psy)
+                if is_curve:
+                    accessor._baked_meshes[gid] = (
+                        verts.copy(), widths.copy(), indices.copy(),
+                        orig_base_z)
+                else:
+                    accessor._baked_meshes[gid] = (
+                        verts.copy(), indices.copy(), orig_base_z)
+
+        if changed and accessor is not None:
+            accessor._geometry_colors_dirty = True
+            self._geometry_colors_builder = accessor._build_geometry_colors_gpu
+
+        # Refresh geometry layer tracking
+        if changed:
+            from .viewer.terrain_lod import is_terrain_lod_gid
+            self._all_geometries = rtx.list_geometries()
+            groups = set()
+            for g in self._all_geometries:
+                if is_terrain_lod_gid(g):
+                    continue
+                parts = g.rsplit('_', 1)
+                base = parts[0] if len(parts) == 2 and parts[1].isdigit() else g
+                if base != 'terrain':
+                    groups.add(base)
+            self._geometry_layer_order = ['none', 'all'] + sorted(groups)
+
+        return changed
+
     def _enable_terrain_lod(self):
         """Set up per-tile LOD terrain rendering.
 
@@ -3840,11 +3935,18 @@ class InteractiveViewer:
         if self.rtx.has_geometry('terrain_skirt'):
             self.rtx.remove_geometry('terrain_skirt')
 
-        # Choose tile size.  When a zarr chunk manager is active, align
+        # Check for a ChunkDataSource provided via explore(terrain_source=...)
+        chunk_source = getattr(self, '_terrain_source', None)
+
+        # Choose tile size.  When a chunk source is active, its chunk grid
+        # defines the tile grid.  When a zarr chunk manager is active, align
         # to the zarr elevation chunk size so terrain tiles and mesh chunks
         # share the same spatial grid — one distance lookup drives both.
         H, W = terrain_np.shape
-        if (self._chunk_manager is not None
+        if chunk_source is not None:
+            tile_size = chunk_source.chunk_shape[0]
+            print(f"LOD tile size {tile_size} (from chunk source)")
+        elif (self._chunk_manager is not None
                 and self._chunk_manager._chunk_h == self._chunk_manager._chunk_w):
             tile_size = self._chunk_manager._chunk_h
             print(f"LOD tile size {tile_size} (aligned to zarr chunk grid)")
@@ -3859,6 +3961,7 @@ class InteractiveViewer:
             pixel_spacing_y=self._base_pixel_spacing_y,
             max_lod=3,
             base_subsample=self.subsample_factor,
+            chunk_source=chunk_source,
         )
         # Carry forward any world offset from a previous terrain reload
         ox = self.terrain._world_offset_x
@@ -3884,6 +3987,11 @@ class InteractiveViewer:
                         float(x[0]), float(y[0]), crs_dx, crs_dy)
             except (KeyError, AttributeError):
                 pass
+        # Wire scene zarr for placed geometry loading through LOD manager
+        scene_zarr = getattr(self, '_scene_zarr', None)
+        if scene_zarr is not None:
+            mgr.set_scene_zarr(scene_zarr)
+
         self._terrain_lod_manager = mgr
         self.lod_enabled = True
 
@@ -4132,22 +4240,30 @@ class InteractiveViewer:
                 self._active_overlay_color_lut = self._overlay_color_luts.get(
                     terrain_name)
 
-        # 6. Invalidate chunk manager scene state (re-snap Z at new resolution).
-        #    Raw zarr data in _cache is resolution-independent (Phase 1 ensures
-        #    Z re-snap always uses full-res terrain), so we keep it and only
-        #    clear the baked/active/visible state so update() re-merges cheaply.
-        if self._chunk_manager is not None:
+        # 6. Invalidate scene mesh state (re-snap Z at new resolution).
+        #    Raw zarr data in _cache is resolution-independent, so we keep
+        #    it and only clear the active/visible state so re-merge is cheap.
+        smm = (self._terrain_lod_manager.scene_mesh_manager
+               if self._terrain_lod_manager is not None else None)
+        if smm is not None:
+            for gid in list(smm.active_gids):
+                if hasattr(self, '_baked_meshes'):
+                    self._baked_meshes.pop(gid, None)
+                if self._accessor is not None:
+                    self._accessor._baked_meshes.pop(gid, None)
+                if self.rtx is not None and self.rtx.has_geometry(gid):
+                    self.rtx.remove_geometry(gid)
+            smm.clear_active()
+        elif self._chunk_manager is not None:
             for gid in list(self._chunk_manager._active_gids):
                 if hasattr(self, '_baked_meshes'):
                     self._baked_meshes.pop(gid, None)
                 if self._accessor is not None:
                     self._accessor._baked_meshes.pop(gid, None)
-                # Remove stale geometry from RTX scene
                 if self.rtx is not None and self.rtx.has_geometry(gid):
                     self.rtx.remove_geometry(gid)
             self._chunk_manager._visible.clear()
             self._chunk_manager._active_gids.clear()
-            # Force immediate re-merge from cache at new resolution
             if hasattr(self, 'position'):
                 self._chunk_manager.update(self.position[0], self.position[1], self)
 
@@ -6896,16 +7012,21 @@ class InteractiveViewer:
                     ve=self.vertical_exaggeration,
                     camera_front=self._get_front(), fov=self.camera.fov):
                 self._render_needed = True
-        if self._chunk_manager is not None:
-            # When LOD is active, sync distance parameters from LOD manager
+        # Scene mesh updates: prefer LOD-manager-driven SceneMeshManager,
+        # fall back to legacy _MeshChunkManager for backward compat.
+        smm = (self._terrain_lod_manager.scene_mesh_manager
+               if self._terrain_lod_manager is not None else None)
+        if smm is not None and smm.is_dirty:
+            if self._update_scene_meshes(smm):
+                self._render_needed = True
+        elif self._chunk_manager is not None:
+            # Legacy path: sync distance params from LOD manager
             if (self.lod_enabled and self._terrain_lod_manager is not None
                     and self._terrain_lod_manager._lod_distances):
                 self._chunk_manager.max_distance = (
                     self._terrain_lod_manager._lod_distances[-1])
                 self._chunk_manager._lod_distances = (
                     self._terrain_lod_manager._lod_distances)
-                # When grids are aligned, pass tile LOD assignments directly
-                # so the chunk manager skips its own distance computation.
                 self._chunk_manager._tile_lods = (
                     self._terrain_lod_manager._tile_lods)
             else:
@@ -9407,6 +9528,7 @@ def explore(raster, width: int = 800, height: int = 600,
             terrain_loader=None,
             tile_data_fn=None,
             scene_zarr=None,
+            terrain_source=None,
             ao_samples: int = 0,
             gi_bounces: int = 1,
             denoise: bool = False,
@@ -9576,7 +9698,12 @@ def explore(raster, width: int = 800, height: int = 600,
     viewer._accessor = accessor
     viewer._terrain_loader = terrain_loader
     viewer._tile_data_fn = tile_data_fn
-    if scene_zarr is not None:
+    viewer._terrain_source = terrain_source
+    viewer._scene_zarr = scene_zarr
+    # Only create legacy _MeshChunkManager when the new chunk-source
+    # path is NOT active.  When terrain_source is provided, the LOD
+    # manager's SceneMeshManager handles placed geometry instead.
+    if scene_zarr is not None and terrain_source is None:
         viewer._chunk_manager = _MeshChunkManager(
             scene_zarr, pixel_spacing_x, pixel_spacing_y)
     viewer.color_stretch = color_stretch

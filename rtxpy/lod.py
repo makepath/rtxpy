@@ -1,8 +1,11 @@
 """Level-of-detail utilities for terrain and instanced geometry.
 
 Provides LOD level computation, mesh simplification via quadric
-decimation, and LOD chain generation for multi-resolution rendering.
+decimation, LOD chain generation, and box-filter downsampling for
+multi-resolution rendering.
 """
+
+import warnings
 
 import numpy as np
 
@@ -223,3 +226,32 @@ def build_lod_chain(vertices, indices, ratios=(1.0, 0.5, 0.25, 0.1)):
         v, i = simplify_mesh(vertices, indices, ratio)
         chain.append((v, i))
     return chain
+
+
+def box_downsample_2x(arr):
+    """Downsample a 2D array by 2x using NaN-aware box averaging.
+
+    Trims to even dimensions, then averages each 2x2 block.  NaN
+    values are ignored (``nanmean``), so water/no-data pixels don't
+    contaminate adjacent land pixels.
+
+    Parameters
+    ----------
+    arr : np.ndarray
+        2D array to downsample.
+
+    Returns
+    -------
+    np.ndarray
+        Downsampled array, shape ``(H//2, W//2)``.
+    """
+    H, W = arr.shape
+    hh = H - H % 2
+    ww = W - W % 2
+    if hh < 2 or ww < 2:
+        return arr.copy()
+    block = arr[:hh, :ww].reshape(hh // 2, 2, ww // 2, 2)
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore', RuntimeWarning)
+        out = np.nanmean(block, axis=(1, 3)).astype(arr.dtype)
+    return out

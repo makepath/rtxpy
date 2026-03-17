@@ -543,6 +543,8 @@ if __name__ == "__main__":
                         help="Pre-build LOD cache arrays and exit")
     parser.add_argument("--clear-lods", action="store_true",
                         help="Delete cached LOD arrays from the zarr store and exit")
+    parser.add_argument("--chunk-source", action="store_true",
+                        help="Use ZarrChunkSource (for UTM-projected zarr stores)")
     args = parser.parse_args()
 
     if args.clear_lods:
@@ -567,27 +569,72 @@ if __name__ == "__main__":
         print("Done.")
         raise SystemExit(0)
 
-    # Tile streaming handles the horizon — no need for baked multi-res
-    # rings in the initial window (they produce coarse pixels in LOD 0).
-    terrain = load_window(
-        args.zarr, args.lon, args.lat, args.size, args.subsample,
-        horizon_rings=0,
-    )
+    if args.chunk_source:
+        # ---- Chunk-source path (for UTM-projected zarr stores) ----
+        # When the zarr store is already in a projected CRS (e.g. a scene
+        # zarr built by build_scene()), the ZarrChunkSource reads chunks
+        # directly — no window loading or reprojection needed.
+        from rtxpy.chunk_source import ZarrChunkSource
 
-    tile_fn = make_tile_data_fn(args.zarr, args.lon, args.lat)
+        z, _fmt, (x_origin, dx, y_origin, dy), \
+            (scale, offset, fill), crs_wkt = _open_zarr_array(args.zarr)
+        H, W = z.shape
+        chunks = z.chunks if hasattr(z, 'chunks') else (256, 256)
+        ch = int(chunks[0]) if isinstance(chunks, (list, tuple)) else int(chunks)
 
-    # Hydro flow: computed lazily on GPU when first enabled (Shift+Y)
-    hydro = {'enabled': False}
+        source = ZarrChunkSource(
+            args.zarr, "usgs10m_dem",
+            pixel_spacing_x=abs(dx),
+            pixel_spacing_y=abs(dy),
+            crs_origin=(x_origin, y_origin),
+            crs_pixel_spacing=(dx, dy),
+            cf_decode=(scale, offset, fill),
+        )
 
-    print(f"\nLaunching explore (Shift+Y to toggle hydro)...\n")
-    terrain.rtx.explore(
-        width=2048,
-        height=1600,
-        render_scale=0.5,
-        color_stretch='cbrt',
-        tile_data_fn=tile_fn,
-        hydro_data=hydro,
-        repl=True,
-    )
+        print(f"ZarrChunkSource: {H}×{W}, chunks {ch}×{ch}, "
+              f"{source.n_chunk_rows}×{source.n_chunk_cols} tiles")
+
+        # Still need a small raster for the viewer (colormap, stats, etc.)
+        terrain = load_window(
+            args.zarr, args.lon, args.lat, args.size, args.subsample,
+            horizon_rings=0,
+        )
+
+        hydro = {'enabled': False}
+
+        print(f"\nLaunching explore with ZarrChunkSource...\n")
+        terrain.rtx.explore(
+            width=2048,
+            height=1600,
+            render_scale=0.5,
+            color_stretch='cbrt',
+            terrain_source=source,
+            hydro_data=hydro,
+            repl=True,
+        )
+    else:
+        # ---- Legacy path (geographic-CRS zarr with UTM reprojection) ----
+        # Tile streaming handles the horizon — no need for baked multi-res
+        # rings in the initial window (they produce coarse pixels in LOD 0).
+        terrain = load_window(
+            args.zarr, args.lon, args.lat, args.size, args.subsample,
+            horizon_rings=0,
+        )
+
+        tile_fn = make_tile_data_fn(args.zarr, args.lon, args.lat)
+
+        # Hydro flow: computed lazily on GPU when first enabled (Shift+Y)
+        hydro = {'enabled': False}
+
+        print(f"\nLaunching explore (Shift+Y to toggle hydro)...\n")
+        terrain.rtx.explore(
+            width=2048,
+            height=1600,
+            render_scale=0.5,
+            color_stretch='cbrt',
+            tile_data_fn=tile_fn,
+            hydro_data=hydro,
+            repl=True,
+        )
 
     print("Done")

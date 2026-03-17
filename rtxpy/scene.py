@@ -47,6 +47,7 @@ def build_scene(
     fires=False,
     name=None,
     cache_dir=None,
+    tile_size=256,
     resume=False,
     progress=None,
 ):
@@ -85,6 +86,10 @@ def build_scene(
     cache_dir : str or Path or None
         Directory for intermediate tile caches. Defaults to a ``.cache``
         sibling of *output_path*.
+    tile_size : int
+        Zarr chunk size for the elevation array, in pixels.  This
+        also controls LOD tile granularity — one chunk = one tile.
+        Default 256.
     resume : bool
         If True, skip fetching data whose zarr group already exists.
         Useful for adding layers to an existing scene without
@@ -126,7 +131,7 @@ def build_scene(
 
     from .remote_data import fetch_dem
     dem = fetch_dem(bounds, str(output_path), source=dem_source, crs=crs,
-                    cache_dir=str(cache_dir))
+                    cache_dir=str(cache_dir), tile_size=tile_size)
     _log('elevation', f"  DEM shape: {dem.shape}, CRS: {dem.rio.crs}")
 
     # Stamp root attributes per spec
@@ -605,6 +610,34 @@ def explore_scene(zarr_path, **explore_kwargs):
 
     # Always pass scene_zarr for mesh loading
     defaults['scene_zarr'] = zarr_path
+
+    # Build a ZarrChunkSource for chunk-driven terrain if the elevation
+    # array has reasonable chunk sizes for LOD tiling.
+    if 'terrain_source' not in explore_kwargs:
+        try:
+            from .chunk_source import ZarrChunkSource
+            elev_arr = store['elevation']
+            chunks = elev_arr.chunks
+            if isinstance(chunks, (list, tuple)):
+                ch, cw = int(chunks[0]), int(chunks[1])
+            else:
+                ch = cw = int(chunks)
+            # Only use chunk source if chunks are tile-sized (not huge)
+            if ch <= 512 and cw <= 512 and ch == cw:
+                # Compute pixel spacing from DataArray coords
+                x_coords = da.coords.get('x')
+                y_coords = da.coords.get('y')
+                if x_coords is not None and len(x_coords) >= 2:
+                    psx = abs(float(x_coords[1] - x_coords[0]))
+                    psy = abs(float(y_coords[1] - y_coords[0]))
+                else:
+                    psx = psy = 1.0
+                cs = ZarrChunkSource(
+                    zarr_path, 'elevation',
+                    pixel_spacing_x=psx, pixel_spacing_y=psy)
+                defaults['terrain_source'] = cs
+        except Exception:
+            pass  # fall back to in-memory path
 
     # Explicit kwargs override stored defaults
     defaults.update(explore_kwargs)

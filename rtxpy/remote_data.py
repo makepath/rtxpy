@@ -262,8 +262,21 @@ def _download_tile(url, tile_path):
             f.write(chunk)
 
 
-def _save_zarr(da, output_path):
-    """Save a DataArray to a CF-encoded zarr store with int16 compression."""
+def _save_zarr(da, output_path, tile_size=256):
+    """Save a DataArray to a CF-encoded zarr store with int16 compression.
+
+    Parameters
+    ----------
+    da : xarray.DataArray
+        Elevation data to save.
+    output_path : str or Path
+        Path to write the zarr store.
+    tile_size : int
+        Chunk (tile) size in pixels.  This controls the spatial
+        granularity of LOD tiling and mesh chunk loading — one zarr
+        chunk = one LOD tile.  Default 256 balances per-tile triangle
+        count with chunk I/O overhead.
+    """
     import numpy as np
     import xarray as xr
     from zarr.codecs import BloscCodec, BloscShuffle
@@ -304,7 +317,7 @@ def _save_zarr(da, output_path):
             '_FillValue': np.int16(-9999),
             'compressors': BloscCodec(cname='zstd', clevel=6,
                                       shuffle=BloscShuffle.bitshuffle),
-            'chunks': (min(2048, H), min(2048, W)),
+            'chunks': (min(tile_size, H), min(tile_size, W)),
         },
     }
 
@@ -328,7 +341,7 @@ def _load_zarr(output_path):
     return da
 
 
-def _merge_clip_reproject(tile_paths, bounds, crs, output_path):
+def _merge_clip_reproject(tile_paths, bounds, crs, output_path, tile_size=256):
     """Merge tile arrays, clip to bounds, optionally reproject, and save."""
     try:
         import rioxarray as rxr
@@ -367,14 +380,15 @@ def _merge_clip_reproject(tile_paths, bounds, crs, output_path):
     # Dispatch by output format
     output_path = Path(output_path)
     if output_path.suffix == '.zarr':
-        _save_zarr(merged, output_path)
+        _save_zarr(merged, output_path, tile_size=tile_size)
     else:
         merged.rio.to_raster(str(output_path))
 
     return merged
 
 
-def fetch_dem(bounds, output_path, source="copernicus", crs=None, cache_dir=None):
+def fetch_dem(bounds, output_path, source="copernicus", crs=None,
+              cache_dir=None, tile_size=256):
     """Download, merge, and clip DEM tiles for a bounding box.
 
     Parameters
@@ -399,6 +413,8 @@ def fetch_dem(bounds, output_path, source="copernicus", crs=None, cache_dir=None
     cache_dir : str or Path, optional
         Directory for caching individual tiles.  Defaults to
         *output_path*'s parent directory.
+    tile_size : int
+        Zarr chunk size in pixels.  Controls LOD tile granularity.
 
     Returns
     -------
@@ -468,7 +484,8 @@ def fetch_dem(bounds, output_path, source="copernicus", crs=None, cache_dir=None
         raise RuntimeError("Failed to download any elevation tiles")
 
     print(f"  Merging {len(tile_paths)} tile(s)...")
-    merged = _merge_clip_reproject(tile_paths, bounds, crs, output_path)
+    merged = _merge_clip_reproject(tile_paths, bounds, crs, output_path,
+                                    tile_size=tile_size)
     print(f"  Saved DEM to {output_path}")
 
     return merged

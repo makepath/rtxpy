@@ -1874,3 +1874,204 @@ class TestTileCallbacks:
         # Should not raise
         mgr.update(np.array([128, 128, 100]), rtx, force=True)
         mgr.update(np.array([10000, 10000, 0]), rtx, force=True)
+
+
+# ---------------------------------------------------------------------------
+# ChunkDataSource-driven TerrainLODManager
+# ---------------------------------------------------------------------------
+
+class TestChunkSourceDrivenLOD:
+    """Tests that TerrainLODManager works when initialized with a
+    ChunkDataSource instead of a terrain_np array."""
+
+    @staticmethod
+    def _make_terrain(h=256, w=256, seed=42):
+        rng = np.random.RandomState(seed)
+        ys = np.linspace(0, 4 * np.pi, h, dtype=np.float32)
+        xs = np.linspace(0, 4 * np.pi, w, dtype=np.float32)
+        return (np.sin(ys[:, None]) * np.cos(xs[None, :]) * 500
+                + 1000).astype(np.float32)
+
+    def test_init_with_chunk_source(self):
+        """TerrainLODManager can be initialized with a ChunkDataSource."""
+        from rtxpy.chunk_source import InMemoryChunkSource
+        terrain = self._make_terrain(256, 256)
+        src = InMemoryChunkSource(terrain, tile_size=64,
+                                  pixel_spacing_x=1.0,
+                                  pixel_spacing_y=1.0)
+        mgr = TerrainLODManager(chunk_source=src)
+        assert mgr._tile_size == 64
+        assert mgr._n_tile_rows == 4
+        assert mgr._n_tile_cols == 4
+        assert mgr._psx == 1.0
+        assert mgr._psy == 1.0
+
+    def test_chunk_source_overrides_params(self):
+        """chunk_source takes precedence over terrain_np params."""
+        from rtxpy.chunk_source import InMemoryChunkSource
+        terrain = self._make_terrain(256, 256)
+        src = InMemoryChunkSource(terrain, tile_size=128,
+                                  pixel_spacing_x=10.0,
+                                  pixel_spacing_y=10.0)
+        mgr = TerrainLODManager(
+            terrain_np=terrain, tile_size=64,
+            pixel_spacing_x=1.0, pixel_spacing_y=1.0,
+            chunk_source=src)
+        # chunk_source values should win
+        assert mgr._tile_size == 128
+        assert mgr._psx == 10.0
+        assert mgr._n_tile_rows == 2
+
+    def test_update_builds_tiles(self):
+        """Tiles are built and uploaded when using chunk_source."""
+        from rtxpy.chunk_source import InMemoryChunkSource
+        terrain = self._make_terrain(256, 256)
+        src = InMemoryChunkSource(terrain, tile_size=64,
+                                  pixel_spacing_x=1.0,
+                                  pixel_spacing_y=1.0)
+        rtx = _FakeRTX()
+        mgr = TerrainLODManager(chunk_source=src)
+        mgr.per_tick_build_limit = 100
+        mgr.update(np.array([128, 128, 100]), rtx, force=True)
+
+        # Should have built some tiles
+        assert len(rtx.geometries) > 0
+        assert len(mgr._tile_lods) > 0
+
+    def test_lod_transitions(self):
+        """Tiles at different distances get different LOD levels."""
+        from rtxpy.chunk_source import InMemoryChunkSource
+        terrain = self._make_terrain(512, 512)
+        src = InMemoryChunkSource(terrain, tile_size=64,
+                                  pixel_spacing_x=1.0,
+                                  pixel_spacing_y=1.0)
+        rtx = _FakeRTX()
+        mgr = TerrainLODManager(chunk_source=src, max_lod=3)
+        mgr.per_tick_build_limit = 200
+        # Camera at center
+        mgr.update(np.array([256, 256, 100]), rtx, force=True)
+
+        lod_vals = set(mgr._tile_lods.values())
+        # Should have at least LOD 0 and some higher LOD
+        assert 0 in lod_vals
+        assert len(lod_vals) > 1
+
+    def test_matches_legacy_path(self):
+        """Chunk-source-driven LOD builds tiles at same positions as legacy."""
+        from rtxpy.chunk_source import InMemoryChunkSource
+        terrain = self._make_terrain(256, 256)
+
+        # Legacy path
+        rtx_legacy = _FakeRTX()
+        mgr_legacy = TerrainLODManager(
+            terrain, tile_size=64,
+            pixel_spacing_x=1.0, pixel_spacing_y=1.0)
+        mgr_legacy.per_tick_build_limit = 100
+        cam = np.array([128, 128, 100])
+        mgr_legacy.update(cam, rtx_legacy, force=True)
+
+        # Chunk source path
+        src = InMemoryChunkSource(terrain, tile_size=64,
+                                  pixel_spacing_x=1.0,
+                                  pixel_spacing_y=1.0)
+        rtx_new = _FakeRTX()
+        mgr_new = TerrainLODManager(chunk_source=src)
+        mgr_new.per_tick_build_limit = 100
+        mgr_new.update(cam, rtx_new, force=True)
+
+        # Same tiles should be active
+        assert set(mgr_legacy._tile_lods.keys()) == \
+               set(mgr_new._tile_lods.keys())
+        # Same LOD assignments
+        for k in mgr_legacy._tile_lods:
+            assert mgr_legacy._tile_lods[k] == mgr_new._tile_lods[k], \
+                f"LOD mismatch at {k}"
+
+    def test_roughness_computed_from_source(self):
+        """Roughness is computed via chunk_source.chunk_roughness()."""
+        from rtxpy.chunk_source import InMemoryChunkSource
+        terrain = self._make_terrain(256, 256)
+        src = InMemoryChunkSource(terrain, tile_size=64,
+                                  pixel_spacing_x=1.0,
+                                  pixel_spacing_y=1.0)
+        mgr = TerrainLODManager(chunk_source=src)
+        # Should have roughness for all tiles
+        assert len(mgr._tile_roughness) == 4 * 4
+
+    def test_set_terrain_with_chunk_source(self):
+        """set_terrain(chunk_source=...) replaces the source."""
+        from rtxpy.chunk_source import InMemoryChunkSource
+        terrain1 = self._make_terrain(128, 128)
+        src1 = InMemoryChunkSource(terrain1, tile_size=64,
+                                   pixel_spacing_x=1.0,
+                                   pixel_spacing_y=1.0)
+        mgr = TerrainLODManager(chunk_source=src1)
+        assert mgr._n_tile_rows == 2
+
+        terrain2 = self._make_terrain(256, 256)
+        src2 = InMemoryChunkSource(terrain2, tile_size=128,
+                                   pixel_spacing_x=2.0,
+                                   pixel_spacing_y=2.0)
+        mgr.set_terrain(chunk_source=src2)
+        assert mgr._n_tile_rows == 2
+        assert mgr._tile_size == 128
+        assert mgr._psx == 2.0
+
+    def test_heightfield_with_chunk_source(self):
+        """Heightfield LOD 0 works with chunk_source."""
+        from rtxpy.chunk_source import InMemoryChunkSource
+        terrain = self._make_terrain(256, 256)
+        src = InMemoryChunkSource(terrain, tile_size=64,
+                                  pixel_spacing_x=1.0,
+                                  pixel_spacing_y=1.0)
+        rtx = _FakeRTX()
+        mgr = TerrainLODManager(chunk_source=src)
+        mgr.enable_heightfield_lod0()
+        mgr.per_tick_build_limit = 100
+        mgr.update(np.array([128, 128, 100]), rtx, force=True)
+
+        # Heightfield GAS should exist
+        assert mgr._hf_gid in rtx.geometries
+
+    def test_batched_upload_with_chunk_source(self):
+        """Batched upload works with chunk_source."""
+        from rtxpy.chunk_source import InMemoryChunkSource
+        terrain = self._make_terrain(256, 256)
+        src = InMemoryChunkSource(terrain, tile_size=64,
+                                  pixel_spacing_x=1.0,
+                                  pixel_spacing_y=1.0)
+        rtx = _FakeRTX()
+        mgr = TerrainLODManager(chunk_source=src)
+        mgr.enable_batched_upload()
+        mgr.per_tick_build_limit = 100
+        mgr.update(np.array([128, 128, 100]), rtx, force=True)
+
+        # Batch GAS IDs should be present
+        assert len(mgr._batch_gids) > 0
+
+    def test_crs_transform_from_source(self):
+        """CRS transform is picked up from chunk_source."""
+        from rtxpy.chunk_source import InMemoryChunkSource
+        terrain = self._make_terrain(128, 128)
+        src = InMemoryChunkSource(terrain, tile_size=64,
+                                  pixel_spacing_x=10.0,
+                                  pixel_spacing_y=10.0,
+                                  crs_origin=(500000.0, 4000000.0),
+                                  crs_pixel_spacing=(10.0, -10.0))
+        mgr = TerrainLODManager(chunk_source=src)
+        assert mgr._crs_origin == (500000.0, 4000000.0)
+        assert mgr._crs_spacing == (10.0, -10.0)
+
+    def test_get_metrics_with_chunk_source(self):
+        """get_metrics() returns valid data with chunk_source."""
+        from rtxpy.chunk_source import InMemoryChunkSource
+        terrain = self._make_terrain(128, 128)
+        src = InMemoryChunkSource(terrain, tile_size=64)
+        rtx = _FakeRTX()
+        mgr = TerrainLODManager(chunk_source=src)
+        mgr.per_tick_build_limit = 100
+        mgr.update(np.array([64, 64, 50]), rtx, force=True)
+
+        metrics = mgr.get_metrics()
+        assert metrics['active_tiles'] > 0
+        assert isinstance(metrics['lod_counts'], dict)
