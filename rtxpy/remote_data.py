@@ -368,14 +368,40 @@ def _merge_clip_reproject(tile_paths, bounds, crs, output_path, tile_size=256):
         merged = merge_arrays(reprojected)
 
     west, south, east, north = bounds
-    # bounds are always WGS84; pass crs so clip works for projected rasters
-    merged = merged.rio.clip_box(
-        minx=west, miny=south, maxx=east, maxy=north,
-        crs="EPSG:4326",
-    )
 
     if crs is not None:
+        # Reproject first, then clip in the projected CRS.  Clipping
+        # in WGS84 before reprojection creates a lon/lat rectangle that
+        # becomes a rotated parallelogram in UTM, leaving large NaN
+        # borders.  By reprojecting the full tile(s) and clipping
+        # afterward, the result is a clean projected rectangle.
+        from pyproj import Transformer
+        to_proj = Transformer.from_crs("EPSG:4326", crs, always_xy=True)
+        # Transform all 4 corners plus edge midpoints to capture the
+        # full projected extent (a lon/lat rect becomes a rotated
+        # quadrilateral in UTM — the extremes aren't always at corners).
+        lons = [west, east, west, east, west, east,
+                (west + east) / 2, (west + east) / 2]
+        lats = [south, south, north, north,
+                (south + north) / 2, (south + north) / 2,
+                south, north]
+        px, py = to_proj.transform(lons, lats)
+        proj_west = min(px)
+        proj_south = min(py)
+        proj_east = max(px)
+        proj_north = max(py)
+
         merged = merged.rio.reproject(crs)
+        merged = merged.rio.clip_box(
+            minx=proj_west, miny=proj_south,
+            maxx=proj_east, maxy=proj_north,
+        )
+    else:
+        # No reprojection — clip in WGS84 directly
+        merged = merged.rio.clip_box(
+            minx=west, miny=south, maxx=east, maxy=north,
+            crs="EPSG:4326",
+        )
 
     # Dispatch by output format
     output_path = Path(output_path)

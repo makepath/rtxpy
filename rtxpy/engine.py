@@ -3901,25 +3901,38 @@ class InteractiveViewer:
         else:
             terrain_np = np.asarray(terrain_data)
 
-        # Fill NaN at raster edges (common from UTM reprojection) so both
-        # the LOD tile builder and the render kernel see clean elevation.
-        # Without this, NaN pixels render as blue ocean water.
+        # Fill any remaining NaN at edges so both the LOD tile builder and
+        # the render kernel see clean elevation.  Without this, NaN pixels
+        # render as blue ocean water.  Use scipy nearest-neighbor fill
+        # (fast, handles diagonal NaN borders from UTM reprojection) with
+        # iterative neighbor-mean fallback.
         if np.any(np.isnan(terrain_np)):
             terrain_np = terrain_np.copy()
-            for _ in range(20):
-                still_nan = np.isnan(terrain_np)
-                if not still_nan.any():
-                    break
-                padded = np.pad(terrain_np, 1, mode='edge')
-                neighbors = np.stack([
-                    padded[:-2, 1:-1], padded[2:, 1:-1],
-                    padded[1:-1, :-2], padded[1:-1, 2:],
-                ], axis=0)
-                with np.errstate(all='ignore'):
-                    fill_vals = np.nanmean(neighbors, axis=0)
-                terrain_np = np.where(
-                    still_nan & np.isfinite(fill_vals),
-                    fill_vals, terrain_np)
+            nan_mask = np.isnan(terrain_np)
+            if nan_mask.any():
+                try:
+                    from scipy.ndimage import distance_transform_edt
+                    ind = distance_transform_edt(
+                        nan_mask, return_distances=False,
+                        return_indices=True)
+                    terrain_np = terrain_np.copy()
+                    terrain_np[nan_mask] = terrain_np[tuple(ind)][nan_mask]
+                except ImportError:
+                    # Fallback: iterative neighbor averaging
+                    for _ in range(200):
+                        still_nan = np.isnan(terrain_np)
+                        if not still_nan.any():
+                            break
+                        padded = np.pad(terrain_np, 1, mode='edge')
+                        neighbors = np.stack([
+                            padded[:-2, 1:-1], padded[2:, 1:-1],
+                            padded[1:-1, :-2], padded[1:-1, 2:],
+                        ], axis=0)
+                        with np.errstate(all='ignore'):
+                            fill_vals = np.nanmean(neighbors, axis=0)
+                        terrain_np = np.where(
+                            still_nan & np.isfinite(fill_vals),
+                            fill_vals, terrain_np)
             # Update raster so render kernel sees clean data too
             is_cupy = hasattr(base.data, 'get')
             if is_cupy:
@@ -3936,7 +3949,10 @@ class InteractiveViewer:
             self.rtx.remove_geometry('terrain_skirt')
 
         # Check for a ChunkDataSource provided via explore(terrain_source=...)
-        chunk_source = getattr(self, '_terrain_source', None)
+        # During __init__, these are pre-set as class attributes since
+        # post-init assignment hasn't happened yet.
+        chunk_source = (getattr(self, '_terrain_source', None)
+                        or getattr(self.__class__, '_pre_terrain_source', None))
 
         # Choose tile size.  When a chunk source is active, its chunk grid
         # defines the tile grid.  When a zarr chunk manager is active, align
@@ -3969,7 +3985,8 @@ class InteractiveViewer:
         if ox != 0.0 or oy != 0.0:
             mgr.set_offset(ox, oy)
         # Enable tile streaming if a data callback was provided
-        tile_data_fn = getattr(self, '_tile_data_fn', None)
+        tile_data_fn = (getattr(self, '_tile_data_fn', None)
+                        or getattr(self.__class__, '_pre_tile_data_fn', None))
         if tile_data_fn is not None:
             mgr.set_tile_data_fn(tile_data_fn)
             # Pass CRS coordinate transform so tile_data_fn receives
@@ -3988,7 +4005,8 @@ class InteractiveViewer:
             except (KeyError, AttributeError):
                 pass
         # Wire scene zarr for placed geometry loading through LOD manager
-        scene_zarr = getattr(self, '_scene_zarr', None)
+        scene_zarr = (getattr(self, '_scene_zarr', None)
+                      or getattr(self.__class__, '_pre_scene_zarr', None))
         if scene_zarr is not None:
             mgr.set_scene_zarr(scene_zarr)
 
@@ -4110,11 +4128,20 @@ class InteractiveViewer:
         except (KeyError, AttributeError):
             pass
 
-        # When streaming is active, use TIN meshes for ALL tiles (including
-        # LOD 0) so initial-extent and streaming tiles render identically.
-        # Without streaming, heightfield gives better quality for LOD 0.
-        if not mgr._streaming:
+        # When tile_data_fn streaming is active, use TIN meshes for ALL
+        # tiles (including LOD 0) so initial-extent and streaming tiles
+        # render identically.  chunk_source.supports_streaming is different
+        # — those are still bounded in-grid tiles, so heightfield is fine.
+        has_tile_data_fn = mgr._tile_data_fn is not None
+        if not has_tile_data_fn:
             mgr.enable_heightfield_lod0()
+
+        # Enable threaded building and batched upload BEFORE the initial
+        # build so all tiles go through the batch path from the start.
+        # This avoids creating N individual GAS entries that persist
+        # alongside the batched ones.
+        mgr.enable_threaded_building()
+        mgr.enable_batched_upload()
 
         # Force initial tile build — no build limit so all in-bounds
         # tiles appear on the first frame (no progressive pop-in on
@@ -4139,10 +4166,6 @@ class InteractiveViewer:
         # Force one more update so streaming tiles begin building
         if saved_streaming:
             mgr._last_update_pos = None
-        # Enable threaded mesh building for subsequent ticks
-        mgr.enable_threaded_building()
-        # Batch same-LOD tiles into single GAS entries to reduce IAS count
-        mgr.enable_batched_upload()
         # Only render if camera position has been initialised (run() sets it).
         # During __init__ the position is still None.
         if self.position is not None:
@@ -9673,6 +9696,13 @@ def explore(raster, width: int = 800, height: int = 600,
     else:
         ViewerClass = InteractiveViewer
 
+    # Pre-set terrain_source and scene_zarr on the class so
+    # _enable_terrain_lod() (called during __init__) can see them.
+    # These are consumed during LOD setup, before post-init runs.
+    ViewerClass._pre_terrain_source = terrain_source
+    ViewerClass._pre_scene_zarr = scene_zarr
+    ViewerClass._pre_tile_data_fn = tile_data_fn
+
     viewer = ViewerClass(
         raster,
         width=width,
@@ -9689,6 +9719,12 @@ def explore(raster, width: int = 800, height: int = 600,
         subsample=subsample,
         skirt=skirt,
     )
+
+    # Clean up class-level pre-sets
+    ViewerClass._pre_terrain_source = None
+    ViewerClass._pre_scene_zarr = None
+    ViewerClass._pre_tile_data_fn = None
+
     viewer._geometry_colors_builder = geometry_colors_builder
     viewer._baked_meshes = baked_meshes or {}
     viewer._minimap_style = minimap_style

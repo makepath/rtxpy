@@ -76,7 +76,9 @@ class TerrainLODManager:
         '_tile_data_cache', '_io_futures',
         '_executor', '_pending_futures', '_threaded',
         '_batched', '_lod_tile_meshes', '_dirty_lods', '_batch_gids',
+        '_batch_cache',
         '_hf_enabled', '_hf_gid', '_hf_dirty', '_hf_tile_size',
+        '_hf_last_lod0_set', '_hf_last_ve', '_hf_cached_pyr_id',
         '_build_retries',
         '_on_tile_added', '_on_tile_removed',
         '_scene_mesh_mgr',
@@ -205,6 +207,7 @@ class TerrainLODManager:
         self._lod_tile_meshes = {}  # {lod: {(tr,tc): (verts, indices, normals)}}
         self._dirty_lods = set()    # LOD levels needing batch rebuild
         self._batch_gids = set()    # batch GAS IDs currently in the scene
+        self._batch_cache = {}      # {lod: (verts, indices, normals)} cached concat
 
         # Heightfield for LOD 0: in-bounds LOD 0 tiles use heightfield
         # ray marching instead of explicit triangles.  Disabled by default;
@@ -213,6 +216,9 @@ class TerrainLODManager:
         self._hf_gid = 'terrain_lod_hf'
         self._hf_dirty = False
         self._hf_tile_size = 32
+        self._hf_last_lod0_set = frozenset()
+        self._hf_last_ve = None
+        self._hf_cached_pyr_id = None  # id() of pyramid array for skip
 
         # Tile lifecycle callbacks — used by OverlayTileManager to
         # keep per-tile overlay data in sync with the tile set.
@@ -323,6 +329,7 @@ class TerrainLODManager:
             self._executor = None
         self._threaded = False
         self._lod_tile_meshes.clear()
+        self._batch_cache.clear()
         self._dirty_lods.clear()
         self._batch_gids.clear()
         self._batched = False
@@ -350,6 +357,7 @@ class TerrainLODManager:
             self._tile_cache.clear()
             self._tile_data_cache.clear()
             self._lod_tile_meshes.clear()
+            self._batch_cache.clear()
             self._dirty_lods.clear()
             self._tile_lods.clear()
             if self._hf_enabled:
@@ -369,6 +377,7 @@ class TerrainLODManager:
             self._tile_cache.clear()
             self._tile_data_cache.clear()
             self._lod_tile_meshes.clear()
+            self._batch_cache.clear()
             self._dirty_lods.clear()
             self._tile_lods.clear()
             if self._hf_enabled:
@@ -512,6 +521,7 @@ class TerrainLODManager:
         self._tile_cache.clear()
         self._tile_data_cache.clear()
         self._lod_tile_meshes.clear()
+        self._batch_cache.clear()
         self._dirty_lods.clear()
         self._tile_lods.clear()
         if self._hf_enabled:
@@ -991,6 +1001,7 @@ class TerrainLODManager:
             rtx.remove_geometry(gid)
         self._batch_gids.clear()
         self._lod_tile_meshes.clear()
+        self._batch_cache.clear()
         self._dirty_lods.clear()
         if self._hf_enabled:
             self._hf_dirty = False
@@ -1267,8 +1278,10 @@ class TerrainLODManager:
         c0_pyr = (tc * ts) // pyr_sub
         r1_full = min((tr + 1) * ts, self._H)
         c1_full = min((tc + 1) * ts, self._W)
-        r1_pyr = min((r1_full + pyr_sub - 1) // pyr_sub + 1, pH)
-        c1_pyr = min((c1_full + pyr_sub - 1) // pyr_sub + 1, pW)
+        r_overlap = 1 if r1_full < self._H else 0
+        c_overlap = 1 if c1_full < self._W else 0
+        r1_pyr = min((r1_full + pyr_sub - 1) // pyr_sub + r_overlap, pH)
+        c1_pyr = min((c1_full + pyr_sub - 1) // pyr_sub + c_overlap, pW)
 
         th = len(range(r0_pyr, r1_pyr, extra))
         tw = len(range(c0_pyr, c1_pyr, extra))
@@ -1466,10 +1479,12 @@ class TerrainLODManager:
         c0_full = tc * ts
         r1_full = min(r0_full + ts, self._H)
         c1_full = min(c0_full + ts, self._W)
+        r_overlap = 1 if r1_full < self._H else 0
+        c_overlap = 1 if c1_full < self._W else 0
         c0_pyr = c0_full // pyr_sub
-        c1_pyr = min((c1_full + pyr_sub - 1) // pyr_sub + 1, pW)
+        c1_pyr = min((c1_full + pyr_sub - 1) // pyr_sub + c_overlap, pW)
         r0_pyr = r0_full // pyr_sub
-        r1_pyr = min((r1_full + pyr_sub - 1) // pyr_sub + 1, pH)
+        r1_pyr = min((r1_full + pyr_sub - 1) // pyr_sub + r_overlap, pH)
 
         if edge == 'top':
             r = r0_full // pyr_sub
@@ -1524,6 +1539,17 @@ class TerrainLODManager:
                 self._batch_gids.discard(gid)
                 return True
             return False
+
+        # Skip rebuild if the set of LOD 0 tiles and VE haven't changed
+        # (avoids re-uploading the full elevation array + AABB rebuild
+        # when only higher-LOD tiles transitioned).
+        lod0_set = frozenset(lod0_tiles)
+        if (lod0_set == self._hf_last_lod0_set
+                and ve == getattr(self, '_hf_last_ve', None)
+                and gid in self._batch_gids):
+            return False
+        self._hf_last_lod0_set = lod0_set
+        self._hf_last_ve = ve
 
         # Get subsampled elevation (pyramid level 0)
         bs = self._base_subsample
@@ -1589,6 +1615,10 @@ class TerrainLODManager:
         per tick.  Empty-LOD removals are always processed immediately
         since they're cheap.
 
+        Uses a cached concatenation buffer per LOD level.  When tiles
+        are added/removed, the buffer is reallocated; when tile data
+        changes (e.g. LOD swap), only the affected slice is overwritten.
+
         Returns True if any GAS was added or updated.
         """
         if not self._dirty_lods:
@@ -1604,6 +1634,7 @@ class TerrainLODManager:
                 if batch_gid in self._batch_gids:
                     rtx.remove_geometry(batch_gid)
                     self._batch_gids.discard(batch_gid)
+                    self._batch_cache.pop(lod, None)
                     changed = True
                 continue
 
@@ -1613,20 +1644,44 @@ class TerrainLODManager:
                 continue
             rebuilt_one = True
 
-            all_verts = []
-            all_indices = []
-            all_normals = []
+            # Compute total sizes
+            total_verts = 0
+            total_indices = 0
+            for (v, idx, n) in tiles.values():
+                total_verts += len(v)
+                total_indices += len(idx)
+
+            # Reuse cached buffer if sizes match (common case: tile
+            # swapped between LOD levels but total count is stable)
+            cached = self._batch_cache.get(lod)
+            if (cached is not None
+                    and len(cached[0]) == total_verts
+                    and len(cached[1]) == total_indices):
+                batch_verts, batch_indices, batch_normals = cached
+            else:
+                batch_verts = np.empty(total_verts, dtype=np.float32)
+                batch_indices = np.empty(total_indices, dtype=np.int32)
+                batch_normals = np.empty(total_verts, dtype=np.float32)
+
+            # Fill buffers (memcpy per tile)
+            v_pos = 0
+            i_pos = 0
             vert_offset = 0
             for (v, idx, n) in tiles.values():
-                all_verts.append(v)
-                shifted = idx + vert_offset
-                all_indices.append(shifted)
-                all_normals.append(n)
-                vert_offset += len(v) // 3
+                vlen = len(v)
+                ilen = len(idx)
+                batch_verts[v_pos:v_pos + vlen] = v
+                batch_normals[v_pos:v_pos + vlen] = n
+                batch_indices[i_pos:i_pos + ilen] = idx
+                if vert_offset > 0:
+                    batch_indices[i_pos:i_pos + ilen] += vert_offset
+                v_pos += vlen
+                i_pos += ilen
+                vert_offset += vlen // 3
 
-            batch_verts = np.concatenate(all_verts)
-            batch_indices = np.concatenate(all_indices)
-            batch_normals = np.concatenate(all_normals)
+            self._batch_cache[lod] = (batch_verts, batch_indices,
+                                      batch_normals)
+
             rc = rtx.add_geometry(
                 batch_gid, batch_verts, batch_indices,
                 normals=batch_normals)
@@ -1782,8 +1837,14 @@ class TerrainLODManager:
         c1_full = min(c0_full + self._tile_size, self._W)
         r0_pyr = r0_full // pyr_sub
         c0_pyr = c0_full // pyr_sub
-        r1_pyr = min((r1_full + pyr_sub - 1) // pyr_sub + 1, pH)
-        c1_pyr = min((c1_full + pyr_sub - 1) // pyr_sub + 1, pW)
+        # Add +1 overlap for shared boundary vertices with the next tile,
+        # but NOT for the last row/column of tiles (no neighbor to share
+        # with, and the extra row would extend into NaN territory causing
+        # elevation spikes from NaN→mean fill).
+        r_overlap = 1 if r1_full < self._H else 0
+        c_overlap = 1 if c1_full < self._W else 0
+        r1_pyr = min((r1_full + pyr_sub - 1) // pyr_sub + r_overlap, pH)
+        c1_pyr = min((c1_full + pyr_sub - 1) // pyr_sub + c_overlap, pW)
 
         # If this LOD needs further subsampling beyond the pyramid level
         # (happens if lod > max precomputed level), stride the remainder.
@@ -1866,14 +1927,18 @@ class TerrainLODManager:
         indices = np.zeros(num_tris * 3, dtype=np.int32)
         mesh_mod.triangulate_terrain(verts, indices, tile, scale=1.0)
 
-        # World-space bounds of this tile
+        # World-space bounds of this tile.  Use the actual pixel extent
+        # (clipped to terrain shape), not the full tile_size — edge tiles
+        # may be smaller than tile_size.
         ts = self._tile_size
         c0 = tc * ts
         r0 = tr * ts
+        c1 = min(c0 + ts, self._W)
+        r1 = min(r0 + ts, self._H)
         wx0 = c0 * self._psx + self._offset_x
         wy0 = r0 * self._psy + self._offset_y
-        wx1 = (c0 + ts) * self._psx + self._offset_x
-        wy1 = (r0 + ts) * self._psy + self._offset_y
+        wx1 = c1 * self._psx + self._offset_x
+        wy1 = r1 * self._psy + self._offset_y
 
         # Compute smooth normals using effective pixel spacing
         if tw > 1:

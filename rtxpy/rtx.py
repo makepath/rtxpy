@@ -1282,7 +1282,9 @@ def _build_gas_for_curves(vertices, widths, indices, num_segments):
     return gas_handle, gas_buffer
 
 
-def _build_gas_for_heightfield(elevation_data, H, W, spacing_x, spacing_y, ve, tile_size, active_mask=None):
+def _build_gas_for_heightfield(elevation_data, H, W, spacing_x, spacing_y, ve,
+                                tile_size, active_mask=None,
+                                d_elevation_reuse=None):
     """
     Build a GAS for heightfield terrain using custom AABB primitives.
 
@@ -1300,6 +1302,9 @@ def _build_gas_for_heightfield(elevation_data, H, W, spacing_x, spacing_y, ve, t
         active_mask: Optional numpy bool array of length num_tiles.
             When provided, inactive tiles get zero-volume AABBs so only
             a subset of the heightfield grid participates in ray tracing.
+        d_elevation_reuse: Optional cupy array from a previous call.
+            When provided, skips the CPU→GPU elevation upload (the
+            elevation data hasn't changed, only the active mask).
 
     Returns:
         Tuple of (gas_handle, gas_buffer, d_elevation, num_tiles_x, num_tiles_y)
@@ -1315,9 +1320,12 @@ def _build_gas_for_heightfield(elevation_data, H, W, spacing_x, spacing_y, ve, t
     num_tiles_y = math.ceil((H - 1) / tile_size)
     num_tiles = num_tiles_x * num_tiles_y
 
-    # Upload elevation data to GPU
+    # Upload elevation data to GPU (skip if caller provides cached buffer)
     elev_np = np.asarray(elevation_data, dtype=np.float32)
-    d_elevation = cupy.asarray(elev_np)
+    if d_elevation_reuse is not None:
+        d_elevation = d_elevation_reuse
+    else:
+        d_elevation = cupy.asarray(elev_np)
 
     # Build AABB for each tile
     aabbs = np.zeros(num_tiles * 6, dtype=np.float32)
@@ -2152,12 +2160,19 @@ class RTX:
             self._geom_state.current_hash = 0xFFFFFFFFFFFFFFFF
             self._geom_state.single_gas_mode = False
 
-        # Compute hash to skip GAS rebuild when vertices haven't changed
+        # Compute hash to skip GAS rebuild when vertices haven't changed.
+        # Use fast approximate hash for large buffers (sampled values)
+        # instead of hashing the full array which takes 20-40ms for 1M+ verts.
         if isinstance(vertices, cupy.ndarray):
             vertices_for_hash = vertices.get()
         else:
             vertices_for_hash = np.asarray(vertices)
-        vertices_hash = hash(vertices_for_hash.tobytes())
+        n = len(vertices_for_hash)
+        if n > 1024:
+            step = max(1, n // 64)
+            vertices_hash = hash((n, vertices_for_hash[::step].tobytes()))
+        else:
+            vertices_hash = hash(vertices_for_hash.tobytes())
 
         existing = self._geom_state.gas_entries.get(geometry_id)
         if existing is not None and existing.vertices_hash == vertices_hash:
@@ -2363,14 +2378,27 @@ class RTX:
         else:
             elev_np = np.asarray(elevation, dtype=np.float32)
 
+        # Reuse existing GPU elevation buffer when the elevation data
+        # hasn't changed (same array identity) — only the active mask
+        # needs updating.  This avoids a 50MB CPU→GPU transfer per frame.
+        existing = self._geom_state.gas_entries.get(geometry_id)
+        d_elevation_reuse = None
+        if (existing is not None and existing.is_heightfield
+                and self._geom_state.heightfield_data is not None
+                and getattr(self._geom_state, '_hf_elev_id', None) == id(elevation)):
+            d_elevation_reuse = self._geom_state.heightfield_data
+
         gas_handle, gas_buffer, d_elevation, num_tiles_x, num_tiles_y = \
-            _build_gas_for_heightfield(elev_np, H, W, spacing_x, spacing_y, ve, tile_size, active_mask)
+            _build_gas_for_heightfield(elev_np, H, W, spacing_x, spacing_y,
+                                       ve, tile_size, active_mask,
+                                       d_elevation_reuse=d_elevation_reuse)
 
         if gas_handle == 0:
             return -1
 
         # Store heightfield metadata on geometry state for params packing
         self._geom_state.heightfield_data = d_elevation
+        self._geom_state._hf_elev_id = id(elevation)
         self._geom_state.hf_width = W
         self._geom_state.hf_height = H
         self._geom_state.hf_spacing_x = spacing_x
@@ -2386,8 +2414,13 @@ class RTX:
                 0.0, 0.0, 1.0, 0.0,
             ]
 
-        # Compute hash for cache invalidation
-        vertices_hash = hash(elev_np.tobytes())
+        # Compute hash for cache invalidation (fast approximate for large arrays)
+        n = elev_np.size
+        if n > 1024:
+            step = max(1, n // 64)
+            vertices_hash = hash((n, elev_np.ravel()[::step].tobytes()))
+        else:
+            vertices_hash = hash(elev_np.tobytes())
 
         self._geom_state.gas_entries[geometry_id] = _GASEntry(
             gas_id=geometry_id,

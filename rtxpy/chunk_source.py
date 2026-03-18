@@ -514,11 +514,17 @@ class ZarrChunkSource(ChunkDataSource):
         if cf_decode is not None:
             self._cf_scale, self._cf_offset, self._cf_fill = cf_decode
         else:
-            # Try to read from zarr attrs
+            # Try to read from zarr attrs.  CF convention stores the fill
+            # value as a `_FillValue` attribute; the zarr metadata
+            # `fill_value` is a different concept (chunk fill, often 0).
             attrs = self._arr.attrs
             self._cf_scale = float(attrs.get('scale_factor', 1.0))
             self._cf_offset = float(attrs.get('add_offset', 0.0))
-            self._cf_fill = self._arr.fill_value
+            cf_fv = attrs.get('_FillValue', None)
+            if cf_fv is not None:
+                self._cf_fill = cf_fv
+            else:
+                self._cf_fill = self._arr.fill_value
             # If scale is 1.0 and offset is 0.0 and fill is NaN,
             # no CF decode needed (data is already float elevation)
             if (self._cf_scale == 1.0 and self._cf_offset == 0.0

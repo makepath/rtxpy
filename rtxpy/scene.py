@@ -103,9 +103,12 @@ def build_scene(
     from concurrent.futures import ThreadPoolExecutor, as_completed
     from .scene_locations import Location
 
-    # Auto-detect CRS from Location objects
+    # Auto-detect CRS: from Location objects, or UTM from bounds center
     if crs is None and isinstance(bounds, Location):
         crs = bounds.crs
+    if crs is None:
+        from .scene_locations import _utm_epsg
+        crs = _utm_epsg(*bounds)
 
     output_path = Path(output_path)
     if name is None:
@@ -570,6 +573,17 @@ def explore_scene(zarr_path, **explore_kwargs):
         if crs_wkt:
             import rioxarray  # noqa: F401
             da = da.rio.write_crs(crs_wkt)
+
+    # Materialize to GPU — the render kernel needs cupy-backed data.
+    # open_zarr returns dask-backed arrays; compute + transfer to GPU.
+    import numpy as np
+    data = da.values  # materializes dask → numpy
+    data = np.ascontiguousarray(data, dtype=np.float32)
+    try:
+        import cupy as cp
+        da = da.copy(data=cp.asarray(data))
+    except ImportError:
+        da = da.copy(data=data)
 
     # Read optional groups
     store = zarr.open(zarr_path, mode='r', use_consolidated=False)

@@ -49,17 +49,18 @@ class SceneMeshManager:
 
         self._zarr_path = zarr_path
         store = _zarr.open(str(zarr_path), mode='r', use_consolidated=False)
-        mg = store['meshes']
 
         # Read per-gid colors and list of geometry IDs
         self._colors = {}
         self._gids = []
-        for gid in mg:
-            gg = mg[gid]
-            if hasattr(gg, 'attrs'):
-                self._colors[gid] = tuple(
-                    gg.attrs.get('color', (0.6, 0.6, 0.6)))
-                self._gids.append(gid)
+        if 'meshes' in store:
+            mg = store['meshes']
+            for gid in mg:
+                gg = mg[gid]
+                if hasattr(gg, 'attrs'):
+                    self._colors[gid] = tuple(
+                        gg.attrs.get('color', (0.6, 0.6, 0.6)))
+                    self._gids.append(gid)
 
         self._chunk_cache = {}
         self._simplify_cache = {}
@@ -150,6 +151,10 @@ class SceneMeshManager:
         bool
             True if the merged output changed (caller should re-upload).
         """
+        # No geometry IDs → nothing to load/merge
+        if not self._gids:
+            return False
+
         new_visible = set(visible_lods.keys())
 
         # Check if anything changed
