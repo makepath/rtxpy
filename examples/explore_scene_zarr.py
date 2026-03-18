@@ -112,6 +112,8 @@ def main():
         height=1200,
         render_scale=0.5,
         color_stretch='cbrt',
+        ao_samples=0,
+        denoise=False,
         repl=True,
     )
 

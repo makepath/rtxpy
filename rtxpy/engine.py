@@ -55,10 +55,17 @@ void main() {
 _QUAD_FRAG = """
 #version 330
 uniform sampler2D frame;
+uniform sampler2D overlay;
+uniform int has_overlay;
 in vec2 v_uv;
 out vec4 fragColor;
 void main() {
-    fragColor = vec4(texture(frame, v_uv).rgb, 1.0);
+    vec3 base = texture(frame, v_uv).rgb;
+    if (has_overlay == 1) {
+        vec4 ov = texture(overlay, v_uv);
+        base = mix(base, ov.rgb, ov.a);
+    }
+    fragColor = vec4(base, 1.0);
 }
 """
 
@@ -7073,23 +7080,60 @@ class InteractiveViewer:
               and self._d_base_frame is not None):
             # Particles active but camera didn't move — skip the expensive ray
             # trace and just re-advect particles + GPU splat on fresh copy.
-            cp.copyto(self._d_wind_scratch, self._d_base_frame)
-            if self._wind_enabled and self._wind_particles is not None:
-                self._update_wind_particles()
-                self._splat_wind_gpu(self._d_wind_scratch)
-            if self._hydro_enabled and self._hydro_particles is not None:
-                self.hydro_mgr.check_streaming_result()
-                self._transfer_streaming_overlay()
-                cam_r = self.position[1] / self._base_pixel_spacing_y
-                cam_c = self.position[0] / self._base_pixel_spacing_x
-                self.hydro_mgr.update_streaming_window(cam_r, cam_c)
-                self._update_hydro_particles()
-                self._splat_hydro_gpu(self._d_wind_scratch)
-            if self._clouds_enabled and self._rain_particles is not None:
-                self._update_rain_particles()
-                self._splat_rain_gpu(self._d_wind_scratch)
-            self._d_wind_scratch.get(out=self._pinned_frame)
-            self._composite_overlays()
+            if self._interop_enabled:
+                # Interop: splat into PBO directly, no CPU involvement
+                try:
+                    d_pbo = self._cuda_gl_buf.map()
+                    try:
+                        cp.copyto(d_pbo, self._d_base_frame)
+                        if self._wind_enabled and self._wind_particles is not None:
+                            self._update_wind_particles()
+                            self._splat_wind_gpu(d_pbo)
+                        if self._hydro_enabled and self._hydro_particles is not None:
+                            self.hydro_mgr.check_streaming_result()
+                            self._transfer_streaming_overlay()
+                            cam_r = self.position[1] / self._base_pixel_spacing_y
+                            cam_c = self.position[0] / self._base_pixel_spacing_x
+                            self.hydro_mgr.update_streaming_window(cam_r, cam_c)
+                            self._update_hydro_particles()
+                            self._splat_hydro_gpu(d_pbo)
+                        if self._clouds_enabled and self._rain_particles is not None:
+                            self._update_rain_particles()
+                            self._splat_rain_gpu(d_pbo)
+                        cp.cuda.get_current_stream().synchronize()
+                    finally:
+                        self._cuda_gl_buf.unmap()
+                    self._cuda_gl_buf.upload_to_texture(self._interop_frame_tex)
+                    self._update_window_title()
+                    self._frame_dirty = True
+                except Exception:
+                    import traceback
+                    traceback.print_exc()
+                    self._interop_enabled = False
+                    # Fall through to CPU path below
+                    self._idle_particles_cpu()
+            else:
+                self._idle_particles_cpu()
+
+    def _idle_particles_cpu(self):
+        """CPU fallback for idle particle replay (no ray trace needed)."""
+        cp.copyto(self._d_wind_scratch, self._d_base_frame)
+        if self._wind_enabled and self._wind_particles is not None:
+            self._update_wind_particles()
+            self._splat_wind_gpu(self._d_wind_scratch)
+        if self._hydro_enabled and self._hydro_particles is not None:
+            self.hydro_mgr.check_streaming_result()
+            self._transfer_streaming_overlay()
+            cam_r = self.position[1] / self._base_pixel_spacing_y
+            cam_c = self.position[0] / self._base_pixel_spacing_x
+            self.hydro_mgr.update_streaming_window(cam_r, cam_c)
+            self._update_hydro_particles()
+            self._splat_hydro_gpu(self._d_wind_scratch)
+        if self._clouds_enabled and self._rain_particles is not None:
+            self._update_rain_particles()
+            self._splat_rain_gpu(self._d_wind_scratch)
+        self._d_wind_scratch.get(out=self._pinned_frame)
+        self._composite_overlays()
 
     def _cycle_terrain_layer(self):
         """Cycle terrain color: elevation → overlay1 → overlay2 → ... → elevation.
@@ -8496,13 +8540,6 @@ class InteractiveViewer:
                 _bloom(d_display, bufs.bloom_temp, bufs.bloom_scratch)
             _tone_map_aces(d_display)
 
-        # Allocate pinned host buffer lazily (or on shape change)
-        if self._pinned_frame is None or self._pinned_frame.shape != d_display.shape:
-            self._pinned_mem = cp.cuda.alloc_pinned_memory(d_display.nbytes)
-            self._pinned_frame = np.frombuffer(
-                self._pinned_mem, dtype=np.float32, count=d_display.size
-            ).reshape(d_display.shape)
-
         # Save clean post-processed frame for idle wind/hydro/rain replay
         _any_particles = (self._wind_enabled or self._hydro_enabled
                           or (self._clouds_enabled and self._rain_particles is not None))
@@ -8511,6 +8548,77 @@ class InteractiveViewer:
                 self._d_base_frame = cp.empty_like(d_display)
                 self._d_wind_scratch = cp.empty_like(d_display)
             cp.copyto(self._d_base_frame, d_display)
+
+        # Advance volumetric cloud animation time
+        if self._clouds_enabled and self._volumetric_clouds_enabled:
+            self._cloud_time += 0.05
+
+        if self._interop_enabled:
+            # --- CUDA-GL interop path: zero-copy GPU→GL ---
+            try:
+                d_pbo = self._cuda_gl_buf.map()
+                try:
+                    # Copy post-processed frame into PBO
+                    cp.copyto(d_pbo, d_display)
+
+                    # Splat particles directly into PBO memory
+                    if self._wind_enabled and self._wind_particles is not None:
+                        self._update_wind_particles()
+                        self._splat_wind_gpu(d_pbo)
+                    if self._hydro_enabled and self._hydro_particles is not None:
+                        self.hydro_mgr.check_streaming_result()
+                        self._transfer_streaming_overlay()
+                        cam_r = self.position[1] / self._base_pixel_spacing_y
+                        cam_c = self.position[0] / self._base_pixel_spacing_x
+                        self.hydro_mgr.update_streaming_window(cam_r, cam_c)
+                        self._update_hydro_particles()
+                        self._splat_hydro_gpu(d_pbo)
+                    if self._clouds_enabled and self._rain_particles is not None:
+                        self._update_rain_particles()
+                        self._splat_rain_gpu(d_pbo)
+
+                    # Ensure all GPU work is done before unmapping
+                    cp.cuda.get_current_stream().synchronize()
+                finally:
+                    self._cuda_gl_buf.unmap()
+
+                # Resize frame texture if needed (after window resize)
+                tex = self._interop_frame_tex
+                tw, th = tex.size
+                pw, ph = self._cuda_gl_buf.width, self._cuda_gl_buf.height
+                if tw != pw or th != ph:
+                    import moderngl as _mgl
+                    tex.release()
+                    tex = self._mgl_ctx.texture((pw, ph), 3, dtype='f4')
+                    tex.filter = (_mgl.LINEAR, _mgl.LINEAR)
+                    self._interop_frame_tex = tex
+
+                # GPU-internal PBO→texture upload (<0.5ms)
+                self._cuda_gl_buf.upload_to_texture(self._interop_frame_tex)
+
+                # Build overlay RGBA (CPU) — only re-uploaded when content changes
+                self._build_overlay_rgba()
+                self._update_window_title()
+                self._frame_dirty = True
+            except Exception:
+                # Interop failed mid-frame — fall back to CPU path for this
+                # frame and disable interop for subsequent frames.
+                import traceback
+                traceback.print_exc()
+                print("CUDA-GL interop error — falling back to CPU path")
+                self._interop_enabled = False
+                self._update_frame_cpu(d_display, _any_particles)
+        else:
+            self._update_frame_cpu(d_display, _any_particles)
+
+    def _update_frame_cpu(self, d_display, _any_particles):
+        """CPU fallback display path: GPU→CPU readback + overlay compositing."""
+        # Allocate pinned host buffer lazily (or on shape change)
+        if self._pinned_frame is None or self._pinned_frame.shape != d_display.shape:
+            self._pinned_mem = cp.cuda.alloc_pinned_memory(d_display.nbytes)
+            self._pinned_frame = np.frombuffer(
+                self._pinned_mem, dtype=np.float32, count=d_display.size
+            ).reshape(d_display.shape)
 
         # GPU wind: advect on CPU, splat on GPU, then readback
         if self._wind_enabled and self._wind_particles is not None:
@@ -8531,10 +8639,6 @@ class InteractiveViewer:
         if self._clouds_enabled and self._rain_particles is not None:
             self._update_rain_particles()
             self._splat_rain_gpu(d_display)
-
-        # Advance volumetric cloud animation time
-        if self._clouds_enabled and self._volumetric_clouds_enabled:
-            self._cloud_time += 0.05
 
         # Sync: splat kernels run on stream 0, readback on non-blocking stream
         if _any_particles:
@@ -8635,6 +8739,101 @@ class InteractiveViewer:
 
         self._display_frame = img
         self._frame_dirty = True
+
+    def _update_window_title(self):
+        """Update FPS counter and GLFW window title (shared by both paths)."""
+        self._fps_counter += 1
+        now = time.monotonic()
+        elapsed = now - self._fps_last_time
+        if elapsed >= 1.0:
+            self._fps_display = self._fps_counter / elapsed
+            self._fps_counter = 0
+            self._fps_last_time = now
+
+        title = self._build_title()
+        pos = self.position
+        fps = self._fps_display
+        sub = f"{fps:.0f} FPS  Pos: ({pos[0]:.0f}, {pos[1]:.0f}, {pos[2]:.0f})  Speed: {self.move_speed:.0f}"
+        if self._observers:
+            obs_parts = []
+            for slot in sorted(self._observers):
+                obs = self._observers[slot]
+                marker = '*' if slot == self._active_observer else ''
+                mode = ''
+                if obs.drone_mode != 'off':
+                    mode = f' {obs.drone_mode.upper()}'
+                if obs.is_touring():
+                    mode += ' TOUR'
+                obs_parts.append(f"{slot}{marker}{mode}")
+            sub += f"  \u2502  Obs: [{' '.join(obs_parts)}]"
+            active_obs = (self._observers.get(self._active_observer)
+                          if self._active_observer else None)
+            if active_obs is not None:
+                sub += f"  h={active_obs.observer_elev:.3f}"
+            if self.viewshed_enabled:
+                sub += f"  Coverage: {self._viewshed_coverage:.1f}%"
+
+        combined = f"{title}  |  {sub}"
+        if combined != self._last_title:
+            self._last_title = combined
+            if self._glfw_window is not None:
+                import glfw
+                glfw.set_window_title(self._glfw_window, combined)
+
+    def _build_overlay_rgba(self):
+        """Build RGBA overlay for the interop path (transparent where empty).
+
+        Sets ``self._overlay_rgba`` and bumps ``self._overlay_gen`` when
+        content changes.  Returns None if nothing to draw.
+        """
+        h, w = self.render_height, self.render_width
+
+        _help_visible = (self._help_page_idx >= 0 and self._help_pages)
+        needs_overlay = (
+            (self._gtfs_rt_enabled and self._gtfs_rt_vehicles is not None)
+            or self.show_minimap
+            or self._title_overlay_rgba is not None
+            or self._legend_rgba is not None
+            or _help_visible
+        )
+        if not needs_overlay:
+            if self._overlay_rgba is not None:
+                self._overlay_rgba = None
+                self._overlay_gen += 1
+            return
+
+        # Build a float32 RGB "canvas" to blit overlays onto, then convert to
+        # RGBA.  We reuse the existing _blit_*_on_frame helpers which write
+        # into an (H, W, 3) float32 array.  We composite with alpha by
+        # tracking which pixels were written.
+        canvas = np.zeros((h, w, 3), dtype=np.float32)
+        mask = np.zeros((h, w), dtype=np.float32)
+
+        # Use a thin wrapper that also sets the alpha mask
+        def _blit_with_mask(blit_fn, canvas, mask):
+            before = canvas.copy()
+            blit_fn(canvas)
+            changed = np.any(canvas != before, axis=2)
+            mask[changed] = 1.0
+
+        if self._gtfs_rt_enabled and self._gtfs_rt_vehicles is not None:
+            _blit_with_mask(self._draw_gtfs_rt_on_frame, canvas, mask)
+        _blit_with_mask(self._blit_minimap_on_frame, canvas, mask)
+        _blit_with_mask(self._blit_title_on_frame, canvas, mask)
+        _blit_with_mask(self._blit_legend_on_frame, canvas, mask)
+        if _help_visible:
+            _blit_with_mask(self._blit_help_on_frame, canvas, mask)
+
+        if mask.any():
+            rgba = np.empty((h, w, 4), dtype=np.float32)
+            rgba[:, :, :3] = canvas
+            rgba[:, :, 3] = mask
+            self._overlay_rgba = rgba
+            self._overlay_gen += 1
+        else:
+            if self._overlay_rgba is not None:
+                self._overlay_rgba = None
+                self._overlay_gen += 1
 
     def _handle_scroll(self, yoffset):
         """Handle mouse scroll wheel for zoom.
@@ -9221,21 +9420,50 @@ class InteractiveViewer:
                 traceback.print_exc()
             self._render_needed = True
 
-    def _present_if_dirty(self, frame_tex, ctx, vao, glfw, window, moderngl):
+    def _present_if_dirty(self, frame_tex, overlay_tex, prog, ctx, vao,
+                          glfw, window, moderngl):
         """Upload frame to GL texture and present if the frame changed."""
-        if self._frame_dirty and self._display_frame is not None:
-            tex_w, tex_h = frame_tex.size
-            fh, fw = self._display_frame.shape[:2]
-            if fw != tex_w or fh != tex_h:
-                frame_tex.release()
-                frame_tex = ctx.texture((fw, fh), 3, dtype='f4')
-                frame_tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
-            frame_tex.write(self._display_frame)
-            frame_tex.use()
+        if not self._frame_dirty:
+            return
+
+        if self._interop_enabled:
+            # Interop path: frame_tex already updated via PBO upload.
+            # Handle overlay texture upload if needed.
+            has_ov = (self._overlay_rgba is not None
+                      and self._overlay_gen != self._overlay_uploaded)
+            if has_ov:
+                ov_w, ov_h = overlay_tex.size
+                oh, ow = self._overlay_rgba.shape[:2]
+                if ow != ov_w or oh != ov_h:
+                    overlay_tex.release()
+                    overlay_tex = ctx.texture((ow, oh), 4, dtype='f4')
+                    overlay_tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
+                overlay_tex.write(self._overlay_rgba)
+                self._overlay_uploaded = self._overlay_gen
+
+            prog['has_overlay'].value = 1 if self._overlay_rgba is not None else 0
+            self._interop_frame_tex.use(location=0)
+            overlay_tex.use(location=1)
             ctx.clear()
             vao.render(moderngl.TRIANGLE_STRIP)
             glfw.swap_buffers(window)
             self._frame_dirty = False
+        else:
+            # Fallback path: frame composited on CPU, upload to texture.
+            if self._display_frame is not None:
+                tex_w, tex_h = frame_tex.size
+                fh, fw = self._display_frame.shape[:2]
+                if fw != tex_w or fh != tex_h:
+                    frame_tex.release()
+                    frame_tex = ctx.texture((fw, fh), 3, dtype='f4')
+                    frame_tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
+                prog['has_overlay'].value = 0
+                frame_tex.write(self._display_frame)
+                frame_tex.use(location=0)
+                ctx.clear()
+                vao.render(moderngl.TRIANGLE_STRIP)
+                glfw.swap_buffers(window)
+                self._frame_dirty = False
 
     def run(self, start_position: Optional[Tuple[float, float, float]] = None,
             look_at: Optional[Tuple[float, float, float]] = None):
@@ -9330,6 +9558,7 @@ class InteractiveViewer:
 
         # --- ModernGL context + fullscreen quad ---
         ctx = moderngl.create_context()
+        self._mgl_ctx = ctx  # stored for _update_frame interop texture resize
         prog = ctx.program(vertex_shader=_QUAD_VERT, fragment_shader=_QUAD_FRAG)
 
         # Fullscreen quad: position (x, y) + UV (u, v)
@@ -9345,11 +9574,42 @@ class InteractiveViewer:
         vbo = ctx.buffer(quad_data.tobytes())
         vao = ctx.simple_vertex_array(prog, vbo, 'in_pos', 'in_uv')
 
+        # Bind texture units: frame on unit 0, overlay on unit 1
+        prog['frame'].value = 0
+        prog['overlay'].value = 1
+        prog['has_overlay'].value = 0
+
         # Frame texture — sized to render resolution, updated every frame
         frame_tex = ctx.texture(
             (self.render_width, self.render_height), 3, dtype='f4',
         )
         frame_tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
+        self._interop_frame_tex = frame_tex  # for _update_frame interop path
+
+        # Overlay texture — RGBA for alpha-blended CPU overlays
+        overlay_tex = ctx.texture(
+            (self.render_width, self.render_height), 4, dtype='f4',
+        )
+        overlay_tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
+
+        # --- CUDA-GL interop ---
+        self._interop_enabled = False
+        self._cuda_gl_buf = None
+        self._overlay_gen = 0      # bumped when overlay content changes
+        self._overlay_uploaded = -1  # last generation uploaded to GPU
+        if has_cupy:
+            try:
+                from .viewer.cuda_gl_interop import CudaGLFrameBuffer
+                if CudaGLFrameBuffer.is_available(ctx):
+                    self._cuda_gl_buf = CudaGLFrameBuffer(
+                        self.render_width, self.render_height, ctx,
+                    )
+                    self._interop_enabled = True
+                    print("CUDA-GL interop enabled (zero-copy display)")
+            except Exception as exc:
+                print(f"CUDA-GL interop not available: {exc}")
+        if not self._interop_enabled:
+            print("Using CPU display path (GPU→CPU→GPU roundtrip)")
 
         # --- Pre-render help text overlay ---
         self._render_title_overlay()
@@ -9396,6 +9656,13 @@ class InteractiveViewer:
             # Invalidate pinned buffer so it's re-allocated at new size
             viewer._pinned_frame = None
             viewer._pinned_mem = None
+            # Resize CUDA-GL PBO if interop is active
+            if viewer._interop_enabled and viewer._cuda_gl_buf is not None:
+                try:
+                    viewer._cuda_gl_buf.resize(
+                        viewer.render_width, viewer.render_height)
+                except Exception:
+                    viewer._interop_enabled = False
             viewer._render_needed = True
 
         glfw.set_key_callback(window, _key_cb)
@@ -9414,6 +9681,7 @@ class InteractiveViewer:
         self._display_frame = None
         self._frame_dirty = False
         self._render_needed = True  # Ensure first frame renders
+        self._overlay_rgba = None   # RGBA overlay for interop path
         self._fps_counter = 0
         self._fps_last_time = time.monotonic()
         self._last_tick_time = time.monotonic()
@@ -9479,8 +9747,8 @@ class InteractiveViewer:
 
                 self._drain_command_queue()
                 self._tick()
-                self._present_if_dirty(frame_tex, ctx, vao, glfw, window,
-                                       moderngl)
+                self._present_if_dirty(frame_tex, overlay_tex, prog, ctx,
+                                       vao, glfw, window, moderngl)
 
                 # Idle: yield CPU when nothing is happening (no movement,
                 # no pending render).  Keeps input polling responsive at
@@ -9489,6 +9757,16 @@ class InteractiveViewer:
                     time.sleep(0.008)
         finally:
             # --- Cleanup ---
+            if self._cuda_gl_buf is not None:
+                try:
+                    self._cuda_gl_buf.release()
+                except Exception:
+                    pass
+                self._cuda_gl_buf = None
+            self._interop_enabled = False
+            self._interop_frame_tex = None
+            self._mgl_ctx = None
+            overlay_tex.release()
             frame_tex.release()
             vbo.release()
             vao.release()
@@ -9838,6 +10116,8 @@ def explore(raster, width: int = 800, height: int = 600,
     # Ambient occlusion initialization
     if ao_samples > 0:
         viewer.ao_enabled = True
+    else:
+        viewer.ao_enabled = False
     viewer.gi_bounces = gi_bounces
 
     # Denoiser initialization

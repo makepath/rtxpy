@@ -82,6 +82,7 @@ class TerrainLODManager:
         '_build_retries',
         '_on_tile_added', '_on_tile_removed',
         '_scene_mesh_mgr',
+        '_lod_changed_this_tick',
     )
 
     def __init__(self, terrain_np=None, tile_size=128,
@@ -185,6 +186,7 @@ class TerrainLODManager:
         self._tile_cache = {}  # (tr, tc, lod, base_sub) -> (verts, indices, normals)
         self._active_tiles = set()  # GAS IDs currently in the scene
         self._build_retries = {}  # cache_key -> int (failed build count)
+        self._lod_changed_this_tick = set()  # (tr, tc) tiles that changed LOD
 
         # Movement/rotation threshold before re-evaluating LOD
         self._last_update_pos = None
@@ -706,6 +708,7 @@ class TerrainLODManager:
                 lod_updates.append(entry)
 
         changed = False
+        self._lod_changed_this_tick = set()
 
         # --- Phase A: collect completed async builds ---
         changed |= self._collect_completed_builds(rtx, ve)
@@ -714,6 +717,14 @@ class TerrainLODManager:
         b_changed, pending = self._process_tile_queue(
             unbuilt + lod_updates, rtx, ve)
         changed |= b_changed
+
+        # --- Phase B2: re-stitch neighbors of tiles that changed LOD ---
+        # When a tile changes LOD, its neighbors' boundary stitching
+        # becomes stale (they were stitched against the old LOD).
+        # Re-stage those neighbors so their stitching uses the updated
+        # tile_lods.
+        if self._lod_changed_this_tick:
+            changed |= self._restitch_neighbors(rtx, ve)
 
         # --- Phase C: prefetch I/O for streaming tiles ---
         if (self._streaming and self._threaded
@@ -841,6 +852,8 @@ class TerrainLODManager:
                     prev_lod = tile_lods.get((tr, tc), -1)
                     if prev_lod > 0 and batched:
                         self._unstage_tile(tr, tc, prev_lod)
+                    if prev_lod != 0:
+                        self._lod_changed_this_tick.add((tr, tc))
                     was_new = (tr, tc) not in self._tile_lods
                     self._tile_lods[(tr, tc)] = 0
                     self._active_tiles.add(gid)
@@ -893,6 +906,46 @@ class TerrainLODManager:
                             gid, tr, tc, lod, result, ve, rtx)
 
         return changed, pending
+
+    def _restitch_neighbors(self, rtx, ve):
+        """Phase B2: re-stitch neighbors of tiles that changed LOD.
+
+        When a tile transitions between LOD levels, its neighbors'
+        boundary stitching becomes stale — they were stitched against the
+        old LOD.  This pass re-stages (batched) or re-uploads
+        (non-batched) those neighbors so stitching uses the current
+        ``_tile_lods``.
+        """
+        changed = False
+        batched = self._batched
+        already = self._lod_changed_this_tick  # skip tiles that were just built
+
+        to_restitch = set()
+        for (tr, tc) in already:
+            for nr, nc in ((tr - 1, tc), (tr + 1, tc),
+                           (tr, tc - 1), (tr, tc + 1)):
+                if (nr, nc) in already:
+                    continue  # already rebuilt this tick
+                nlod = self._tile_lods.get((nr, nc), -1)
+                if nlod < 0:
+                    continue  # not an active tile
+                gid = _tile_gid(nr, nc)
+                if gid not in self._active_tiles:
+                    continue
+                to_restitch.add((nr, nc, nlod, gid))
+
+        for nr, nc, nlod, gid in to_restitch:
+            cache_key = (nr, nc, nlod, self._base_subsample)
+            cached = self._tile_cache.get(cache_key)
+            if cached is None or cached[0] is None:
+                continue
+            if batched:
+                self._stage_tile(gid, nr, nc, nlod, cached, ve)
+            else:
+                changed |= self._upload_tile(
+                    gid, nr, nc, nlod, cached, ve, rtx)
+
+        return changed
 
     def _prefetch_streaming_tiles(self, queue, max_prefetches=8):
         """Phase C: submit I/O prefetches for out-of-bounds streaming tiles.
@@ -1155,12 +1208,15 @@ class TerrainLODManager:
 
         Returns True if the tile was successfully added.
         """
+        prev_lod = self._tile_lods.get((tr, tc), -1)
         # own=False: rtx.add_geometry copies into GPU buffers internally
         verts, indices, norms = self._prepare_tile(
             mesh_data, tr, tc, lod, ve, own=False)
         rc = rtx.add_geometry(gid, verts, indices, normals=norms)
         if rc == 0 or rc is None:
             self._active_tiles.add(gid)
+            if prev_lod != lod:
+                self._lod_changed_this_tick.add((tr, tc))
             self._tile_lods[(tr, tc)] = lod
             if self._on_tile_added is not None:
                 self._fire_tile_added(tr, tc)
@@ -1253,6 +1309,10 @@ class TerrainLODManager:
         prev_lod = self._tile_lods.get((tr, tc), -1)
         if prev_lod >= 0 and prev_lod != lod:
             self._unstage_tile(tr, tc, prev_lod)
+        # Track any tile whose LOD state changed (including first build)
+        # so neighbors can be re-stitched.
+        if prev_lod != lod:
+            self._lod_changed_this_tick.add((tr, tc))
         # Stage into the new LOD's batch
         if lod not in self._lod_tile_meshes:
             self._lod_tile_meshes[lod] = {}
@@ -1800,6 +1860,19 @@ class TerrainLODManager:
                 arr = np.zeros((1, 1), dtype=np.float32)
         else:
             raise RuntimeError("No terrain data available for pyramid")
+
+        # Fill NaN globally BEFORE caching so every tile that slices from
+        # this pyramid level sees the same value at shared boundary pixels.
+        # Without this, per-tile nanmean fill produces different Z at
+        # boundaries → cracks visible under vertical exaggeration.
+        # Also makes stitching reference Z non-NaN.
+        bad = ~np.isfinite(arr)
+        if bad.any():
+            fill_val = np.nanmean(arr)
+            if not np.isfinite(fill_val):
+                fill_val = 0.0
+            arr = arr.copy()
+            arr[bad] = fill_val
 
         self._pyramid_cache[level] = arr
 
