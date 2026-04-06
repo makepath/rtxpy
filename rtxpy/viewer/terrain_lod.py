@@ -1943,18 +1943,41 @@ class TerrainLODManager:
         indices = np.zeros(num_tris * 3, dtype=np.int32)
         mesh_mod.triangulate_terrain(verts, indices, tile, scale=1.0)
 
-        # Compute smooth per-vertex normals from the elevation grid
-        eff_sub = pyr_sub * extra_sub
+        # World-space bounds of this tile.  Use the actual pixel extent
+        # (clipped to terrain shape via r1_full/c1_full computed above),
+        # not the full tile_size — edge tiles may be smaller than
+        # tile_size, causing a gap when vertex spacing assumes uniform
+        # eff_sub * psx across the full tile.
+        wx0 = c0_full * self._psx + self._offset_x
+        wy0 = r0_full * self._psy + self._offset_y
+        wx1 = c1_full * self._psx + self._offset_x
+        wy1 = r1_full * self._psy + self._offset_y
+
+        # Compute smooth per-vertex normals using effective pixel spacing
+        # derived from the actual world extent (not uniform eff_sub * psx,
+        # which is wrong for partial edge tiles).
+        if tw > 1:
+            eff_psx = (wx1 - wx0) / (tw - 1)
+        else:
+            eff_psx = abs(self._psx)
+        if th > 1:
+            eff_psy = (wy1 - wy0) / (th - 1)
+        else:
+            eff_psy = abs(self._psy)
         normals = mesh_mod.compute_terrain_normals(
-            tile, th, tw,
-            psx=eff_sub * self._psx,
-            psy=eff_sub * self._psy)
+            tile, th, tw, psx=eff_psx, psy=eff_psy)
 
         # Transform from local grid coords to world coords.
-        # Each pixel in the tile spans subsample full-res pixels.
-        # The world offset keeps positions stable across terrain reloads.
-        verts[0::3] = verts[0::3] * eff_sub * self._psx + c0_full * self._psx + self._offset_x
-        verts[1::3] = verts[1::3] * eff_sub * self._psy + r0_full * self._psy + self._offset_y
+        # Normalize vertex positions to [0, 1] then scale to actual world
+        # extent, so edge tiles map exactly to the terrain boundary.
+        if tw > 1:
+            verts[0::3] = verts[0::3] / (tw - 1) * (wx1 - wx0) + wx0
+        else:
+            verts[0::3] = (wx0 + wx1) * 0.5
+        if th > 1:
+            verts[1::3] = verts[1::3] / (th - 1) * (wy1 - wy0) + wy0
+        else:
+            verts[1::3] = (wy0 + wy1) * 0.5
 
         return verts, indices, normals
 

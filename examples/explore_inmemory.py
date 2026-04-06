@@ -13,21 +13,26 @@ This is the right path when:
 Usage:
     python explore_inmemory.py
     python explore_inmemory.py --dem copernicus --subsample 2
+    python explore_inmemory.py --buildings --roads --water --wind --hydro
 
 Requirements:
     pip install rtxpy[all]
 """
 
 import argparse
+import warnings
+from pathlib import Path
 
 import numpy as np
 import xarray as xr  # noqa
 import xrspatial  # noqa
 
 import rtxpy  # noqa
+from rtxpy import fetch_buildings, fetch_roads, fetch_water
 
 # Birmingham, Alabama — rolling Appalachian foothills
 BOUNDS = (-86.9, 33.4, -86.7, 33.6)
+CACHE = Path(__file__).parent
 
 
 def _auto_utm(bounds):
@@ -52,6 +57,16 @@ def main():
                         metavar=("W", "S", "E", "N"),
                         default=list(BOUNDS),
                         help="Bounding box in lon/lat degrees")
+    parser.add_argument("--buildings", action="store_true",
+                        help="Place Overture buildings on terrain")
+    parser.add_argument("--roads", action="store_true",
+                        help="Place Overture roads on terrain")
+    parser.add_argument("--water", action="store_true",
+                        help="Place water features on terrain")
+    parser.add_argument("--wind", action="store_true",
+                        help="Enable wind particle animation (Shift+W)")
+    parser.add_argument("--hydro", action="store_true",
+                        help="Enable hydro flow particles (Shift+Y)")
     args = parser.parse_args()
 
     bounds = tuple(args.bounds)
@@ -78,16 +93,93 @@ def main():
     emax = float(cp.nanmax(dem.data))
     print(f"Terrain: {dem.shape}, elevation {emin:.0f}–{emax:.0f} m")
 
+    # ---- Place geometry (buildings, roads, water) -----------------------
+    if args.buildings:
+        try:
+            bldgs = fetch_buildings(
+                bounds=bounds, source='overture', crs=crs,
+                cache_path=CACHE / "inmemory_buildings.geojson")
+            if bldgs['features']:
+                with warnings.catch_warnings():
+                    warnings.filterwarnings(
+                        "ignore", message="place_geojson called before")
+                    info = dem.rtx.place_buildings(bldgs)
+                print(f"Placed {info['geometries']} buildings")
+            else:
+                print("No buildings found in bounds")
+        except Exception as e:
+            print(f"Skipping buildings: {e}")
+
+    if args.roads:
+        try:
+            roads = fetch_roads(
+                bounds=bounds, road_type='all', source='overture', crs=crs,
+                cache_path=CACHE / "inmemory_roads.geojson")
+            if roads['features']:
+                with warnings.catch_warnings():
+                    warnings.filterwarnings(
+                        "ignore", message="place_geojson called before")
+                    info = dem.rtx.place_roads(roads, geometry_id='roads',
+                                               height=5)
+                print(f"Placed {info['geometries']} road geometries")
+            else:
+                print("No roads found in bounds")
+        except Exception as e:
+            print(f"Skipping roads: {e}")
+
+    if args.water:
+        try:
+            water_data = fetch_water(
+                bounds=bounds, water_type='all', crs=crs,
+                cache_path=CACHE / "inmemory_water.geojson")
+            with warnings.catch_warnings():
+                warnings.filterwarnings(
+                    "ignore", message="place_geojson called before")
+                results = dem.rtx.place_water(water_data)
+            for cat, info in results.items():
+                print(f"Placed {info['geometries']} {cat} water features")
+        except Exception as e:
+            print(f"Skipping water: {e}")
+
+    # ---- Wind data (Open-Meteo) -----------------------------------------
+    wind = None
+    if args.wind:
+        try:
+            from rtxpy import fetch_wind
+            wind = fetch_wind(bounds, grid_size=15)
+            wind['n_particles'] = 15000
+            wind['max_age'] = 120
+            wind['speed_mult'] = 400.0
+            print("Wind data loaded")
+        except Exception as e:
+            print(f"Skipping wind: {e}")
+
+    # ---- Hydro flow (lazy GPU computation on first Shift+Y) -------------
+    hydro = None
+    if args.hydro:
+        hydro = {'enabled': False}
+        print("Hydro enabled (press Shift+Y to activate)")
+
     # ---- Explore --------------------------------------------------------
     # This is the classic path: a single DataArray in GPU memory.
     # Internally, the LOD system wraps it in an InMemoryChunkSource and
     # tiles it automatically.  No zarr, no chunk source, no streaming —
     # just a raster and a viewer.
+    controls = []
+    if args.wind:
+        controls.append("Shift+W for wind")
+    if args.hydro:
+        controls.append("Shift+Y for hydro")
+    if controls:
+        print(f"\nControls: {', '.join(controls)}")
+
     dem.rtx.explore(
         width=1600,
         height=1200,
         render_scale=0.5,
         color_stretch='cbrt',
+        wind_data=wind,
+        hydro_data=hydro,
         repl=True,
     )
 

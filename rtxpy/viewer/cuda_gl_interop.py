@@ -51,15 +51,19 @@ def _get_libcuda() -> ctypes.CDLL:
     if _libcuda is None:
         path = ctypes.util.find_library("cuda")
         if path is None:
-            # Common fallback paths
-            for candidate in ("libcuda.so.1", "libcuda.so"):
+            # Platform-specific fallback paths
+            if os.name == "nt":
+                candidates = ("nvcuda.dll",)
+            else:
+                candidates = ("libcuda.so.1", "libcuda.so")
+            for candidate in candidates:
                 try:
                     _libcuda = ctypes.CDLL(candidate)
                     break
                 except OSError:
                     continue
             if _libcuda is None:
-                raise OSError("Cannot find libcuda.so")
+                raise OSError("Cannot find CUDA driver library")
         else:
             _libcuda = ctypes.CDLL(path)
     return _libcuda
@@ -70,14 +74,18 @@ def _get_libgl() -> ctypes.CDLL:
     if _libgl is None:
         path = ctypes.util.find_library("GL")
         if path is None:
-            for candidate in ("libGL.so.1", "libGL.so"):
+            if os.name == "nt":
+                candidates = ("opengl32.dll",)
+            else:
+                candidates = ("libGL.so.1", "libGL.so")
+            for candidate in candidates:
                 try:
                     _libgl = ctypes.CDLL(candidate)
                     break
                 except OSError:
                     continue
             if _libgl is None:
-                raise OSError("Cannot find libGL.so")
+                raise OSError("Cannot find OpenGL library")
         else:
             _libgl = ctypes.CDLL(path)
     return _libgl
@@ -127,14 +135,12 @@ def _setup_cuda_bindings(lib: ctypes.CDLL):
 
 
 def _setup_gl_bindings(lib: ctypes.CDLL):
-    """Set up argtypes/restypes for the raw GL calls we need."""
-    # glBindBuffer(GLenum target, GLuint buffer)
-    lib.glBindBuffer.argtypes = [ctypes.c_uint, ctypes.c_uint]
-    lib.glBindBuffer.restype = None
+    """Set up argtypes/restypes for the raw GL calls we need.
 
-    # glTexSubImage2D(GLenum target, GLint level, GLint xoffset, GLint yoffset,
-    #                 GLsizei width, GLsizei height, GLenum format, GLenum type,
-    #                 const void *pixels)
+    On Windows, glBindBuffer is a GL 1.5 extension not exported by
+    opengl32.dll, so we resolve it via wglGetProcAddress at runtime.
+    """
+    # glTexSubImage2D — core GL 1.1, always in opengl32.dll / libGL.so
     lib.glTexSubImage2D.argtypes = [
         ctypes.c_uint,   # target
         ctypes.c_int,    # level
@@ -148,9 +154,25 @@ def _setup_gl_bindings(lib: ctypes.CDLL):
     ]
     lib.glTexSubImage2D.restype = None
 
-    # glBindTexture(GLenum target, GLuint texture)
+    # glBindTexture — core GL 1.1
     lib.glBindTexture.argtypes = [ctypes.c_uint, ctypes.c_uint]
     lib.glBindTexture.restype = None
+
+    # glBindBuffer — GL 1.5.  On Linux it's in libGL.so; on Windows we
+    # must resolve it through wglGetProcAddress.
+    if os.name == "nt":
+        _wglGetProcAddress = lib.wglGetProcAddress
+        _wglGetProcAddress.argtypes = [ctypes.c_char_p]
+        _wglGetProcAddress.restype = ctypes.c_void_p
+        ptr = _wglGetProcAddress(b"glBindBuffer")
+        if not ptr:
+            raise OSError("wglGetProcAddress('glBindBuffer') returned NULL "
+                          "— is an OpenGL context current?")
+        BINDBUFFFUNC = ctypes.CFUNCTYPE(None, ctypes.c_uint, ctypes.c_uint)
+        lib.glBindBuffer = BINDBUFFFUNC(ptr)
+    else:
+        lib.glBindBuffer.argtypes = [ctypes.c_uint, ctypes.c_uint]
+        lib.glBindBuffer.restype = None
 
 
 # ---------------------------------------------------------------------------
@@ -175,9 +197,7 @@ class CudaGLFrameBuffer:
 
         # Load and set up ctypes bindings
         self._cuda = _get_libcuda()
-        self._gl = _get_libgl()
         _setup_cuda_bindings(self._cuda)
-        _setup_gl_bindings(self._gl)
 
         # Create GL buffer (PBO) via ModernGL
         nbytes = width * height * 3 * 4  # RGB float32
@@ -253,35 +273,17 @@ class CudaGLFrameBuffer:
     def upload_to_texture(self, tex: "moderngl.Texture"):
         """GPU-internal PBO→texture upload (no CPU involvement).
 
-        Binds the PBO as ``GL_PIXEL_UNPACK_BUFFER`` and calls
-        ``glTexSubImage2D`` with ``data=NULL`` to trigger a GPU-side copy
-        from the PBO into the texture.
+        Uses ModernGL's ``tex.write(buffer)`` which performs a GPU-side
+        copy from the PBO into the texture.  This avoids raw GL state
+        conflicts with ModernGL on Windows where ``glTexSubImage2D``
+        with a PBO source doesn't work through ctypes.
         """
         if self._mapped:
             raise RuntimeError(
                 "Cannot upload_to_texture while PBO is mapped for CUDA"
             )
 
-        # Bind PBO as pixel unpack source
-        self._gl.glBindBuffer(GL_PIXEL_UNPACK_BUFFER, self._glo)
-
-        # Bind the target texture
-        self._gl.glBindTexture(GL_TEXTURE_2D, tex.glo)
-
-        # GPU-internal copy: data=NULL means read from bound PBO
-        self._gl.glTexSubImage2D(
-            GL_TEXTURE_2D,
-            0,       # level
-            0, 0,    # xoffset, yoffset
-            self._width,
-            self._height,
-            GL_RGB,
-            GL_FLOAT,
-            None,    # NULL → read from PBO
-        )
-
-        # Unbind PBO
-        self._gl.glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0)
+        tex.write(self._gl_buf)
 
     def resize(self, width: int, height: int):
         """Resize the PBO (unregister → recreate → re-register)."""
@@ -371,6 +373,120 @@ class CudaGLFrameBuffer:
         except Exception as exc:
             logger.info("CUDA-GL interop not available: %s", exc)
             return False
+
+    def __del__(self):
+        try:
+            self.release()
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# DoubleBufferedCudaGL
+# ---------------------------------------------------------------------------
+class DoubleBufferedCudaGL:
+    """Double-buffered CUDA-GL interop for pipelined display.
+
+    Maintains two PBOs and two textures.  While CUDA writes frame N into
+    the "write" buffer, GL displays frame N-1 from the "display" buffer.
+    Call :meth:`swap` after unmapping the write PBO to flip roles.
+
+    Parameters
+    ----------
+    width, height : int
+        Frame dimensions.
+    ctx : moderngl.Context
+        ModernGL context (must be current).
+    """
+
+    def __init__(self, width: int, height: int, ctx: "moderngl.Context"):
+        import moderngl as _mgl
+
+        self._ctx = ctx
+        self._width = width
+        self._height = height
+        self._idx = 0  # index of the "write" buffer
+        self._has_display = False  # True after first swap
+
+        # Create two PBO / texture pairs
+        self._pbos = [
+            CudaGLFrameBuffer(width, height, ctx),
+            CudaGLFrameBuffer(width, height, ctx),
+        ]
+        self._textures = [
+            ctx.texture((width, height), 3, dtype='f4'),
+            ctx.texture((width, height), 3, dtype='f4'),
+        ]
+        for t in self._textures:
+            t.filter = (_mgl.LINEAR, _mgl.LINEAR)
+
+    @property
+    def width(self) -> int:
+        return self._width
+
+    @property
+    def height(self) -> int:
+        return self._height
+
+    @property
+    def write_pbo(self) -> CudaGLFrameBuffer:
+        """The PBO currently designated for CUDA writes."""
+        return self._pbos[self._idx]
+
+    @property
+    def display_texture(self) -> "moderngl.Texture":
+        """The texture containing the most recently completed frame."""
+        return self._textures[1 - self._idx]
+
+    @property
+    def has_display_frame(self) -> bool:
+        """True after the first swap (a completed frame is available)."""
+        return self._has_display
+
+    def map(self) -> "cp.ndarray":
+        """Map the write PBO for CUDA access."""
+        return self._pbos[self._idx].map()
+
+    def unmap(self):
+        """Unmap the write PBO after CUDA writes are done."""
+        self._pbos[self._idx].unmap()
+
+    def swap(self):
+        """Upload write PBO to its texture and swap roles.
+
+        After this call, the previous write buffer becomes the display
+        buffer and vice versa.  The display texture is immediately
+        usable for GL rendering.
+        """
+        # Upload the just-written PBO to its paired texture
+        self._pbos[self._idx].upload_to_texture(self._textures[self._idx])
+        # Swap indices
+        self._idx = 1 - self._idx
+        self._has_display = True
+
+    def resize(self, width: int, height: int):
+        """Resize both PBOs and textures."""
+        import moderngl as _mgl
+
+        self._width = width
+        self._height = height
+        for pbo in self._pbos:
+            pbo.resize(width, height)
+        for i, tex in enumerate(self._textures):
+            tex.release()
+            self._textures[i] = self._ctx.texture(
+                (width, height), 3, dtype='f4')
+            self._textures[i].filter = (_mgl.LINEAR, _mgl.LINEAR)
+        self._has_display = False
+
+    def release(self):
+        """Release all resources."""
+        for pbo in self._pbos:
+            pbo.release()
+        for tex in self._textures:
+            tex.release()
+        self._pbos = []
+        self._textures = []
 
     def __del__(self):
         try:

@@ -617,7 +617,7 @@ class HydroManager:
 
         speed = float(st.hydro_speed)
         trail_len = int(st.hydro_trail_len)
-        rng_base = np.random.randint(0, 2**62)
+        rng_base = int(np.random.randint(0, 2**31 - 1))
 
         threadsperblock = 256
         blockspergrid = (N + threadsperblock - 1) // threadsperblock
